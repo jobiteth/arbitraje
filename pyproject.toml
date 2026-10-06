@@ -20,6 +20,15 @@ dependencies = [
     "certifi>=2025.1.31",
     "keyring>=25.7,<26",
     "structlog>=26.1,<27",
+    # Se importa directamente en `infra.config` para volcar el `.env` al entorno
+    # del proceso. Llega igual como dependencia de `pydantic-settings`, pero se
+    # declara porque el código lo usa sin intermediarios.
+    "python-dotenv>=1.0",
+    # Firma EIP-1559 y derivación de direcciones: lo mínimo para que la
+    # aplicación pueda emitir una operación. No se escribe RLP ni secp256k1 a
+    # mano. El tope inferior no es decorativo: `web3` (el extra `[chain]`)
+    # exige `>=0.14`, y fijar algo menor hace el grafo irresoluble.
+    "eth-account>=0.14,<0.15",
 ]
 
 # Sólo necesario para motores que decodifican ABIs / contratos (M2+).
@@ -40,6 +49,8 @@ geckoterminal = "amigocompora.engines.geckoterminal:PROVIDER"
 dexscreener = "amigocompora.engines.dexscreener:PROVIDER"
 jupiter = "amigocompora.engines.jupiter:PROVIDER"
 uniswap = "amigocompora.engines.uniswap:PROVIDER"
+uniswap_v3 = "amigocompora.engines.uniswap_v3:PROVIDER"
+uniswap_v4 = "amigocompora.engines.uniswap_v4:PROVIDER"
 zeroex = "amigocompora.engines.zeroex:PROVIDER"
 polymarket = "amigocompora.engines.polymarket:PROVIDER"
 stub_advisor = "amigocompora.engines.llm.providers:STUB_PROVIDER"

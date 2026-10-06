@@ -54,6 +54,67 @@ class ConfirmationDeniedError(AmigocomporaError):
 
 
 # --------------------------------------------------------------------------- #
+# Ejecución — cuando la aplicación mueve dinero de verdad
+# --------------------------------------------------------------------------- #
+class ExecutionError(AmigocomporaError):
+    """Raíz de los fallos al firmar o emitir una operación."""
+
+
+class NoWalletError(ExecutionError):
+    """No hay clave privada configurada, así que no hay con qué firmar.
+
+    Se distingue de un fallo de firma: aquí no se intentó nada. El mensaje debe
+    decir **dónde** se configura, porque quien lo lee es alguien que acaba de
+    pulsar «Ejecutar» y no sabe por qué no pasa nada.
+    """
+
+
+class KeyCustodyError(ExecutionError):
+    """La clave privada está en un sitio que no es seguro para una clave privada.
+
+    Existe por una asimetría concreta: una API key filtrada se rota en un minuto,
+    y una clave privada filtrada vacía la cartera para siempre. Por eso el
+    fallback a variable de entorno —razonable para una API key, y la única vía
+    que funciona en una máquina sin keyring— no se acepta aquí sin pedirlo
+    explícitamente.
+    """
+
+
+class ExecutionLimitExceededError(ExecutionError):
+    """La operación no cabe en los límites configurados.
+
+    No es un fallo técnico ni del mercado: es el límite haciendo su trabajo. Se
+    lanza desde el dominio **antes** de firmar, y el mensaje dice qué límite y
+    con qué cifras, porque la salida —subirlo o reducir la orden— la decide el
+    usuario.
+    """
+
+    def __init__(self, limit: str, detail: str) -> None:
+        self.limit = limit
+        self.detail = detail
+        super().__init__(f"la operación supera el límite de {limit}: {detail}")
+
+
+class BroadcastError(ExecutionError):
+    """La transacción se firmó pero la red no la aceptó.
+
+    Importa distinguirlo de un fallo de firma: aquí **existe** una transacción
+    firmada y con un hash conocido, y si el nodo la rechazó por algo transitorio
+    puede volver a emitirse la misma. El mensaje lleva el hash para que se pueda
+    comprobar en un explorador en vez de tener que creer a la aplicación.
+    """
+
+    def __init__(self, tx_hash: str, chain: str, reason: str) -> None:
+        self.tx_hash = tx_hash
+        self.chain = chain
+        self.reason = reason
+        super().__init__(
+            f"la red «{chain}» rechazó la transacción {tx_hash}: {reason}. "
+            f"La transacción está firmada: se puede reintentar la misma."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Datos de mercado
 # --------------------------------------------------------------------------- #
 class MarketDataError(AmigocomporaError):

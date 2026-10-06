@@ -21,7 +21,14 @@ from PySide6.QtWidgets import (
 
 from amigocompora.app.confirmation import PendingAction
 from amigocompora.domain.models import PlannedTransaction
-from amigocompora.ui.theme import COLOR_BORDER, COLOR_CARD, COLOR_MUTED
+from amigocompora.domain.modes import Capability
+from amigocompora.ui.theme import (
+    COLOR_BORDER,
+    COLOR_CARD,
+    COLOR_DANGER,
+    COLOR_MUTED,
+    COLOR_WARNING,
+)
 
 #: Un payload en base64 o un calldata ocupan cientos de caracteres y no caben en
 #: el diálogo. Se recorta sólo para **mostrar**: el valor completo sigue en el
@@ -31,6 +38,38 @@ _CLIP_CHARS: Final = 120
 
 def _clip(value: str) -> str:
     return value if len(value) <= _CLIP_CHARS else f"{value[:_CLIP_CHARS]}…"
+
+
+#: El aviso del diálogo, según lo que la acción va a hacer **de verdad**.
+#:
+#: Estaba escrito a mano —«Amigocompora nunca firma ni emite transacciones»— y
+#: con la ejecución real esa frase pasó a ser falsa. Es la línea que más importa
+#: de todo el diálogo, porque dice justo lo contrario de lo que va a ocurrir en
+#: el instante exacto en que alguien decide si ocurre. La capacidad viaja dentro
+#: de la acción, así que el aviso puede depender de ella en vez de suponerla.
+#:
+#: Sólo hay dos textos porque sólo hay dos capacidades confirmables
+#: (`CONFIRMABLE_CAPABILITIES`, en `domain/modes.py`): construir el payload y
+#: emitirlo. No hay una tercera rama esperando, y por eso no hay un `else` que
+#: adivine.
+_SIGNING_WARNING: Final = (
+    "Esta operación es <b>real e irreversible</b>. Amigocompora va a <b>firmar y "
+    "emitir</b> una transacción a la red: sale dinero de tu cartera y, una vez "
+    "emitida, no se puede deshacer ni cancelar. Revisa la red, el importe y el "
+    "destino."
+)
+
+_PREPARE_WARNING: Final = (
+    "Confirmar aquí sólo autoriza a <b>construir</b> el payload. En esta acción "
+    "Amigocompora no firma ni emite nada."
+)
+
+
+def warning_for(capability: Capability) -> tuple[str, str]:
+    """El texto del aviso y su color, para la capacidad que se está confirmando."""
+    if capability is Capability.BROADCAST_TX:
+        return _SIGNING_WARNING, COLOR_DANGER
+    return _PREPARE_WARNING, COLOR_WARNING
 
 #: Tareas de fondo vivas. Guardar la referencia evita que el recolector de
 #: basura cancele una corrutina recién lanzada desde un handler de Qt.
@@ -101,9 +140,12 @@ class ConfirmationDialog(QDialog):
         if action.transaction is not None:
             layout.addWidget(self._tx_widget(action.transaction))
 
-        warning = QLabel("Amigocompora <b>nunca firma ni emite</b> transacciones. Revisa los datos antes de confirmar.")
+        warning = QLabel()
+        warning.setTextFormat(Qt.RichText)
         warning.setWordWrap(True)
-        warning.setStyleSheet("color: #f5c518; font-size: 11px;")
+        texto, color = warning_for(action.capability)
+        warning.setText(texto)
+        warning.setStyleSheet(f"color: {color}; font-size: 11px;")
         layout.addWidget(warning)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No)

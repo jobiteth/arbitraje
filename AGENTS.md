@@ -10,7 +10,8 @@ compatibilidad para herramientas que buscan `AGENTS.md`.
 Resumen de las reglas no negociables:
 
 - La IA propone, el usuario decide. Nada con efectos sin confirmación explícita.
-- La aplicación **no firma ni emite** transacciones.
+- Firmar y emitir exigen modo `EJECUCIÓN`, `execution.enabled = true` y una
+  confirmación explícita. La aplicación nunca firma por iniciativa propia.
 - Secretos sólo en el keyring del sistema; nunca en `config.toml` ni en logs.
 - Comentarios y documentación en español; identificadores en inglés.
 - Antes de dar una tarea por hecha: `ruff`, `mypy --strict` y `pytest` en verde.

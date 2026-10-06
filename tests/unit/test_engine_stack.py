@@ -85,6 +85,15 @@ class _Planner(_Reader):
         """No se llega a llamar: estas pruebas miran **quién** sería elegido."""
         raise NotImplementedError
 
+    def expected_destination(self, chain_key: str) -> str | None:
+        """Tampoco se llega a llamar: el contraste es del camino de ejecución.
+
+        Existe porque `SwapPlanner` es `runtime_checkable` y comprueba **qué
+        métodos hay**: sin él este doble dejaría de ser un planificador y las
+        pruebas de prioridad pasarían a medir el conjunto vacío.
+        """
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class _Provider:

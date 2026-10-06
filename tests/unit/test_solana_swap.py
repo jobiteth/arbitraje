@@ -468,6 +468,10 @@ class _FakePlanner:
             description="Swap de prueba en EVM",
         )
 
+    def expected_destination(self, chain_key: str) -> str | None:
+        """El doble no declara routers: el contraste se prueba en su propio sitio."""
+        return None
+
 
 _FAKE_MANIFEST = EngineManifest(
     engine_id="fake_dex",

@@ -5,13 +5,24 @@ La decisión de diseño que más importa aquí es **distinguir dos clases de fal
 - *Fallo de endpoint* (timeout, conexión rechazada, 5xx, 429, 401/403): el nodo
   no sirve. Se pasa al siguiente y se le apunta un fallo; tras varios
   consecutivos su cortacircuitos se abre y deja de intentarse durante un rato.
-- *Error de aplicación JSON-RPC* (objeto `error` en la respuesta, p. ej.
-  `execution reverted`): el nodo funciona perfectamente y nos está diciendo que
-  nuestra petición es inválida. Reintentarla en otros cinco endpoints da el
+- *Error de aplicación JSON-RPC* (objeto `error` que **responde** a la consulta,
+  p. ej. `execution reverted`): el nodo funciona perfectamente y nos está diciendo
+  que nuestra petición es inválida. Reintentarla en otros cinco endpoints da el
   mismo error, cuesta tiempo y puede agotar cuotas. Falla rápido.
 
 Confundir ambos es el bug clásico de estos pools: convierte un error de datos
 en una tormenta de peticiones y marca como caídos nodos que están sanos.
+
+Pero el objeto `error` **no basta** para distinguirlos, y creer que sí lo es el
+error simétrico —el que deja una red entera sin servicio—. Un nodo contesta con
+error también cuando no puede atender la petición: no la soporta, no la tiene
+blanqueada o no nos reconoce. Eso no es una respuesta sobre nuestros datos, es un
+endpoint que no sirve, y hay que pasar al siguiente. Medido el 2026-10-06 en los
+respaldos públicos de Ethereum: `cloudflare-eth.com` devuelve `-32603` a
+*cualquier* llamada, `rpc.ankr.com/eth` `-32000 Unauthorized` y
+`rpc.flashbots.net` `-32601 not whitelisted`. Con los tres tratados como errores
+de aplicación, `eth_call` moría en el primero de la lista sin llegar a los dos
+nodos que sí contestaban. La clasificación está en `_is_endpoint_fault`.
 
 Si todos los cortacircuitos están abiertos no se devuelve un fallo inmediato:
 se sondea el endpoint cuyo enfriamiento acabe antes (*half-open*). Un apagón
@@ -45,9 +56,60 @@ LATENCY_ALPHA: Final = 0.3
 #: tiene sentido probar otro en vez de abortar.
 ENDPOINT_FAULT_STATUSES: Final = frozenset({401, 403, 408, 429, 500, 502, 503, 504})
 
+#: Códigos JSON-RPC con los que el nodo dice que **él** no puede atender la
+#: petición. No son respuestas sobre nuestros datos, así que se pasa al siguiente
+#: endpoint y se le apunta el fallo, con lo que el cortacircuitos acaba apartando
+#: al que no sirve en vez de gastar una petición perdida en cada llamada.
+#:
+#: `-32603` (Internal error), `-32601` (Method not found), `-32005` (cuota
+#: agotada), `-32004` (método no soportado) y `-32002` (recurso no disponible) no
+#: pueden significar «tu petición está mal»: si lo estuviera, el nodo contestaría
+#: `-32600` o `-32602`, que se quedan fuera a propósito — ahí el error es nuestro
+#: y reintentarlo en cinco nodos sólo multiplica un fallo de programación.
+ENDPOINT_FAULT_CODES: Final = frozenset({-32603, -32601, -32005, -32004, -32002})
+
+#: Marcas en el mensaje que delatan un fallo de endpoint cuando el código no
+#: basta. Hacen falta porque `-32000` es el cajón de sastre de Geth y significa
+#: tanto `execution reverted` —una respuesta sobre nuestra petición, que debe
+#: fallar rápido— como `Unauthorized` —el nodo diciendo que no sirve—. Es el
+#: único lugar del módulo donde se mira texto, y se admite la asimetría: una
+#: lectura reintentada de más cuesta una petición HTTP, y una lectura no
+#: reintentada cuando el endpoint estaba roto deja una red entera sin servicio.
+ENDPOINT_FAULT_MARKERS: Final = (
+    "unauthorized",
+    "authenticate",
+    "api key",
+    "forbidden",
+    "rate limit",
+    "limit exceeded",
+    "too many requests",
+    "capacity",
+    "not whitelisted",
+    "not supported",
+    "method not found",
+    "internal error",
+    "timed out",
+    "timeout",
+    "try again",
+)
+
+
+def _is_endpoint_fault(code: int, message: str) -> bool:
+    """Si un `error` JSON-RPC significa «este nodo no sirve» en vez de «no»."""
+    if code in ENDPOINT_FAULT_CODES:
+        return True
+    lowered = message.lower()
+    return any(marker in lowered for marker in ENDPOINT_FAULT_MARKERS)
+
 
 class RpcError(AmigocomporaError):
-    """El nodo respondió con un error JSON-RPC. No se hace failover."""
+    """El nodo **contestó** que no. No se hace failover.
+
+    Es una respuesta sobre nuestros datos —un revert, un parámetro inválido, un
+    saldo insuficiente—, y por eso repetirla en otro nodo da lo mismo. El otro
+    caso —el nodo que no puede atender la petición— sale de aquí como
+    `RpcTransportError`, aunque llegue en forma de objeto JSON-RPC `error`.
+    """
 
     def __init__(self, code: int, message: str, method: str) -> None:
         self.code = code
@@ -79,6 +141,18 @@ class RpcEndpoint:
     @property
     def display_name(self) -> str:
         return self.label or safe_url(self.url)
+
+    def __repr__(self) -> str:
+        """Nunca incluye la URL completa, y no es un descuido.
+
+        En los RPC comerciales la clave de API viaja **dentro de la URL**, así que
+        un `repr()` que la mostrara convierte cualquier traza, cualquier log de una
+        excepción y cualquier `print` de depuración en una filtración. El
+        procesador de logs ya redacta los campos llamados `url` o `endpoint`, pero
+        eso sólo protege cuando el valor va en uno de esos campos: esto lo protege
+        siempre, incluso donde nadie pensó en redactar.
+        """
+        return f"RpcEndpoint({self.display_name!r}, priority={self.priority})"
 
 
 @dataclass(slots=True)
@@ -247,7 +321,16 @@ class RpcPool:
                 _log.warning(
                     "rpc.endpoint_failed",
                     chain=self.chain,
-                    endpoint=endpoint.url,
+                    # `display_name` y no `url`: en un RPC comercial la clave de
+                    # API viaja dentro de la URL, y esto se midió —con el
+                    # procesador de logs sin instalar, `endpoint=endpoint.url`
+                    # escribía la clave entera en la consola. El procesador de
+                    # `infra.logging` redacta ese campo cuando está puesto, pero
+                    # depender de que lo esté convierte una salvaguarda en una
+                    # casualidad: basta con usar el pool desde un script que no
+                    # llame a `configure_logging` para filtrarla. `display_name`
+                    # es la etiqueta del nodo, o el host sin ruta ni query.
+                    endpoint=endpoint.display_name,
                     method=method,
                     reason=reason,
                 )
@@ -295,6 +378,10 @@ class RpcPool:
                 if isinstance(error_obj, dict)
                 else str(error_obj)
             )
+            # No todo objeto `error` es una respuesta: el nodo también contesta
+            # así cuando no puede atender la petición. Eso se pasa al siguiente.
+            if _is_endpoint_fault(int(code), str(message)):
+                raise RpcTransportError(f"JSON-RPC {code}: {message}")
             # Error de aplicación: el nodo está sano. Falla rápido.
             raise RpcError(int(code), str(message), method)
 

@@ -1,14 +1,18 @@
-"""Preparar un swap: el único caso de uso que produce algo con efectos.
+"""Preparar un swap: el borrador, sin firmar y sin efectos.
 
-Capacidad requerida: `PREPARE_TX`, que sólo concede el modo `ASISTIDO`. Y aun
+Capacidad requerida: `PREPARE_TX`, que conceden `ASISTIDO` y `EJECUCIÓN`. Y aun
 concedida, pasa por `ConfirmationGateway`, así que el usuario ve el payload
 exacto y tiene que decir sí.
 
 Lo que devuelve es una `PlannedTransaction` —el payload de EVM o el de Solana,
-según la red del par—: un objeto para inspeccionar o exportar. Amigocompora no
-almacena claves privadas, no firma y no emite. Las capacidades `SIGN_TX` y
-`BROADCAST_TX` existen en el enum para que la barrera pueda nombrarlas y
-negarlas, no porque haya código que las implemente.
+según la red del par—: un objeto para inspeccionar o exportar. Este caso de uso
+**no firma ni emite**, y por eso sigue siendo el camino seguro: sirve para mirar
+qué se haría sin que nada ocurra.
+
+Firmar y emitir es otra cosa, con otro caso de uso (`ExecuteSwap`), otra
+capacidad y otro modo. La separación no es de estilo: es lo que permite que
+alguien use la aplicación para estudiar el mercado sin darle la llave de la
+cartera.
 """
 
 from __future__ import annotations
@@ -46,17 +50,32 @@ class PrepareSwap:
             )
         return bool(self.registry.planners_for(chain_key))
 
+    async def build(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
+        """Construye el payload sin firmar. **No pide confirmación.**
+
+        Está separado de `__call__` porque el camino de ejecución necesita
+        exactamente esto —el payload, del mismo motor que observó la cotización—
+        y volver a escribirlo allí sería tener dos versiones del mismo paso, una
+        de las cuales se quedaría atrás. Lo que **no** se comparte es el
+        permiso: aquí no se comprueba ninguna capacidad, así que quien llame a
+        este método tiene que haber comprobado la suya antes. Los dos llamantes
+        lo hacen, y cada uno por su cuenta porque son permisos distintos.
+        """
+        destination = destination_for(quote, recipient)
+        engine = self.planner_for(quote)
+        # El motor reúne el payload y responde de que corresponde a la
+        # cotización que se le pasa: es él quien detecta la deriva de precio.
+        return await engine.plan_swap(quote, recipient=destination)
+
     async def __call__(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
         # 1. Descartar primero lo que el modo no permite: construir un payload
         #    que luego se va a rechazar es trabajo y red gastados en balde.
         self.gateway.precheck(Capability.PREPARE_TX)
 
-        destination = _recipient_for(quote, recipient)
-        engine = self._planner_for(quote)
+        destination = destination_for(quote, recipient)
 
-        # 2. Construir. Sin efectos externos: el motor reúne el payload, y
-        #    responde de que corresponde a la cotización que se le pasa.
-        transaction = await engine.plan_swap(quote, recipient=destination)
+        # 2. Construir. Sin efectos externos.
+        transaction = await self.build(quote, recipient=recipient)
 
         # 3. Y ahora sí, pedir el sí explícito, con el payload real delante.
         await self.gateway.authorize(
@@ -69,14 +88,20 @@ class PrepareSwap:
                 f"Comisión del venue: {_fee_line(quote)}",
                 f"Impacto de precio: {_impact_line(quote)}",
                 f"Destino: {shorten(destination)}",
-                "Amigocompora no firmará ni emitirá esta transacción.",
+                "Es un borrador: no se firma ni se emite nada.",
             ),
             transaction=transaction,
         )
         return transaction
 
-    def _planner_for(self, quote: Quote) -> SwapPlanner:
+    def planner_for(self, quote: Quote) -> SwapPlanner:
         """El motor que **observó** esa cotización, de entre los que están activos.
+
+        Es público porque el camino de ejecución necesita el **mismo** motor, y
+        por la misma razón que aquí: para preguntarle a qué contrato dirige los
+        swaps antes de firmar. Resolverlo por segunda vez allí, con otro criterio,
+        sería tener dos respuestas a «quién construye esto» que podrían separarse
+        justo entre el contraste y la firma.
 
         Se busca por `engine_id` y no se toma «el primero que sepa construir»: la
         cifra que el usuario vio y el payload que va a firmar tienen que salir del
@@ -105,7 +130,7 @@ class PrepareSwap:
         )
 
 
-def _recipient_for(quote: Quote, recipient: str) -> str:
+def destination_for(quote: Quote, recipient: str) -> str:
     """Valida el destino según el formato de dirección de la red del par.
 
     Se despacha por lo que declara el registro de redes, no por la pinta de la
@@ -118,6 +143,11 @@ def _recipient_for(quote: Quote, recipient: str) -> str:
     forma: `"z" * 44` son 44 caracteres del alfabeto y no son un pubkey. Este
     destino es lo último que se revisa antes de entregar algo que el usuario
     firmará fuera de la aplicación, así que se comprueba de verdad.
+
+    Es pública porque el camino de ejecución necesita **el mismo** destino ya
+    validado —para contrastarlo contra el del payload antes de firmar— y tenerlo
+    calculado dos veces por dos funciones distintas sería tener dos reglas de
+    validación que podrían separarse.
     """
     spec = chain(quote.pair.chain)
     if spec.address_format is AddressFormat.SOLANA_BASE58:

@@ -338,6 +338,23 @@ class JupiterEngine:
         body = as_mapping(response, "respuesta de swap", SOURCE_NAME)
         return self._to_unsigned(quote, body, fresh_raw, recipient)
 
+    def expected_destination(self, chain_key: str) -> str | None:
+        """`None`: en Solana no hay una tabla de routers que contrastar.
+
+        No es un hueco, es la forma de la red. En EVM el swap se dirige a un
+        contrato con una dirección fija y conocida por adelantado, y ahí tiene
+        sentido exigir que el `to` del payload sea exactamente ese. En Solana la
+        transacción es un mensaje con sus instrucciones y sus cuentas, y el
+        programa que la ejecuta —Jupiter— no se identifica por un `to` del
+        payload, así que no hay un valor contra el que comparar.
+
+        Devolver `None` es lo que hace que el camino de ejecución **no firme**
+        una operación de Solana por accidente: quien pregunte recibe «este motor
+        no declara destino», y ahí la decisión correcta es parar. Firmar en
+        Solana es la entrega siguiente, con `solders` y su propio contraste.
+        """
+        return None
+
     def _require_same_price(self, quote: Quote, fresh_raw: int) -> None:
         """Aborta si el precio se movió más de lo tolerado desde lo que se vio."""
         shown_raw = quote.amount_out.raw

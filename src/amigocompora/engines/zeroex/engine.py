@@ -328,6 +328,17 @@ class ZeroExEngine:
             return None
         return body
 
+
+    def expected_destination(self, chain_key: str) -> str | None:
+        """El router de la tabla medida para esa red, o `None` si no la cubre.
+
+        Se lee de `ROUTERS` en vez de escribirse aparte porque es la misma
+        pregunta —«¿a qué contrato manda este motor los swaps de esta red?»— y
+        mantener dos listas abre la posibilidad de declarar una red cuya
+        dirección ya no esté en la tabla de construcción.
+        """
+        return ROUTERS.get(chain_key)
+
     def _require_same_price(self, quote: Quote, fresh_raw: int) -> None:
         """Aborta si el precio se movió más de lo tolerado desde lo que se vio."""
         shown_raw = quote.amount_out.raw

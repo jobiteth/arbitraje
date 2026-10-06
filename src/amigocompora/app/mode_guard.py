@@ -5,10 +5,12 @@ decide a partir de la tabla `MODE_CAPABILITIES`. Nada más en la aplicación
 pregunta por el modo activo, así que la política es auditable leyendo un solo
 fichero en vez de persiguiendo condicionales por toda la base de código.
 
-Defensa en profundidad: además de consultar la tabla, el guard rechaza
-incondicionalmente las capacidades de `UNIMPLEMENTED_CAPABILITIES` (firmar y
-emitir transacciones). Si alguien las añadiera a la tabla por error, seguirían
-bloqueadas aquí.
+El guard es también la razón por la que la ejecución desatendida no puede
+saltarse el modo. La política de autonomía vive en otro sitio y lo único que
+puede hacer es **omitir la pregunta**; las capacidades las sigue concediendo
+esta clase, y firmar o emitir exige estar en `EXECUTION`. Un fallo en la
+política de autonomía no puede, por tanto, convertirse en una operación con
+efectos desde un modo que no la permite.
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ from amigocompora.domain.errors import ModeNotPermittedError
 from amigocompora.domain.modes import (
     CONFIRMABLE_CAPABILITIES,
     DEFAULT_MODE,
-    UNIMPLEMENTED_CAPABILITIES,
     Capability,
     OperationMode,
     modes_granting,
@@ -68,8 +69,6 @@ class ModeGuard:
 
     # ---------------------------------------------------------- autorizar  #
     def allows(self, capability: Capability) -> bool:
-        if capability in UNIMPLEMENTED_CAPABILITIES:
-            return False
         return self._mode.grants(capability)
 
     def require(self, capability: Capability) -> None:
@@ -88,8 +87,6 @@ class ModeGuard:
         Devuelve `None` si ningún modo la concede, para que la UI distinga
         «sube de modo» de «esto no existe en esta versión».
         """
-        if capability in UNIMPLEMENTED_CAPABILITIES:
-            return None
         candidates = modes_granting(capability)
         if not candidates:
             return None

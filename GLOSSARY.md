@@ -7,13 +7,22 @@ no desviarse.
 
 - **Principio rector.** «La IA propone, el usuario decide». Ninguna ruta ejecuta
   una acción con efectos sin confirmación explícita.
-- **Modo de operación.** `OBSERVACIÓN`, `SIMULACIÓN` o `ASISTIDO`. Define qué
-  `Capability` están concedidas. Ver `domain/modes.py`.
+- **Modo de operación.** `OBSERVACIÓN`, `SIMULACIÓN`, `ASISTIDO` o `EJECUCIÓN`.
+  Define qué `Capability` están concedidas. Ver `domain/modes.py`.
 - **Capability.** Acción concreta que un caso de uso declara necesitar
   (`READ_CHAIN`, `COMPUTE_ROUTE`, `QUERY_AI`, `PREPARE_TX`, `SIGN_TX`,
   `BROADCAST_TX`). La UI nunca decide «en qué modo estoy»; declara la capacidad.
-- **`UNIMPLEMENTED_CAPABILITIES`.** `SIGN_TX` y `BROADCAST_TX`: firmar y emitir.
-  Ningún modo las concede. La app no tiene claves privadas.
+- **`CONFIRMABLE_CAPABILITIES`.** `PREPARE_TX` y `BROADCAST_TX`: las que, además
+  de estar concedidas por el modo, exigen un «sí» del usuario. `SIGN_TX` **no**
+  está aquí, y es deliberado: firmar sin emitir no tiene efecto propio dentro del
+  flujo —la firma va de la mano al envío, sin pasar por el usuario ni por disco—
+  y un segundo diálogo para una sola operación se aprende a cerrar sin leer.
+- **Ejecución desatendida.** Ejecutar sin que pregunte cada vez. Está **desarmada**
+  por defecto; se arma con `AutonomyPolicy.arm(frase)`, que exige una frase del
+  llavero —o del entorno, si `allow_env_key` lo autoriza— y la compara con
+  `hmac.compare_digest`. Sólo se salta el diálogo el `BROADCAST_TX` que quepa en
+  los límites. **La autonomía salta el diálogo, nunca el `ModeGuard`**: sin modo
+  `EJECUCIÓN` no se llega a firmar ni con la frase correcta.
 - **`ConfirmationGateway`.** Cruza modo + un «sí» explícito del usuario. Sin
   prompt conectado rige `DenyAllPrompt` (todo denegado).
 

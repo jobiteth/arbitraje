@@ -22,7 +22,12 @@ from amigocompora.ui.pages.alerts import AlertsPage
 from amigocompora.ui.pages.engines import EnginesPage
 from amigocompora.ui.pages.prediction import PredictionPage
 from amigocompora.ui.pages.prices import PricesPage
-from amigocompora.ui.theme import APP_SUBTITLE, APP_TITLE, STYLESHEET
+from amigocompora.ui.theme import (
+    APP_SUBTITLE,
+    APP_TITLE,
+    COLOR_DANGER,
+    STYLESHEET,
+)
 from amigocompora.ui.widgets import AlertBanner, QtConfirmationPrompt, spawn
 
 
@@ -67,8 +72,9 @@ class MainWindow(QMainWindow):
         alert_center.subscribe(lambda a: self._on_alert(a))
 
         # Pestañas
+        self._prices = PricesPage(container)
         self._tabs = QTabWidget()
-        self._tabs.addTab(PricesPage(container), "Cotizaciones")
+        self._tabs.addTab(self._prices, "Cotizaciones")
         self._tabs.addTab(PredictionPage(container), "Predicción")
         self._tabs.addTab(AiPage(container), "Copiloto IA")
         self._tabs.addTab(EnginesPage(container), "Motores")
@@ -80,11 +86,23 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         self._status_label = QLabel("Listo")
         status.addWidget(self._status_label, stretch=1)
+        # El indicador de autonomía va **antes** de las alertas, o sea más a la
+        # izquierda y más cerca de donde se lee primero. No es una cifra más: es
+        # la única señal de que la aplicación puede gastar sin consultar, y por
+        # eso se pinta con el color de peligro y no con el de aviso.
+        self._autonomy_label = QLabel("")
+        status.addPermanentWidget(self._autonomy_label)
         self._alert_label = QLabel("")
         status.addPermanentWidget(self._alert_label)
         self._refresh_status()
         alert_center.subscribe(lambda _a: self._refresh_status())
         container.guard.subscribe(lambda _m: self._refresh_status())
+        container.policy.subscribe(lambda _armed: self._refresh_autonomy())
+        # El modo decide si se puede firmar y emitir, así que la pestaña de
+        # cotizaciones tiene que enterarse de que ha cambiado. Sin esto, «Ejecutar»
+        # se queda como estaba y el usuario descubre el cambio al pulsarlo —que es
+        # justo lo que enseña a desconfiar de los botones—.
+        container.guard.subscribe(lambda _m: self._prices.refresh_execution_state())
 
         # Cerrar: detener scheduler y motores.
         self._closing = False
@@ -110,6 +128,34 @@ class MainWindow(QMainWindow):
         self._alert_label.setText(f"● {pending} alerta(s)" if pending else "Sin alertas")
         caps = ", ".join(sorted(c.value for c in self._container.guard))
         self._status_label.setText(f"Modo {self._container.guard.mode.label} · capacidades: {caps or 'ninguna'}")
+        self._refresh_autonomy()
+
+    def _refresh_autonomy(self) -> None:
+        """Pinta el estado de la ejecución desatendida.
+
+        Sólo se enciende cuando está **armada**, que es el caso que hay que ver.
+        El estado normal —desarmada— deja la etiqueta vacía a propósito: un
+        indicador permanente diciendo que todo va bien ocupa el mismo sitio que
+        la alarma y acaba leyéndose igual, que es nada. La ausencia de la alarma
+        es el mensaje.
+
+        Se pinta con el color de peligro y no con el de aviso porque no avisa de
+        un riesgo: describe un hecho que ya está en marcha. Armada, la aplicación
+        emite transacciones reales sin preguntar, dentro de los límites, y lo
+        único que la detiene es desarmarla.
+        """
+        if not self._container.policy.armed:
+            self._autonomy_label.setText("")
+            self._autonomy_label.setToolTip("")
+            return
+        self._autonomy_label.setText("● Ejecución desatendida ARMADA · emite sin preguntar")
+        self._autonomy_label.setStyleSheet(f"color: {COLOR_DANGER}; font-weight: 600;")
+        self._autonomy_label.setToolTip(
+            "La ejecución desatendida está armada: dentro de las listas blancas y "
+            "los topes declarados, la aplicación firma y emite sin pedirte "
+            "confirmación. Para detenerla, desarma la autonomía con "
+            "`AutonomyPolicy.disarm()`."
+        )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._closing:

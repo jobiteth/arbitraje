@@ -73,6 +73,12 @@ QPushButton#secondary {{
     color: {COLOR_TEXT};
 }}
 QPushButton#secondary:hover {{ background: #232730; }}
+QPushButton#danger {{
+    background: {COLOR_DANGER};
+    color: white;
+}}
+QPushButton#danger:hover {{ background: #ff7575; }}
+QPushButton#danger:disabled {{ background: #2a2f3a; color: {COLOR_MUTED}; }}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {COLOR_BG};
     border: 1px solid {COLOR_BORDER};

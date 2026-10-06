@@ -9,16 +9,17 @@ Uniswap, que además de cotizar devuelve el payload listo para firmar.
 
 La API devuelve **HTTP 401 `Unauthenticated api key or session`** a cualquier
 petición de cotización sin clave —medido, no supuesto—. Antes de aceptar que
-hacía falta, se comprobó si quedaba un camino sin clave, y sí lo hay: el router
-V2 leído directamente por JSON-RPC público cotiza de verdad (medido: 1 USDC →
-0,00036836 WETH, con la dirección del router verificada contra la cadena). Ese es
-el motor `uniswap_v2`, la vía **directa**.
+hacía falta, se comprobó si quedaba un camino sin clave, y sí lo hay: los pools
+de Uniswap V3 leídos directamente por JSON-RPC público cotizan de verdad. Ese es
+el motor `uniswap_v3`, la vía **directa**, y está en su propio paquete porque
+usa contratos distintos y una ABI distinta.
 
 Los dos conviven, y no es duplicación: el directo no necesita clave y no se
 detiene nunca; el agregado da mejor precio —la misma medición por la API dio
-0,00037068 WETH, un 0,63 % más— porque reparte la orden entre V2, V3, V4 y rutas
-mixtas en vez de ceñirse a un pool. Por eso el agregado va primero en
-`swap_priority` y el directo queda de respaldo.
+0,00037068 WETH frente a 0,00036836 del router leído por RPC, un 0,63 % más—
+porque reparte la orden entre V2, V3, V4 y rutas mixtas en vez de ceñirse a los
+pools de una sola versión. Por eso el agregado va primero en `swap_priority` y el
+directo queda de respaldo.
 
 ### Lo que se midió contra la API real
 
@@ -342,6 +343,17 @@ class UniswapEngine:
             # para ese tamaño. Es una respuesta, no un formato roto.
             return None
         return as_mapping(quote, "quote", SOURCE_NAME)
+
+
+    def expected_destination(self, chain_key: str) -> str | None:
+        """El router de la tabla medida para esa red, o `None` si no la cubre.
+
+        Se lee de `ROUTERS` en vez de escribirse aparte porque es la misma
+        pregunta —«¿a qué contrato manda este motor los swaps de esta red?»— y
+        mantener dos listas abre la posibilidad de declarar una red cuya
+        dirección ya no esté en la tabla de construcción.
+        """
+        return ROUTERS.get(chain_key)
 
     def _require_same_price(self, quote: Quote, fresh_raw: int) -> None:
         """Aborta si el precio se movió más de lo tolerado desde lo que se vio."""

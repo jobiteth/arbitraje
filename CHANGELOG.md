@@ -5,6 +5,58 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Añadido — Ejecución real: la aplicación firma y emite
+
+- **Modo `EJECUCIÓN`**, el único que concede `SIGN_TX` y `BROADCAST_TX`. Con él
+  la aplicación deja de ser sólo analítica: firma con la cartera que configures y
+  emite la transacción a la red. Los otros tres modos siguen sin poder hacerlo.
+- **Tres cosas a la vez, y a propósito.** El modo, `execution.enabled = true` y
+  —salvo que la ejecución desatendida esté armada— un «sí» explícito en el
+  diálogo. Ninguna de las tres basta sola, y las tres se activan en sitios
+  distintos: el modo en la barra superior, el interruptor en el fichero, el «sí»
+  en el momento de operar.
+- **El interruptor maestro se comprueba en el dominio**, no en la vista. Un
+  interruptor que sólo mira la interfaz no es un interruptor: `check_intent` corta
+  por `enabled` antes de mirar red, token, motor o importe, y por eso ninguna
+  ruta —ni siquiera una que no pase por la pantalla— puede saltárselo.
+- **Listas blancas que fallan del lado de no operar.** `allowed_chains`,
+  `allowed_tokens` y `allowed_engines` vacías significan **nada permitido**, no
+  «sin restricción». Con esto moviendo dinero, el valor por omisión tiene que ser
+  el que no gasta.
+- **Topes contra lo ya gastado.** `max_quote_per_trade` y `max_quote_per_day`
+  se comparan contra el registro `executions.jsonl` de las últimas 24 h, no
+  contra un contador en memoria que se reinicia al cerrar la ventana.
+- **La clave privada se lee sólo al firmar** y no se cachea en el contenedor. No
+  cabe en `config.toml` —que usa `extra="forbid"` y aborta el arranque— ni sale
+  en los logs. Por omisión **no** se lee del entorno: hace falta
+  `execution.allow_env_key = true`, que es una decisión de custodia y no de
+  dinero. Una API key filtrada se rota en un minuto; una clave privada filtrada
+  vacía la cartera y no hay rotación que lo arregle.
+- **Ejecución desatendida armada con frase.** `AutonomyPolicy.arm(frase)` compara
+  contra el llavero con `hmac.compare_digest`, y sólo entonces se salta el
+  diálogo —y sólo el `BROADCAST_TX` que quepa en los límites—. **La autonomía
+  salta el diálogo, nunca el `ModeGuard`**: sin modo `EJECUCIÓN` no se firma ni
+  con la frase correcta, y el `PolicyBypass` sólo puede omitir el prompt, nunca
+  la comprobación de modo.
+- **Comprar y vender.** El par se arma como `token/stable` al vender y como
+  `stable/token` al comprar, y la etiqueta del importe dice en qué unidad está:
+  un importe ambiguo, en una pantalla que firma, es un importe equivocado. El
+  destinatario por omisión es la dirección derivada de tu clave, ofrecida por
+  delante de las direcciones vigiladas.
+- **El botón de ejecutar dice por qué está apagado** cuando falta algo, y nombra
+  las cuatro piezas que pueden faltar: el modo, el interruptor, una cartera y un
+  motor capaz de construir el payload. Las cuatro se enseñan a la vez en vez de
+  la primera, porque arreglar una y destapar la siguiente es lo que hace pensar
+  que la aplicación está rota en lugar de a medio configurar.
+- **El aviso de confirmación depende de la capacidad.** Emitir se describe como
+  lo que es —real, irreversible y no cancelable—; preparar, como lo que no firma
+  ni emite. Antes era un texto fijo que afirmaba que la aplicación nunca firma:
+  con esta entrega esa frase habría sido falsa justo en el instante en que el
+  usuario decide.
+- **La barrera, verificada por mutación**, no por lectura: conceder `SIGN_TX` a
+  `ASISTIDO`, quitar las comprobaciones previas de `ExecuteSwap`, forzar el
+  interruptor maestro o anular el bloqueo por motor hacen fallar la suite.
+
 ### Cambiado — Comparar precios usa **todos** los motores activos
 
 - `ComparePrices` cotiza todos los motores de la ranura DEX y **fusiona** sus
@@ -50,8 +102,9 @@ versionado [SemVer](https://semver.org/lang/es/).
   manda `"0"` donde la de Uniswap manda `"0x00"`. Un lector de una sola forma
   habría abortado cada swap, o callado un valor nativo distinto de cero.
 - No integra `/gasless/quote`: ese flujo termina en `/gasless/submit`, donde 0x
-  **emite** la transacción por el usuario. Amigocompora no firma ni emite, así
-  que el motor no podría completar nunca su propio flujo.
+  **emite** la transacción por el usuario. Amigocompora firma localmente con la
+  clave del usuario y no delega ni la firma ni el envío en un tercero, así que
+  ese flujo no encaja en el motor.
 
 ### Cambiado — El impacto de precio puede faltar
 

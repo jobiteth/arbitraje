@@ -259,6 +259,41 @@ class SwapPlanner(Engine, Protocol):
 
     async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction: ...
 
+    def expected_destination(self, chain_key: str) -> str | None:
+        """El contrato al que este motor dirige los swaps en esa red, o `None`.
+
+        Existe para que el camino de ejecución pueda contrastar, **antes de
+        firmar**, que el `to` del payload está entre los destinos que el motor
+        declara para esa red. Un payload cuyo destino no sea uno de ellos es
+        exactamente lo que hay que no firmar: ni un motor mal configurado ni una
+        respuesta manipulada deberían poder desviar los fondos.
+
+        Lo declara el motor y no el núcleo porque la tabla es suya y está medida
+        contra el proveedor: `infra.evm` no puede importar `engines` —la
+        dependencia va `infra → domain`—, así que si el dato viviera allí, o se
+        duplicaría aquí o el contraste no podría existir.
+
+        `None` significa «este motor no declara destino para esa red», y quien
+        lo consulte tiene que decidir qué hacer con eso; en el camino de
+        ejecución, no firmar.
+
+        ### Añadir un método aquí no es aditivo, y conviene saberlo
+
+        `SwapPlanner` es `runtime_checkable`, y esa comprobación mira **qué
+        métodos existen**, no sus firmas. Así que un método nuevo aquí invalida
+        de golpe a todo motor que no lo tenga, y no sólo para ejecutar: el
+        registro deja de reconocerlo y tampoco podrá preparar swaps. Se midió al
+        añadir este método: tres pruebas de Solana y tres de la pila de motores
+        empezaron a fallar porque a sus dobles les faltaba.
+
+        Es el precio de que la comprobación sea estructural, y se paga a
+        conciencia: un motor que construye payloads **tiene** que poder decir a
+        dónde van. Lo que hay que recordar es que el próximo método que se añada
+        aquí obliga a tocar todos los motores y todos los dobles, y que el
+        olvido no se ve en el tipo —se ve en las pruebas, si existen.
+        """
+        ...
+
 
 @runtime_checkable
 class PredictionMarketEngine(Engine, Protocol):

@@ -20,19 +20,60 @@ from typing import Final, Protocol, runtime_checkable
 
 import structlog
 
-from amigocompora.domain.errors import AmigocomporaError
+from amigocompora.domain.errors import (
+    AmigocomporaError,
+    KeyCustodyError,
+    NoWalletError,
+)
 from amigocompora.domain.protocols import ConfigResolver, EngineManifest
+from amigocompora.infra.evm.signer import address_from_key
 
 _log = structlog.get_logger(__name__)
 
 #: Nombre del servicio bajo el que se agrupan las credenciales en el keyring.
 SERVICE_NAME: Final = "Amigocompora"
 
+#: Prefijo de las credenciales que **no** son de un motor: la cartera que firma
+#: y lo que la habilita. Van separadas de las de motor porque no siguen su
+#: ciclo de vida —no se activan ni se desactivan con un motor— y porque mezclar
+#: una clave privada con una API key en el mismo espacio de nombres invita a
+#: tratarlas igual, que es justo lo que no hay que hacer.
+APP_PREFIX: Final = "app:"
+
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
+
+#: Credencial de la clave privada que firma. La aplicación no la escribe nunca.
+#:
+#: `noqa: S105` porque el analizador ve «KEY» en el nombre y avisa de un secreto
+#: incrustado: lo que hay aquí es el **nombre de la entrada** en el almacén, no
+#: la clave. La clave no aparece en este fichero ni puede aparecer — escribirla
+#: aquí sería justo el fallo que estas dos constantes existen para evitar.
+PRIVATE_KEY_SECRET: Final = "execution_private_key"  # noqa: S105
+#: Credencial de la frase que habilita la ejecución desatendida. Mismo caso.
+AUTONOMY_PASSPHRASE_SECRET: Final = "execution_autonomy_passphrase"  # noqa: S105
 
 
 class SecretStoreError(AmigocomporaError):
     """El almacén de credenciales del sistema no está disponible."""
+
+
+class MissingSecretError(AmigocomporaError):
+    """Se pidió un secreto por su nombre y no está en ningún sitio.
+
+    Distinto de `SecretStoreError`: ahí el almacén no responde y puede que el
+    secreto exista; aquí el almacén respondió y dijo que no lo tiene. El mensaje
+    tiene que decir **qué variable** definir, porque quien lo lee sólo ve que un
+    endpoint no funciona.
+    """
+
+    def __init__(self, name: str, place: str) -> None:
+        self.name = name
+        self.place = place
+        super().__init__(
+            f"falta el secreto «{name}», que se usa en {place}. Guárdalo en el "
+            f"administrador de credenciales como «{app_secret_key(name)}» o define "
+            f"la variable {app_env_var_name(name)}."
+        )
 
 
 def secret_key(engine_id: str, option: str) -> str:
@@ -40,10 +81,26 @@ def secret_key(engine_id: str, option: str) -> str:
     return f"{engine_id}:{option}"
 
 
+def app_secret_key(name: str) -> str:
+    """Credencial de la aplicación, no de un motor: `app:<name>`."""
+    return f"{APP_PREFIX}{name}"
+
+
 def env_var_name(engine_id: str, option: str) -> str:
     """Variable de entorno equivalente, para CI y contenedores."""
     slug = _NON_ALNUM.sub("_", f"{engine_id}_{option}".upper()).strip("_")
     return f"AMIGOCOMPORA_ENGINE_{slug}"
+
+
+def app_env_var_name(name: str) -> str:
+    """Variable de entorno equivalente para una credencial de la aplicación.
+
+    `app_env_var_name("execution_private_key")` da
+    `AMIGOCOMPORA_EXECUTION_PRIVATE_KEY`, sin el `ENGINE_` que llevan las de
+    motor.
+    """
+    slug = _NON_ALNUM.sub("_", name.upper()).strip("_")
+    return f"AMIGOCOMPORA_{slug}"
 
 
 @runtime_checkable
@@ -114,6 +171,261 @@ class InMemorySecretStore:
 
     def delete(self, key: str) -> None:
         self.values.pop(key, None)
+
+
+class SpendingKeyProvider:
+    """Entrega la clave privada que firma, y sólo cuando hay que firmar.
+
+    Existe separada del `SecretStore` porque la política de custodia de una
+    clave privada **no** es la de una API key, y mezclarlas habría hecho que la
+    primera heredara las comodidades de la segunda:
+
+    - Una API key filtrada se rota en un minuto. Una clave privada filtrada
+      vacía la cartera para siempre, y no hay rotación que lo arregle: la
+      dirección cambia, y con ella los fondos.
+    - Por eso el fallback a variable de entorno —razonable para una API key, y
+      la única vía que funciona en una máquina sin keyring— aquí viene
+      **apagado por omisión**. Se enciende con `allow_env_fallback`, que es una
+      decisión explícita de quien opera y no un descuido de configuración.
+
+    Nada de esto guarda la clave: se devuelve, se usa y se deja de referenciar.
+    La aplicación no la escribe en disco, no la cachea y no la registra.
+    """
+
+    __slots__ = ("_allow_env_fallback", "_store")
+
+    def __init__(
+        self,
+        store: SecretStore,
+        *,
+        allow_env_fallback: bool = False,
+    ) -> None:
+        self._store = store
+        self._allow_env_fallback = allow_env_fallback
+
+    @property
+    def env_var(self) -> str:
+        """La variable donde se buscaría, para poder decírselo al usuario."""
+        return app_env_var_name(PRIVATE_KEY_SECRET)
+
+    def available(self) -> bool:
+        """Si hay con qué firmar. No lanza: la UI lo llama para pintar botones."""
+        try:
+            return self.get() is not None
+        except (NoWalletError, KeyCustodyError):
+            return False
+
+    def address(self) -> str | None:
+        """La **dirección pública** que firmaría, o `None` si no hay cartera.
+
+        Deriva la dirección de la clave —una operación pública y barata— y
+        devuelve la dirección, nunca la clave. Es lo que la interfaz necesita para
+        enseñar de qué cartera saldría el dinero y para proponerla como destino por
+        omisión: teclear una dirección a mano es la forma más común de perder
+        fondos, y ofrecer la propia la elimina.
+
+        No lanza, igual que `available`: es una consulta para pintar la pantalla, y
+        una pantalla que no se puede pintar porque el llavero no responde es peor
+        que una que dice «sin cartera». Quien vaya a **firmar** usa `require()`, que
+        sí distingue «no hay clave» de «el almacén falló».
+        """
+        try:
+            return address_from_key(self.require())
+        except (NoWalletError, KeyCustodyError):
+            return None
+
+    def get(self) -> str | None:
+        """La clave privada, o `None` si no hay ninguna configurada.
+
+        Lanza `KeyCustodyError` cuando **sí** podría haberla pero el almacén no
+        responde y el fallback está apagado: distinguirlo de «no hay clave»
+        importa, porque el mensaje que hay que darle al usuario es distinto —
+        «configúrala» frente a «tu almacén no funciona y no voy a leerla de un
+        sitio inseguro».
+        """
+        store_error: SecretStoreError | None = None
+        try:
+            value = self._store.get(app_secret_key(PRIVATE_KEY_SECRET))
+        except SecretStoreError as error:
+            store_error = error
+            value = None
+
+        if value:
+            return value
+
+        if self._allow_env_fallback:
+            from_env = os.environ.get(self.env_var)
+            if from_env:
+                _log.warning(
+                    "secrets.private_key_from_env",
+                    hint=(
+                        "la clave privada se leyó de una variable de entorno. "
+                        "Cualquiera con acceso al entorno del proceso la tiene."
+                    ),
+                )
+                return from_env
+
+        if store_error is not None and not self._allow_env_fallback:
+            raise KeyCustodyError(
+                f"el almacén de credenciales no está disponible ({store_error}) y el "
+                f"fallback a la variable de entorno está apagado. Una clave privada "
+                f"en el entorno del proceso la ve cualquiera que pueda leer el "
+                f"entorno, y a diferencia de una API key no se puede rotar sin "
+                f"cambiar de cartera. Instala un almacén cifrado (por ejemplo "
+                f"`keyrings.cryptfile`) o activa explícitamente "
+                f"`execution.allow_env_key` si asumes el riesgo."
+            )
+
+        if store_error is not None:
+            _log.warning("secrets.store_unavailable", reason=str(store_error))
+        return None
+
+    def require(self) -> str:
+        """Como `get`, pero lanza `NoWalletError` si no hay clave.
+
+        Es lo que llama el caso de uso: si no hay con qué firmar, la operación
+        no se intenta siquiera, y el mensaje dice dónde se configura.
+        """
+        key = self.get()
+        if key is None:
+            raise NoWalletError(
+                f"no hay ninguna cartera configurada, así que no hay con qué firmar. "
+                f"Guarda la clave privada en el administrador de credenciales como "
+                f"«{app_secret_key(PRIVATE_KEY_SECRET)}»"
+                + (f" o en {self.env_var}" if self._allow_env_fallback else "")
+                + "."
+            )
+        return key
+
+
+class AutonomyPassphraseProvider:
+    """La frase que habilita la ejecución desatendida.
+
+    Es prima hermana de `SpendingKeyProvider` y **no** la misma cosa: esta frase
+    no firma nada ni mueve un céntimo por sí sola. Lo que hace es convertir «hay
+    una clave cargada» en «se emite sin preguntar», que es la decisión que un
+    operador tiene que tomar a propósito y no descubrir después.
+
+    Por eso se lee de los mismos dos sitios y con el mismo recato, y por eso
+    `get` **no lanza nunca**: un llavero roto, una frase ausente y una frase vacía
+    significan lo mismo —no hay autonomía— y el fallo cae del lado de preguntar.
+    Es la diferencia deliberada con `SpendingKeyProvider.require()`, donde un
+    error de custodia **sí** tiene que detener la operación: quedarse sin clave
+    impide firmar, y quedarse sin frase sólo impide firmar *sin preguntar*.
+    """
+
+    __slots__ = ("_allow_env_fallback", "_store")
+
+    def __init__(
+        self,
+        store: SecretStore,
+        *,
+        allow_env_fallback: bool = False,
+    ) -> None:
+        self._store = store
+        self._allow_env_fallback = allow_env_fallback
+
+    @property
+    def env_var(self) -> str:
+        """La variable donde se buscaría, para poder decírselo al usuario."""
+        return app_env_var_name(AUTONOMY_PASSPHRASE_SECRET)
+
+    def get(self) -> str | None:
+        """La frase, o `None` si no hay ninguna configurada.
+
+        El llavero manda sobre el entorno: si hay frase guardada, la del entorno
+        ni se mira. Es la misma precedencia que usa la clave privada, y por la
+        misma razón — el sitio bueno gana cuando existe, y el respaldo sólo
+        rellena su ausencia.
+        """
+        try:
+            value = self._store.get(app_secret_key(AUTONOMY_PASSPHRASE_SECRET))
+        except SecretStoreError as error:
+            # Un llavero que no responde no es motivo para no arrancar: sin frase
+            # no hay autonomía, y sin autonomía la aplicación sigue sirviendo para
+            # todo lo demás. Se registra para que el silencio no oculte la causa
+            # cuando alguien pregunte por qué no se arma.
+            _log.warning("secrets.passphrase_store_unavailable", reason=str(error))
+            value = None
+
+        if value:
+            return value
+
+        if self._allow_env_fallback:
+            from_env = os.environ.get(self.env_var)
+            if from_env:
+                _log.warning(
+                    "secrets.passphrase_from_env",
+                    hint=(
+                        "la frase de autonomía se leyó de una variable de entorno. "
+                        "Quien pueda leer el entorno del proceso puede habilitar la "
+                        "ejecución sin confirmación."
+                    ),
+                )
+                return from_env
+        return None
+
+
+#: Marcador de secreto dentro de un texto de configuración: `${NOMBRE}`.
+#:
+#: El nombre va deliberadamente restringido a identificadores simples. Un
+#: marcador que admitiera cualquier cosa sería una plantilla, y una plantilla en
+#: un fichero de configuración es una superficie de ataque: `${a}${b}` o rutas
+#: con `..` dejarían de ser una referencia a una credencial para convertirse en
+#: una forma de leer otra cosa.
+_PLACEHOLDER = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]*)\}")
+
+
+def has_placeholders(text: str) -> bool:
+    """Si el texto referencia algún secreto. No revela cuáles."""
+    return bool(_PLACEHOLDER.search(text))
+
+
+def resolve_placeholders(
+    text: str,
+    store: SecretStore,
+    *,
+    allow_env_fallback: bool = True,
+    place: str = "la configuración",
+) -> str:
+    """Sustituye cada `${NOMBRE}` por la credencial `app:NOMBRE`.
+
+    Existe para que una clave de RPC —que viaja **dentro** de una URL— no tenga
+    que escribirse en `config.toml`. El fichero de configuración se copia, se
+    pega en un issue y se sube a un repositorio; una URL con la clave dentro
+    convierte cada una de esas cosas en una filtración. Con el marcador, el
+    fichero dice dónde está la clave y la clave está en otro sitio.
+
+    Se resuelve **una sola vez**, al construir el contenedor, y no en cada
+    petición: el valor sustituido no se guarda en ningún objeto de larga vida más
+    allá del cliente HTTP, que ya tenía que llevar la URL de todos modos.
+
+    Un marcador que no se puede resolver es un error, no una cadena vacía: dejar
+    la URL con `${...}` dentro produciría un endpoint que falla con un error de
+    DNS incomprensible, y sustituirlo por vacío produciría uno que responde 401
+    sin decir por qué.
+    """
+    missing: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        try:
+            value = store.get(app_secret_key(name))
+        except SecretStoreError:
+            # Un almacén caído no es un secreto ausente, pero tampoco se puede
+            # inventar el valor: se trata como ausente y el mensaje dirá las dos
+            # vías de configurarlo, una de las cuales no depende del almacén.
+            value = None
+        value = value or (os.environ.get(app_env_var_name(name)) if allow_env_fallback else None)
+        if not value:
+            missing.append(name)
+            return match.group(0)
+        return value
+
+    resolved = _PLACEHOLDER.sub(replace, text)
+    if missing:
+        raise MissingSecretError(missing[0], place)
+    return resolved
 
 
 def build_config_resolver(

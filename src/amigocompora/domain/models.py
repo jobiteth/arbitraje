@@ -560,6 +560,68 @@ def _require_confirmable(description: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenApproval:
+    """A quién hay que autorizar para que un payload pueda mover un token.
+
+    Existe porque «el router mueve el token» dejó de ser cierto. Se medió
+    contra los contratos desplegados y hay dos caminos, no uno:
+
+    - **Directo.** El router llama a `transferFrom` y el token se le autoriza a
+      él. Es el caso de Uniswap V2 Router02 y del SwapRouter V1 de V3, que está
+      en Ethereum, Optimism, Arbitrum y Polygon.
+    - **Por Permit2.** El router **no** toca el token: se lo pide a Permit2, y
+      Permit2 sólo lo entrega si el dueño se lo ha autorizado a él. Son dos
+      permisos encadenados —el del ERC-20 contra Permit2 y el de Permit2 contra
+      el router— y ninguno sustituye al otro. Es el caso del SwapRouter02, que
+      es **el único router V3 que existe en Base**, y del Universal Router.
+
+    Que esto viva en el payload y no en el ejecutor es lo que permite que la
+    decisión la tome quien conoce el contrato —el motor, que acaba de leer su
+    `factory()` y su `WETH9()`— y no una tabla de casos por red metida en el
+    camino que firma.
+
+    Un `approve` contra el contrato equivocado no falla al construirse: se
+    firma, se emite, se paga el gas y el swap revierte. Por eso conviene que el
+    dato viaje pegado al payload y no se deduzca en dos sitios distintos.
+    """
+
+    #: Contrato que ejecuta el `transferFrom` del token: el router del swap.
+    spender: str
+    #: Permit2, si el router cobra a través de él. `None` en el camino directo.
+    via: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.spender:
+            raise InvalidAmountError(
+                "el permiso necesita el contrato que va a mover el token: sin él "
+                "no se sabe a quién autorizar"
+            )
+
+    @property
+    def target(self) -> str:
+        """A quién se le da el `approve` del ERC-20. No siempre es el router.
+
+        Es el único sitio donde esta decisión se toma: con Permit2 de por medio,
+        el token se le autoriza a Permit2, y quien autoriza al router es Permit2.
+        """
+        return self.via or self.spender
+
+    @property
+    def is_chained(self) -> bool:
+        """¿Hacen falta los dos permisos, o basta el del ERC-20?"""
+        return self.via is not None
+
+    def describe(self) -> TransactionField:
+        if self.via is None:
+            return ("Permiso del token", f"directo al router {self.spender}")
+        return (
+            "Permiso del token",
+            f"encadenado por Permit2 ({self.via}) hacia el router {self.spender}: "
+            f"son dos transacciones de permiso, no una",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class UnsignedTransaction:
     """Payload de transacción **sin firmar**, para revisión del usuario.
 
@@ -581,6 +643,12 @@ class UnsignedTransaction:
     value: TokenAmount
     description: str
     gas_limit: int | None = None
+    #: Cómo hay que autorizar el token antes de que esto se pueda ejecutar.
+    #:
+    #: `None` —lo que hace todo motor que no diga otra cosa— significa el camino
+    #: directo contra `to_address`, que es como funcionaba esto cuando el único
+    #: router era uno que movía los tokens él mismo.
+    approval: TokenApproval | None = None
 
     def __post_init__(self) -> None:
         if not self.to_address:
@@ -589,15 +657,33 @@ class UnsignedTransaction:
         if self.value.raw < 0:
             raise InvalidAmountError("el valor de la transacción no puede ser negativo")
 
+    @property
+    def token_approval(self) -> TokenApproval:
+        """El permiso a conceder, resolviendo el caso por omisión.
+
+        Devuelve siempre un `TokenApproval` para que el ejecutor no tenga que
+        ramificar: un payload que no declara nada se comporta como el camino
+        directo contra su propio destino, que es lo que hacía antes de que este
+        campo existiera.
+        """
+        return self.approval or TokenApproval(spender=self.to_address)
+
     def describe(self) -> tuple[TransactionField, ...]:
         """Campos para mostrar al usuario, en el orden en que se leen."""
-        return (
+        campos: tuple[TransactionField, ...] = (
             ("Red", f"EVM (chain id {self.chain_id})"),
             ("Destino", self.to_address),
             ("Valor", str(self.value)),
             ("Descripción", self.description),
-            ("Calldata", self.calldata),
         )
+        # El permiso se enseña **sólo** cuando es encadenado. Enseñar el directo
+        # sería ruido: es un `approve` de un token propio al contrato que va a
+        # hacer el swap, y no hay nada que decidir sobre él. El encadenado sí,
+        # porque son dos transacciones y una de ellas sobrevive a esta operación
+        # hasta su caducidad — eso el usuario tiene que verlo antes de firmar.
+        if self.approval is not None and self.approval.is_chained:
+            campos += (self.approval.describe(),)
+        return (*campos, ("Calldata", self.calldata))
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,3 +739,237 @@ class UnsignedSolanaTransaction:
 #: Lo que un motor de swap puede devolver. La UI la consume a través de
 #: `describe()`, así que añadir una red nueva no toca la vista.
 type PlannedTransaction = UnsignedTransaction | UnsignedSolanaTransaction
+
+
+# --------------------------------------------------------------------------- #
+# Ejecución — lo que ya no es un borrador
+# --------------------------------------------------------------------------- #
+#: Un hash de transacción: `0x` y 64 dígitos hexadecimales. Se valida porque un
+#: hash inventado en un mensaje de error manda al usuario a un explorador donde
+#: no hay nada, y eso es peor que no dar ninguno.
+_TX_HASH_LENGTH: Final = 66
+
+#: El prefijo de una transacción EIP-1559 firmada y serializada: tipo 2.
+_EIP1559_PREFIX: Final = "0x02"
+
+
+def _require_tx_hash(value: str, field_name: str) -> str:
+    if len(value) != _TX_HASH_LENGTH or not value.startswith("0x"):
+        raise InvalidAmountError(
+            f"{field_name} no es un hash de transacción: «{value}». "
+            f"Se espera 0x seguido de 64 dígitos hexadecimales."
+        )
+    try:
+        int(value[2:], 16)
+    except ValueError as error:
+        raise InvalidAmountError(f"{field_name} no es hexadecimal: «{value}»") from error
+    return value
+
+
+class BroadcastStatus(StrEnum):
+    """En qué estado quedó una transacción emitida."""
+
+    #: Aceptada por el nodo y aún sin minar. Es el estado normal justo después
+    #: de emitir: no se espera a que mine, porque eso puede tardar minutos y el
+    #: usuario tiene que poder seguir usando la aplicación.
+    PENDING = "pending"
+    SUCCESS = "success"
+    REVERTED = "reverted"
+    #: No se llegó a saber: el nodo dejó de responder antes de dar un recibo.
+    #: Es distinto de `PENDING` —aquí no se sabe si sigue viva— y decirlo así
+    #: evita que el usuario dé por hecha una operación de la que no hay prueba.
+    UNKNOWN = "unknown"
+
+    @property
+    def is_final(self) -> bool:
+        return self in {BroadcastStatus.SUCCESS, BroadcastStatus.REVERTED}
+
+
+@dataclass(frozen=True, slots=True)
+class SignedEvmTransaction:
+    """Una transacción EVM **firmada**, lista para emitirse.
+
+    Existe sólo aquí y no se guarda en ningún sitio: la firma convierte el
+    payload en un instrumento al portador —quien la tenga puede emitirla— así que
+    su vida es la de la operación y nada más.
+
+    De la clave privada que la produjo **no hay rastro**: ni un campo, ni un
+    hash, ni el `r`/`s`/`v` sueltos. El único vínculo es `from_address`, que es
+    pública y es justo lo que el usuario necesita ver para saber de qué cartera
+    sale el dinero.
+
+    `nonce`, `gas_limit` y las comisiones viven aquí y no en
+    `UnsignedTransaction` porque no son parte de la propuesta del motor: son
+    estado de la red que se consultó en el último momento. Mezclarlos habría
+    hecho que un payload de hace un minuto pareciera tener un nonce válido.
+    """
+
+    raw_hex: str
+    tx_hash: str
+    from_address: str
+    chain_id: int
+    nonce: int
+    to_address: str
+    value: TokenAmount
+    gas_limit: int
+    max_fee_per_gas: int
+    max_priority_fee_per_gas: int
+    calldata: str
+    description: str
+
+    def __post_init__(self) -> None:
+        if not self.raw_hex.startswith(_EIP1559_PREFIX):
+            raise InvalidAmountError(
+                f"la transacción firmada no empieza por {_EIP1559_PREFIX}: "
+                f"no es una EIP-1559 serializada."
+            )
+        _require_tx_hash(self.tx_hash, "el hash de la transacción")
+        if self.nonce < 0:
+            raise InvalidAmountError(f"el nonce no puede ser negativo, llegó {self.nonce}")
+        if self.gas_limit <= 0:
+            raise InvalidAmountError(
+                f"el límite de gas debe ser positivo, llegó {self.gas_limit}. "
+                f"Sin él la transacción no se puede firmar."
+            )
+        if self.max_fee_per_gas <= 0:
+            raise InvalidAmountError(
+                f"el precio máximo por gas debe ser positivo, llegó {self.max_fee_per_gas}"
+            )
+        if self.max_fee_per_gas < self.max_priority_fee_per_gas:
+            raise InvalidAmountError(
+                f"el precio máximo por gas ({self.max_fee_per_gas}) es menor que la "
+                f"propina ({self.max_priority_fee_per_gas}): la transacción nunca "
+                f"sería aceptable y el nodo la rechazaría."
+            )
+        _require_confirmable(self.description)
+
+    @property
+    def max_cost_wei(self) -> int:
+        """Lo máximo que puede costar en gas, en wei. Es el techo, no la cuenta."""
+        return self.gas_limit * self.max_fee_per_gas
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (
+            ("Red", f"EVM (chain id {self.chain_id})"),
+            ("Firma", self.from_address),
+            ("Destino", self.to_address),
+            ("Valor", str(self.value)),
+            ("Nonce", str(self.nonce)),
+            ("Límite de gas", str(self.gas_limit)),
+            ("Coste máximo en gas", f"{self.max_cost_wei} wei"),
+            ("Hash", self.tx_hash),
+            ("Descripción", self.description),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BroadcastReceipt:
+    """Qué pasó al emitir. Es la prueba de que la operación ocurrió."""
+
+    tx_hash: str
+    chain: str
+    status: BroadcastStatus
+    observed_at: datetime
+    block_number: int | None = None
+    #: Motivo del fallo si la red la revirtió, tal cual lo dio el nodo.
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        _require_tx_hash(self.tx_hash, "el hash del recibo")
+        _require_aware(self.observed_at, "el momento del recibo")
+        if self.status is BroadcastStatus.REVERTED and not self.reason:
+            raise InvalidAmountError(
+                "un recibo revertido tiene que traer el motivo: sin él no se puede "
+                "saber si fue el mercado o un parámetro mal puesto."
+            )
+
+    @property
+    def is_proof(self) -> bool:
+        """Si esto ya es prueba suficiente para anotarlo en el registro.
+
+        `PENDING` cuenta: la transacción existe y es pública, aunque aún no haya
+        minado. `UNKNOWN` no, porque anotar como hecha una operación de la que no
+        se sabe nada es exactamente lo que un registro no debe hacer.
+        """
+        return self.status is not BroadcastStatus.UNKNOWN
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionIntent:
+    """Lo que se propone ejecutar, en los términos que la política evalúa.
+
+    `notional` es lo que **se entrega**, y por eso tiene que ser una de las dos
+    patas del par: es un hecho, no una estimación.
+
+    `reference_value` es cuánto vale eso en la moneda en la que están escritos
+    los topes —la stablecoin de referencia de la red—, y sólo aparece cuando el
+    par no toca esa moneda. Ahí es donde está el trabajo: «5 000 por operación»
+    tiene que querer decir lo mismo para un par de WETH que para uno de un token
+    de 18 decimales que nadie conoce, y comparar el importe entregado contra un
+    tope expresado en otra unidad sería comparar peras con manzanas —o peor,
+    dejar que un token carísimo se cuele por debajo de un tope pensado para
+    dólares—. Cuando el par **sí** toca la moneda de referencia no hace falta
+    ninguna valoración: la pata que coincide es el valor exacto, y `None` aquí
+    significa exactamente eso.
+    """
+
+    quote: Quote
+    recipient: str
+    notional: TokenAmount
+    engine_id: str
+    #: El mismo importe, valorado en la moneda de referencia de la red. `None`
+    #: cuando `notional` **ya** está en esa moneda, que es el caso de siempre.
+    reference_value: TokenAmount | None = None
+
+    def __post_init__(self) -> None:
+        if not self.recipient:
+            raise InvalidAmountError("una ejecución necesita destinatario")
+        if self.notional.raw <= 0:
+            raise InvalidAmountError(
+                f"el importe de referencia debe ser positivo, llegó {self.notional}"
+            )
+        if self.reference_value is not None and self.reference_value.raw <= 0:
+            raise InvalidAmountError(
+                f"la valoración en la moneda de referencia debe ser positiva, llegó "
+                f"{self.reference_value}"
+            )
+        # `TokenAmount` no lleva la red —sólo símbolo y escala—, así que la
+        # coherencia se comprueba contra las dos patas del par, que sí la llevan.
+        # El importe entregado es siempre una de ellas. Comparar por `symbol` y
+        # `decimals` es lo que el resto del dominio usa para decidir si dos
+        # cantidades son sumables.
+        legs = (self.quote.pair.base, self.quote.pair.quote)
+        if not any(
+            leg.symbol == self.notional.symbol and leg.decimals == self.notional.decimals
+            for leg in legs
+        ):
+            raise CurrencyMismatchError(
+                f"el importe de referencia ({self.notional}) no es ninguna de las dos "
+                f"patas de {self.quote.pair.symbol}: no se puede comparar contra un "
+                f"tope expresado en otra unidad."
+            )
+
+    @property
+    def measured(self) -> TokenAmount:
+        """El importe que se mide contra los topes, **en la unidad del tope**.
+
+        Es la única cifra que ve la política. Se prefiere la valoración cuando
+        existe y se cae al importe entregado cuando no, que es el caso en el que
+        los dos son el mismo número y no hay nada que valorar.
+        """
+        return self.reference_value or self.notional
+
+    @property
+    def tokens(self) -> tuple[str, str]:
+        """Los dos símbolos que toca la operación, para la lista blanca."""
+        return (self.quote.pair.base.symbol, self.quote.pair.quote.symbol)
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (
+            ("Par", self.quote.pair.symbol),
+            ("Entregas", str(self.quote.amount_in)),
+            ("Recibes", str(self.quote.amount_out)),
+            ("Importe de referencia", str(self.notional)),
+            ("Motor", self.engine_id),
+            ("Destino", self.recipient),
+        )

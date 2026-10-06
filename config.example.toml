@@ -9,8 +9,9 @@
 # el administrador de credenciales del sistema (keyring) o como variables de
 # entorno AMIGOCOMPORA_ENGINE_<ENGINE>_<OPTION>.
 
-# Modo de arranque: "observation" | "simulation" | "assisted".
+# Modo de arranque: "observation" | "simulation" | "assisted" | "execution".
 # El menos capaz por defecto; subir de modo es un acto explícito del usuario.
+# Sólo "execution" permite firmar y emitir transacciones. Ver [execution] abajo.
 mode = "observation"
 
 log_level = "INFO"
@@ -24,24 +25,55 @@ request_timeout_seconds = 10.0
 rpc_failure_threshold = 3
 rpc_cooldown_seconds = 30.0
 
-# Motor activo por ranura. Si se omite, se autoactiva el preferido.
+# Direcciones que quieres observar. Son direcciones, no carteras: aquí no caben
+# claves privadas ni frases semilla, y escribir una no hace que la aplicación
+# pueda operar con ella.
+#
+# La cartera que **sí** puede firmar se configura aparte, con su clave, y no en
+# este fichero: ver la sección «Ejecución» más abajo.
+watch_addresses = []
+
+# ATENCIÓN al editar este fichero: en TOML, toda clave suelta que venga después
+# de una cabecera `[tabla]` pertenece a esa tabla. Todas las claves de arriba
+# van antes de la primera cabecera por eso. Una clave de nivel superior colocada
+# más abajo no se ignora: se cuela dentro de la tabla anterior y hace fallar el
+# arranque con un error que habla de otra cosa.
+
+# Motores activos por ranura. Si se omite, se autoactiva el preferido.
+#
+# Una ranura admite **varios** motores a la vez. El primero manda y los demás se
+# suman, así que cotizan todos y se comparan sus precios; el orden de respuesta
+# lo decide la prioridad de cada motor, no el orden de esta lista.
+#
+# Para operar de verdad hacen falta motores que sepan construir la transacción
+# —`uniswap_v3` y `uniswap_v4` lo hacen, contra los contratos y sin clave—,
+# porque `geckoterminal` sólo publica precios y no puede preparar un swap.
+# V3 y V4 son pools distintos con precios distintos: apilados se ven los dos.
 [active_engines]
-dex_quotes = "geckoterminal"
+dex_quotes = ["uniswap_v3", "uniswap_v4", "geckoterminal"]
 prediction_markets = "polymarket"
 ai_advisor = "stub_advisor"
 
 # Endpoints RPC por red (opcional). Mínimo privilegio: sólo https salvo hosts
 # locales. La API key del proveedor viaja en la URL, así que nunca uses http.
+#
+# Para no escribir la clave en este fichero, usa un marcador `${NOMBRE}`: se
+# resuelve al arrancar desde el administrador de credenciales —como
+# `app:NOMBRE`— o desde la variable de entorno `AMIGOCOMPORA_NOMBRE`. Si no se
+# puede resolver, ese endpoint se descarta con un aviso y la red sigue
+# funcionando con los respaldos públicos; la aplicación no deja de arrancar.
+# Ejemplo:
 # [[chains]]
 # chain = "ethereum"
 # endpoints = [
+#     { url = "https://mainnet.infura.io/v3/${INFURA_API_KEY}", label = "infura", priority = 10 },
 #     { url = "https://ethereum-rpc.publicnode.com", label = "publicnode", priority = 100 },
-#     { url = "https://rpc.ankr.com/eth", label = "ankr", priority = 200 },
 # ]
-
-# Direcciones de SÓLO LECTURA que quieres observar. La app no guarda claves
-# privadas y no puede operar con ellas.
-watch_addresses = []
+#
+# Y sin clave propia, basta con pedir los respaldos públicos medidos:
+# [[chains]]
+# chain = "base"
+# include_public_fallbacks = true
 
 # Ejemplo de par vigilado para el barrido periódico (la UI lo configura):
 # [[watch_pairs]]
@@ -50,3 +82,96 @@ watch_addresses = []
 # quote = "USDC"
 # amount = "1"
 # min_net_bps = 10
+
+# ---------------------------------------------------------------------------
+# Ejecución: firmar y emitir transacciones. Irreversible.
+# ---------------------------------------------------------------------------
+# Esto NO es lo que enciende la ejecución: hacen falta **tres** cosas, y son
+# actos distintos a propósito.
+#
+#   1. `enabled = true` aquí abajo.
+#   2. El modo en "execution" —arriba al arrancar, o desde la barra superior—.
+#   3. Para operar **sin que te pregunte cada vez**, la autonomía armada con su
+#      frase. Sin ella se confirma cada operación, una a una.
+#
+# Los dos secretos —la clave privada que firma y la frase de autonomía— **no se
+# escriben aquí**. Este fichero rechaza cualquier clave que no conozca, así que
+# una escrita por error no se ignora: aborta el arranque diciendo dónde va. Un
+# `config.toml` se copia, se pega en un issue y se sube a un repositorio.
+#
+# Van en el administrador de credenciales del sistema o, si se autoriza
+# explícitamente con `allow_env_key`, en el entorno:
+#
+#   AMIGOCOMPORA_EXECUTION_PRIVATE_KEY        la que firma
+#   AMIGOCOMPORA_EXECUTION_AUTONOMY_PASSPHRASE   la que autoriza sin preguntar
+#
+# Con `allow_env_key = false` (por omisión) la variable de entorno se ignora. Es
+# deliberado: una API key filtrada se rota en un minuto; una clave privada
+# filtrada vacía la cartera y no hay rotación que lo arregle.
+[execution]
+enabled = false
+
+# "manual" (por omisión): sólo se ejecuta lo que pidas desde la interfaz.
+# "auto": se ejecuta lo que la política considere, sin que nadie lo pida.
+# "pinned": se ejecutan las operaciones de [[execution.pinned]] cuando toca.
+trigger = "manual"
+
+# Autoriza leer los dos secretos de ejecución del entorno cuando el llavero no
+# los tiene. Es una decisión de **custodia**, no de dinero: una máquina sin
+# backend de keyring es indistinguible de un llavero roto, y sin esto no se
+# podría firmar en ninguna de las dos.
+allow_env_key = false
+
+# Redes, tokens y motores con los que se puede operar. **Vacío significa «nada
+# permitido»** — no «sin restricción»—, igual que los topes: con esto moviendo
+# dinero, el fallo tiene que caer del lado de no operar. Con `enabled = true`
+# las tres tienen que estar declaradas o el arranque falla diciéndolo, en vez de
+# dejar que cada operación muera luego con un mensaje que describe el síntoma.
+#
+# Los tokens se nombran por **símbolo**, así que un token que no esté en el
+# catálogo también se declara aquí: en la pestaña de precios se añade por su
+# dirección de contrato —el símbolo y los decimales los lee de la cadena— y lo
+# que hay que escribir en esta lista es el símbolo que devuelva ese contrato.
+# allowed_chains = ["base", "ethereum"]
+# allowed_tokens = ["WETH", "USDC"]
+# allowed_engines = ["zeroex", "uniswap"]
+
+# Topes de gasto, en unidades de la stablecoin con la que se cotiza el par
+# (USDC, USDT…), **entre comillas**. Sin comillas TOML los leería como coma
+# flotante, y un tope de gasto que se hubiera redondeado por el camino es un
+# tope que no se cumple. Se aplican contra lo ya ejecutado en las últimas 24 h,
+# leído del registro `executions.jsonl`.
+#
+# Se aplican a **cualquier** par, también a los que no tocan la stablecoin: una
+# operación que entrega ETH se valora en la stablecoin de la red con los mismos
+# motores que cotizaron el par, y ese valor es el que se compara con estos
+# números. Así "500" quiere decir lo mismo para un par de dólares que para uno
+# de ETH. Si no se puede valorar —ningún motor cotiza lo entregado contra la
+# stablecoin— la operación **no se ejecuta**, en vez de ejecutarse sin tope.
+# max_quote_per_trade = "500"
+# max_quote_per_day = "2000"
+
+# Cuántas operaciones como mucho por ciclo de barrido, y el deslizamiento
+# máximo tolerado en puntos básicos (50 = 0,5 %).
+max_executions_per_cycle = 1
+slippage_bps = 50
+
+[execution.gas]
+# "auto": techo y propina se calculan de lo que publica la red, por el factor
+# de abajo. "fixed": se usan las dos cifras fijas, y hay que declarar las dos.
+strategy = "auto"
+# Texto, por la misma razón que los importes: "1.2" tiene que ser exactamente 1.2.
+multiplier = "1.2"
+# fixed_max_fee_per_gas = 3000000000
+# fixed_max_priority_fee_per_gas = 1000000
+
+# Operaciones fijas: par, importe y cadencia. No dependen de que el mercado
+# ofrezca nada —ocurren cuando toca—, así que no llevan umbral. Sólo se
+# ejecutan con `trigger = "pinned"`; declararlas con otro disparador hace fallar
+# el arranque, porque serían operaciones que no ocurrirían nunca.
+# [[execution.pinned]]
+# chain = "base"
+# base = "USDC"
+# quote = "WETH"
+# amount = "25"
+# every_minutes = 60

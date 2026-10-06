@@ -57,7 +57,7 @@ hot-swappable, dominio puro verificado. Árbol de carpetas definitivo.
 
 ## Etapa 8 — Refactor, seguridad y empaquetado 🟡
 
-- ✅ Suite de tests (`pytest`, 44 casos) y `mypy --strict`, `ruff`.
+- ✅ Suite de tests (`pytest`, 441 casos) y `mypy --strict` (98 ficheros), `ruff`.
 - ✅ `config.example.toml`, spec de PyInstaller (`packaging/`).
 - 🟡 Pendiente: `pip-audit` en CI, profiling (`py-spy`) para validar <500 ms,
   y generación y firma del `.exe` en una máquina Windows limpia.
@@ -67,6 +67,27 @@ hot-swappable, dominio puro verificado. Árbol de carpetas definitivo.
 - ✅ Spec de protocolo y mapeo de tipos: `docs/RUST_MIGRATION.md`.
 - 🔴 Pendiente: PoC de sidecar (proceso Rust hablando JSON por stdio) y
   medición comparada.
+
+## Etapa 10 — Ejecución real (firmar y emitir) 🟡
+
+- ✅ Modo `EJECUCIÓN`, el único que concede `SIGN_TX` y `BROADCAST_TX`.
+- ✅ `infra/evm/signer.py` (clave → dirección, firma EIP-1559) y
+  `infra/evm/broadcast.py` (emisión y espera del recibo), con failover de nodos.
+- ✅ `ExecuteSwap` con sus dos comprobaciones previas: el modo concede la
+  capacidad y el `ModeGuard` da paso, **antes** de tocar la clave.
+- ✅ `AutonomyPolicy` + `ExecutionLimits`: interruptor maestro, listas blancas de
+  red, token y motor, topes por operación y por día contra `executions.jsonl`, y
+  ejecución desatendida armada con frase.
+- ✅ Compra **y** venta desde la interfaz, con el importe etiquetado en la unidad
+  que se entrega y el destinatario ofrecido por delante.
+- ✅ Aviso del diálogo según la capacidad: emitir se describe como real e
+  irreversible; preparar, como lo que no firma.
+- 🔴 Pendiente: `trigger = "auto"` (no existe `AutoExecutor`; el barrido sólo
+  tiene escuchas síncronas), las operaciones `[[execution.pinned]]`, la página
+  Cartera y el estado de autonomía en la barra de estado.
+- 🔴 Pendiente para poder operar en EVM: una clave de motor DEX. `uniswap` y
+  `zeroex` la exigen (`api_key`) y sin ella `prepare_swap.is_available()` es
+  `False` — los motores gratuitos cotizan pero no construyen payloads.
 
 ## Rendimiento objetivo
 

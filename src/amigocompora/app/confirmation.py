@@ -34,6 +34,11 @@ class Decision(StrEnum):
     REJECTED = "rejected"
     #: Bloqueada por el modo: nunca llegó a preguntarse al usuario.
     BLOCKED_BY_MODE = "blocked_by_mode"
+    #: Aprobada **sin** preguntar, por la política de autonomía. Es un valor
+    #: propio y no un `APPROVED` con una nota: quien lea la traza tiene que poder
+    #: distinguir de un vistazo lo que una persona autorizó de lo que una máquina
+    #: hizo por su cuenta, y eso no puede depender de interpretar un texto libre.
+    APPROVED_BY_POLICY = "approved_by_policy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +58,14 @@ class PendingAction:
 
     @property
     def is_irreversible(self) -> bool:
-        """Si la acción tocaría la red. En M1 siempre `False`: no se firma nada."""
+        """Si la acción tocaría la red de verdad, sin vuelta atrás.
+
+        Con el modo `EJECUCIÓN` esto pasa a ser `True` —y el diálogo tiene que
+        decirlo—, porque desde ahí sí se firma y se emite. Dejar aquí el
+        comentario de una versión anterior en la que nunca había nada
+        irreversible sería exactamente la clase de mentira que importa: la que
+        se lee justo en el momento de decidir.
+        """
         return self.capability in {Capability.SIGN_TX, Capability.BROADCAST_TX}
 
 
@@ -72,6 +84,23 @@ class ConfirmationPrompt(Protocol):
     """Quien pregunta al usuario. La implementación real es un diálogo Qt."""
 
     async def ask(self, action: PendingAction) -> bool: ...
+
+
+@runtime_checkable
+class ConfirmationBypass(Protocol):
+    """Quien puede decidir que no hace falta preguntar.
+
+    El protocolo vive aquí, junto a quien lo consulta, y no en la política de
+    autonomía que lo implementa: así `app.confirmation` no importa
+    `app.execution_policy` —que sí importa a este módulo— y no hay ciclo.
+
+    Devolver un motivo significa «adelante sin preguntar»; `None` significa
+    «pregunta». **Un bypass no puede conceder una capacidad**: sólo puede
+    ahorrarse la pregunta, y por eso se consulta después de la barrera de modo
+    y nunca antes.
+    """
+
+    def reason_to_skip(self, action: PendingAction) -> str | None: ...
 
 
 class DenyAllPrompt:
@@ -102,18 +131,31 @@ class RecordingPrompt:
 class ConfirmationGateway:
     """Autoriza acciones cruzando modo + confirmación explícita."""
 
-    __slots__ = ("_clock", "_guard", "_history", "_prompt")
+    __slots__ = ("_bypass", "_clock", "_guard", "_history", "_prompt")
 
     def __init__(
         self,
         guard: ModeGuard,
         prompt: ConfirmationPrompt | None = None,
         clock: Clock | None = None,
+        bypass: ConfirmationBypass | None = None,
     ) -> None:
         self._guard = guard
         self._prompt: ConfirmationPrompt = prompt or DenyAllPrompt()
         self._clock = clock or SystemClock()
         self._history: list[ConfirmationRecord] = []
+        # Por omisión **no hay bypass**, y eso no es un descuido: `None` aquí
+        # significa que la única vía de aprobar algo es que una persona lo
+        # apruebe. Cablear la autonomía es un acto explícito.
+        self._bypass: ConfirmationBypass | None = bypass
+
+    def set_bypass(self, bypass: ConfirmationBypass | None) -> None:
+        """Conecta (o desconecta) la política de autonomía.
+
+        Se puede desconectar en caliente —con `None`— porque desarmar tiene que
+        ser siempre posible sin reconstruir el grafo de objetos.
+        """
+        self._bypass = bypass
 
     def set_prompt(self, prompt: ConfirmationPrompt) -> None:
         """Conecta la UI de confirmación una vez construida la ventana."""
@@ -154,6 +196,14 @@ class ConfirmationGateway:
         Lanza `ModeNotPermittedError` si el modo no concede la capacidad, y
         `ConfirmationDeniedError` si el usuario dice no. Nunca devuelve algo
         «a medias»: si retorna, la acción está autorizada.
+
+        ### El orden de las tres comprobaciones es la salvaguarda
+
+        Primero el modo, después el bypass, y sólo entonces se pregunta. El
+        bypass va en medio a propósito: consultado antes, podría aprobar algo
+        que el modo no concede y la elección del usuario sobre en qué modo está
+        la aplicación sería decorativa; consultado después de preguntar, no
+        serviría de nada. Aquí sólo puede saltarse **la pregunta**.
         """
         action = PendingAction(
             action_id=uuid4().hex,
@@ -171,6 +221,15 @@ class ConfirmationGateway:
         if not self._guard.requires_confirmation(capability):
             self._record(action, Decision.APPROVED, "capacidad de sólo lectura")
             return action
+
+        if self._bypass is not None:
+            reason = self._bypass.reason_to_skip(action)
+            if reason is not None:
+                # Se registra **siempre**, y con un valor de decisión propio: una
+                # operación que se hizo sin que nadie la mirara tiene que quedar
+                # contada como tal, no confundida con una confirmación humana.
+                self._record(action, Decision.APPROVED_BY_POLICY, reason)
+                return action
 
         approved = await self._prompt.ask(action)
         if not approved:

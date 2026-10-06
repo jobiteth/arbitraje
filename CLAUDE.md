@@ -28,7 +28,10 @@ mercados de predicción.
 ### Principio rector
 
 **La IA propone, el usuario decide.** Toda operación con efectos requiere
-confirmación explícita. La aplicación **nunca firma ni emite** transacciones.
+confirmación explícita. La aplicación **nunca firma ni emite por iniciativa
+propia**: sólo en modo `EJECUCIÓN`, con `execution.enabled = true` y tras un «sí»
+del usuario —o, si la ejecución desatendida está armada, dentro de los límites
+declarados—.
 
 ## 2. Arquitectura
 
@@ -65,7 +68,9 @@ Infra (config, logs, secrets)  src/amigocompora/infra
 - Sanitización de inputs en todos los adapters.
 - Allowlist de hosts por motor; TLS obligatorio salvo `localhost`.
 - Avisos de slippage/riesgo antes de cualquier acción.
-- Firmar y emitir están en `UNIMPLEMENTED_CAPABILITIES`: ningún modo los concede.
+- Firmar y emitir (`SIGN_TX`, `BROADCAST_TX`) sólo los concede el modo
+  `EJECUCIÓN`, y pasan por `ConfirmationGateway`. La clave privada se lee sólo en
+  el momento de firmar y no se cachea en ningún objeto del contenedor.
 
 ## 5. Rendimiento
 
