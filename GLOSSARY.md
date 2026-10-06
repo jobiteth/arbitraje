@@ -1,0 +1,61 @@
+# Glosario
+
+Términos que en este proyecto tienen un significado preciso y del que conviene
+no desviarse.
+
+## Producto y seguridad
+
+- **Principio rector.** «La IA propone, el usuario decide». Ninguna ruta ejecuta
+  una acción con efectos sin confirmación explícita.
+- **Modo de operación.** `OBSERVACIÓN`, `SIMULACIÓN` o `ASISTIDO`. Define qué
+  `Capability` están concedidas. Ver `domain/modes.py`.
+- **Capability.** Acción concreta que un caso de uso declara necesitar
+  (`READ_CHAIN`, `COMPUTE_ROUTE`, `QUERY_AI`, `PREPARE_TX`, `SIGN_TX`,
+  `BROADCAST_TX`). La UI nunca decide «en qué modo estoy»; declara la capacidad.
+- **`UNIMPLEMENTED_CAPABILITIES`.** `SIGN_TX` y `BROADCAST_TX`: firmar y emitir.
+  Ningún modo las concede. La app no tiene claves privadas.
+- **`ConfirmationGateway`.** Cruza modo + un «sí» explícito del usuario. Sin
+  prompt conectado rige `DenyAllPrompt` (todo denegado).
+
+## Motores
+
+- **Motor (engine).** Componente descubrible por entry points que implementa un
+  `Protocol` (`DexQuoteEngine`, `PredictionMarketEngine`, `AiAdvisorEngine`).
+  El núcleo nunca importa una clase concreta.
+- **Ranura (`EngineKind`).** Hay un motor activo por ranura: `DEX_QUOTES`,
+  `PREDICTION_MARKETS`, `AI_ADVISOR`.
+- **Hot-swap.** Sustituir el motor activo sin reiniciar; se abre el nuevo antes
+  de cerrar el viejo.
+- **Manifiesto.** Metadatos de un motor (id, tipo, capacidades, hosts
+  permitidos, config), legibles sin instanciarlo.
+
+## Datos de mercado
+
+- **Venue.** Un sitio donde operar: un pool de un DEX o un mercado de
+  predicción. El *fee tier* forma parte de su identidad (`uniswap-v3@5`).
+- **Cotización (`Quote`).** Resultado de vender `amount_in` de base por quote en
+  un venue. `amount_out` es **neto** (ya incluye comisión e impacto).
+- **`Measurement`.** Procedencia de una cifra: `REPORTED` (la publica la
+  fuente), `DERIVED` (la calculamos sobre datos publicados), `ESTIMATED` (con un
+  supuesto documentado).
+- **Comisión desconocida (`fee_bps is None`).** La fuente no la desglosa (caso
+  medido: Jupiter). No significa «gratis»: `amount_out` sigue siendo neto. Esas
+  cotizaciones se excluyen del cálculo de diferencial **neto**.
+- **Impacto de precio.** Cuánto empeora el precio por el tamaño de la orden, sin
+  contar la comisión. En un AMM de producto constante, siempre ≥ 0.
+- **Spread bruto / neto.** Diferencia entre mejor y peor ejecución, antes y
+  después de restar comisiones de ambos lados.
+- **Overround.** Cuánto se desvía de 1 la suma de probabilidades de un mercado
+  de predicción. Positivo = margen; negativo = discrepancia.
+- **`x·y=k`.** Fórmula del pool de producto constante (Uniswap V2 y clones).
+
+## Infraestructura
+
+- **`JsonSource`.** Base común de los motores HTTP: caché, límite de ritmo
+  adaptativo, reintentos acotados y dos clases de fallo.
+- **`RpcPool`.** Endpoints JSON-RPC de una red con failover y circuit-breaker.
+  Distingue fallo de transporte (reintenta otro endpoint) de error de aplicación
+  JSON-RPC (falla rápido).
+- **Allowlist de hosts.** Un motor sólo puede hablar con los hosts que declara.
+- **Keyring.** Almacén de credenciales del sistema operativo. Los secretos
+  nunca van a `config.toml` (`extra="forbid"`) ni a los logs.

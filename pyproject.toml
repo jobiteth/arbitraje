@@ -1,0 +1,175 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amigocompora"
+version = "0.1.0"
+description = "Análisis y asistencia para exploración de mercados on-chain y mercados de predicción"
+readme = "README.md"
+requires-python = ">=3.13,<3.15"
+
+dependencies = [
+    "PySide6>=6.11.2,<7",
+    "qasync>=0.28,<0.29",
+    "pydantic>=2.13.5,<3",
+    "pydantic-settings>=2.15,<3",
+    "httpx>=0.28.1,<0.29",
+    # Se importa directamente en infra.http para construir el contexto TLS:
+    # el almacén de certificados del SO se complementa con este paquete.
+    "certifi>=2025.1.31",
+    "keyring>=25.7,<26",
+    "structlog>=26.1,<27",
+]
+
+# Sólo necesario para motores que decodifican ABIs / contratos (M2+).
+# El núcleo y el RpcPool hablan JSON-RPC crudo sobre httpx y no lo requieren.
+[project.optional-dependencies]
+chain = ["web3>=8.0.0,<9"]
+
+[project.scripts]
+amigocompora = "amigocompora.__main__:main"
+
+# Motores descubribles. Terceros pueden publicar paquetes que registren
+# este mismo grupo para añadir motores sin tocar el núcleo.
+#
+# Los cuatro leen de APIs públicas reales y no requieren API key. Ninguno firma
+# ni emite transacciones: son de sólo lectura.
+[project.entry-points."amigocompora.engines"]
+geckoterminal = "amigocompora.engines.geckoterminal:PROVIDER"
+dexscreener = "amigocompora.engines.dexscreener:PROVIDER"
+jupiter = "amigocompora.engines.jupiter:PROVIDER"
+polymarket = "amigocompora.engines.polymarket:PROVIDER"
+stub_advisor = "amigocompora.engines.llm.providers:STUB_PROVIDER"
+claude = "amigocompora.engines.llm.providers:CLAUDE_PROVIDER"
+deepseek = "amigocompora.engines.llm.providers:DEEPSEEK_PROVIDER"
+chatgpt = "amigocompora.engines.llm.providers:CHATGPT_PROVIDER"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "pytest-qt>=4.5,<5",
+    "pytest-cov>=7",
+    "respx>=0.23.1,<0.24",
+    "ruff>=0.16.10,<0.17",
+    "mypy>=2.4,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/amigocompora"]
+
+[tool.uv]
+# Esta red intercepta TLS: la CA raíz vive en el almacén del SO y no en el
+# bundle que trae uv. Sin esto, cualquier `uv sync` falla con UnknownIssuer.
+system-certs = true
+
+
+# --------------------------------------------------------------------------- #
+# Ruff
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort
+    "N",           # pep8-naming
+    "UP",          # pyupgrade
+    "B",           # bugbear
+    "A",           # builtins shadowing
+    "C4",          # comprehensions
+    "DTZ",         # datetimes sin tz
+    "PIE", "PT", "RET", "SIM", "TID", "PTH",
+    "ERA",         # código comentado
+    "TRY",         # anti-patrones de excepciones
+    "RUF",
+    "ANN",         # anotaciones obligatorias
+    "ASYNC",
+    "S",           # bandit
+]
+ignore = [
+    "ANN401",  # Any explícito, puntualmente necesario
+    "TRY003",  # mensajes largos en raise: los queremos
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN", "PLR2004"]
+# La UI usa Qt: impone nombres camelCase en los overrides (closeEvent, …),
+# contiene stylesheets que son cadenas largas por naturaleza y usa símbolos
+# tipográficos en las etiquetas visibles. Estas excepciones son del toolkit,
+# no una licencia general de estilo.
+"src/amigocompora/ui/**" = ["E501", "N802", "N815", "RUF001", "RUF002", "RUF003", "ANN"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+# --------------------------------------------------------------------------- #
+# Mypy
+# --------------------------------------------------------------------------- #
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+warn_no_return = true
+disallow_any_explicit = false
+enable_error_code = [
+    "redundant-expr",
+    "possibly-undefined",
+    "truthy-bool",
+    "ignore-without-code",
+]
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["qasync.*", "keyring.*"]
+ignore_missing_imports = true
+
+# Los stubs de PySide6 modelan los enums como clases anidadas (Qt.Alignment
+# Flag.AlignCenter) mientras el runtime acepta el acceso plano (Qt.AlignCenter),
+# que es lo idiomático. Es una limitación del binding, no del código, así que
+# se relajan sólo en la capa de UI los códigos que dependen de ella.
+[[tool.mypy.overrides]]
+module = ["amigocompora.ui.*"]
+disable_error_code = [
+    "attr-defined",
+    "no-untyped-def",
+    "no-any-return",
+    "truthy-bool",
+    "redundant-expr",
+    "unused-ignore",
+]
+
+# --------------------------------------------------------------------------- #
+# Pytest
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--import-mode=importlib",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "ui: pruebas que requieren un QApplication (se omiten sin display)",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["src/amigocompora"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

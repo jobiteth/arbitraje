@@ -1,0 +1,52 @@
+# Amigocompora — configuración de ejemplo
+#
+# Copia este fichero a:
+#   %APPDATA%\Amigocompora\config.toml      (Windows)
+#   ~/.config/Amigocompora/config.toml      (Linux/macOS)
+#
+# ADVERTENCIA: aquí NO van credenciales. Cualquier clave no declarada hace
+# fallar el arranque (el modelo usa extra="forbid"). Las API keys se guardan en
+# el administrador de credenciales del sistema (keyring) o como variables de
+# entorno AMIGOCOMPORA_ENGINE_<ENGINE>_<OPTION>.
+
+# Modo de arranque: "observation" | "simulation" | "assisted".
+# El menos capaz por defecto; subir de modo es un acto explícito del usuario.
+mode = "observation"
+
+log_level = "INFO"
+log_json = false
+
+# TTL corto de la caché de cotizaciones, en segundos.
+quote_cache_ttl_seconds = 5.0
+request_timeout_seconds = 10.0
+
+# Failover de endpoints JSON-RPC.
+rpc_failure_threshold = 3
+rpc_cooldown_seconds = 30.0
+
+# Motor activo por ranura. Si se omite, se autoactiva el preferido.
+[active_engines]
+dex_quotes = "geckoterminal"
+prediction_markets = "polymarket"
+ai_advisor = "stub_advisor"
+
+# Endpoints RPC por red (opcional). Mínimo privilegio: sólo https salvo hosts
+# locales. La API key del proveedor viaja en la URL, así que nunca uses http.
+# [[chains]]
+# chain = "ethereum"
+# endpoints = [
+#     { url = "https://ethereum-rpc.publicnode.com", label = "publicnode", priority = 100 },
+#     { url = "https://rpc.ankr.com/eth", label = "ankr", priority = 200 },
+# ]
+
+# Direcciones de SÓLO LECTURA que quieres observar. La app no guarda claves
+# privadas y no puede operar con ellas.
+watch_addresses = []
+
+# Ejemplo de par vigilado para el barrido periódico (la UI lo configura):
+# [[watch_pairs]]
+# chain = "ethereum"
+# base = "WETH"
+# quote = "USDC"
+# amount = "1"
+# min_net_bps = 10

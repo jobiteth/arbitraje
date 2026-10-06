@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Herramientas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Entorno / secretos — nunca versionar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Config local de la app (puede contener rutas y endpoints privados)
+config.local.toml
+
+# SO / editores
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
