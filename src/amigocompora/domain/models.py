@@ -332,11 +332,24 @@ class Quote:
 
 @dataclass(frozen=True, slots=True)
 class PriceComparison:
-    """Las cotizaciones de un mismo `amount_in` en varios venues."""
+    """Las cotizaciones de un mismo `amount_in` en varios venues.
+
+    `quotes` puede traer cifras de **varios motores a la vez**: la ranura de
+    cotización guarda una pila, y comparar es precisamente el momento en que
+    todas aportan. Por eso cada `Quote` lleva su `engine_id`, y por eso existe
+    `failed_engines`: cuando una fuente no responde, la comparación sigue con
+    las demás —no detenerse es un requisito, no una comodidad— pero lo dice.
+    Una tabla con cuatro filas donde había cinco fuentes no puede parecer
+    completa.
+    """
 
     pair: TradingPair
     amount_in: TokenAmount
     quotes: tuple[Quote, ...]
+    #: Ids de los motores que se consultaron y no respondieron. Va aquí y no en
+    #: un log porque el usuario es quien tiene que saber que la comparación está
+    #: incompleta, y para entonces el log ya no está en pantalla.
+    failed_engines: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.quotes:
@@ -391,6 +404,18 @@ class PriceComparison:
         comparar, y la UI lo marca aparte por eso.
         """
         return any(not quote.fee_is_known for quote in self.quotes)
+
+    @property
+    def has_partial_sources(self) -> bool:
+        """Si alguna fuente consultada no llegó a responder.
+
+        Se separa de `has_estimates` y de `has_unknown_fees` porque es un tercer
+        modo de estar incompleta, y el más fácil de confundir con «no hay
+        oportunidad»: si la fuente que habría dado el mejor precio es justo la
+        que se cayó, la comparación se ve perfectamente normal y está mintiendo
+        por omisión. Ver `failed_engines`.
+        """
+        return bool(self.failed_engines)
 
     @property
     def observed_at(self) -> datetime:

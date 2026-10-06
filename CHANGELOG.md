@@ -5,6 +5,32 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Cambiado — Comparar precios usa **todos** los motores activos
+
+- `ComparePrices` cotiza todos los motores de la ranura DEX y **fusiona** sus
+  cotizaciones, en vez de preguntarle sólo al preferido. Hasta ahora tener un
+  respaldo servía para cuando el titular se cayera, pero no para comparar: con
+  dos motores activos la tabla mostraba las filas de uno. Ahora gana el mejor
+  `amount_out` sea de quien sea, así que dos agregados como 0x y Uniswap
+  aparecen por fin frente a frente.
+- Un motor que falla **no detiene** la comparación —se sigue con los demás— pero
+  tampoco desaparece en silencio: su id viaja en
+  `PriceComparison.failed_engines` y la interfaz lo dice en la misma línea del
+  resultado. Una tabla con menos filas de las que fuentes había se lee como
+  «aquí no hay nada mejor», y puede que la mejor fuera justo la que no respondió.
+- Si **todas** fallan se propaga el error real de la preferida, en lugar de
+  informar de que no hay cotizaciones: no se pudo mirar, que es otra cosa
+  distinta de haber mirado y no encontrar.
+- Deduplicación por `venue_id`. El identificador nombra el protocolo y la red,
+  no la fuente, así que dos motores mirando el mismo pool producían dos filas y
+  un `spread` que era la diferencia entre dos mediciones del mismo contrato:
+  ruido con aspecto de oportunidad. Se queda la del motor preferido —y **no** la
+  mejor de las dos, que sería escoger la cifra que más conviene de dos
+  observaciones del mismo pool— y el desacuerdo entre fuentes queda en el log.
+- La tabla de cotizaciones gana una columna **Motor** con el `engine_id` de cada
+  fila: con varios motores alimentando una sola tabla, hay que poder ver de dónde
+  sale cada cifra.
+
 ### Añadido — Motor de 0x (ZeroEx), con el build apagado por omisión
 
 - `engines/zeroex`: cotiza repartiendo la orden entre los venues que agrega 0x

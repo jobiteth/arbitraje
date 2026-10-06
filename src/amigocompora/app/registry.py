@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.metadata import entry_points
+from typing import cast
 
 import structlog
 
@@ -309,11 +310,29 @@ class EngineRegistry:
     # clase `Protocol` donde se espera `type[T]` (`type-abstract`), y la
     # alternativa sería sembrar `type: ignore` en cada punto de llamada.
     # `EngineKind` es un enum cerrado, así que la lista no crece sola.
-    def active_dex(self) -> DexQuoteEngine:
-        engine = self.active(EngineKind.DEX_QUOTES)
-        if not isinstance(engine, DexQuoteEngine):
-            raise EngineError(_wrong_slot(engine, EngineKind.DEX_QUOTES, "DexQuoteEngine"))
-        return engine
+    def active_dex_stack(self) -> tuple[DexQuoteEngine, ...]:
+        """Toda la ranura DEX, el preferido primero, o error si está vacía.
+
+        Devuelve **todas** y no sólo la preferida porque hay una operación que
+        las quiere todas: comparar precios. Cotizar con una sola daría una tabla
+        con las filas de un único motor y ninguna comparación; el sentido de
+        tener varios activos es que sus cifras se vean juntas y gane la mejor.
+        Quien sólo necesite la titular —el caso habitual— la tiene en `[0]`.
+
+        Se valida el tipo de **todas** antes de devolver ninguna: si una entrada
+        de la ranura no cumpliera el protocolo, quien llama recibiría una tupla
+        a medias y fallaría más tarde, lejos de la causa.
+        """
+        stack = self.active_stack(EngineKind.DEX_QUOTES)
+        for engine in stack:
+            if not isinstance(engine, DexQuoteEngine):
+                raise EngineError(_wrong_slot(engine, EngineKind.DEX_QUOTES, "DexQuoteEngine"))
+        if not stack:
+            raise NoActiveEngineError(
+                f"no hay motor activo para «{EngineKind.DEX_QUOTES.label}». "
+                f"Selecciona uno en el panel de motores."
+            )
+        return cast("tuple[DexQuoteEngine, ...]", stack)
 
     def active_prediction(self) -> PredictionMarketEngine:
         engine = self.active(EngineKind.PREDICTION_MARKETS)

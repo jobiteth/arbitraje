@@ -83,10 +83,12 @@ class PricesPage(QWidget):
         self._status.setWordWrap(True)
         lay.addWidget(self._status)
 
-        self._table = QTableWidget(0, 7)
-        self._table.setHorizontalHeaderLabels(["Venue", "Recibes", "Precio", "Comisión", "Impacto", "Liquidez", "Nota"])
+        self._table = QTableWidget(0, 8)
+        self._table.setHorizontalHeaderLabels(
+            ["Venue", "Motor", "Recibes", "Precio", "Comisión", "Impacto", "Liquidez", "Nota"]
+        )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -171,6 +173,12 @@ class PricesPage(QWidget):
             note = "con estimaciones" if comparison.has_estimates else "todo medido"
             if comparison.has_unknown_fees:
                 note += " · hay comisiones no desglosadas"
+            if comparison.has_partial_sources:
+                # Se dice en la misma línea que el resultado y no en un aviso
+                # aparte: una comparación a la que le falta una fuente se lee
+                # como «aquí no hay nada mejor», y puede que la mejor fuera
+                # justo la que no respondió.
+                note += f" · sin respuesta: {', '.join(comparison.failed_engines)}"
             self._status.setText(
                 f"{len(comparison.quotes)} venue(s) · spread {comparison.spread_bps} · {note} · observado {comparison.observed_at.isoformat()}"
             )
@@ -190,12 +198,17 @@ class PricesPage(QWidget):
             fee = str(quote.fee_bps) if quote.fee_bps is not None else "— no desglosada"
             fee_basis = quote.fee_basis.value if quote.fee_basis is not None else "—"
             self._table.setItem(row, 0, QTableWidgetItem(quote.venue.name))
-            self._table.setItem(row, 1, QTableWidgetItem(str(quote.amount_out)))
-            self._table.setItem(row, 2, QTableWidgetItem(str(quote.price)))
+            # Qué motor produjo la cifra. Con varios motores activos la tabla es
+            # una mezcla, y dos motores pueden cotizar el mismo par por caminos
+            # distintos: sin esta columna, dos filas del mismo venue parecerían
+            # un error de la vista en vez de dos fuentes que no coinciden.
+            self._table.setItem(row, 1, QTableWidgetItem(quote.engine_id))
+            self._table.setItem(row, 2, QTableWidgetItem(str(quote.amount_out)))
+            self._table.setItem(row, 3, QTableWidgetItem(str(quote.price)))
             item_fee = QTableWidgetItem(f"{fee} [{fee_basis}]")
             if not quote.fee_is_known:
                 item_fee.setForeground(Qt.yellow)
-            self._table.setItem(row, 3, item_fee)
+            self._table.setItem(row, 4, item_fee)
             # Un impacto sin publicar no es un cero: se escribe igual que en el
             # diálogo de confirmación, para que las dos vistas digan lo mismo de
             # la misma cotización.
@@ -208,9 +221,11 @@ class PricesPage(QWidget):
             item_imp = QTableWidgetItem(f"{impact} [{impact_basis}]")
             if not quote.impact_is_known or not quote.is_exact:
                 item_imp.setForeground(Qt.yellow)
-            self._table.setItem(row, 4, item_imp)
-            self._table.setItem(row, 5, QTableWidgetItem(str(quote.liquidity) if quote.liquidity else "—"))
-            self._table.setItem(row, 6, QTableWidgetItem(quote.source_note))
+            self._table.setItem(row, 5, item_imp)
+            self._table.setItem(
+                row, 6, QTableWidgetItem(str(quote.liquidity) if quote.liquidity else "—")
+            )
+            self._table.setItem(row, 7, QTableWidgetItem(quote.source_note))
 
     def _fill_opps(self, opps: tuple[Opportunity, ...]) -> None:
         self._opp_table.setRowCount(0)
