@@ -5,6 +5,46 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Añadido — Motor de Uniswap (agregado de EVM)
+
+- `engines/uniswap`: cotiza y construye por la Trading API de Uniswap en las
+  ocho redes EVM del registro (ethereum, base, bsc, arbitrum, polygon, unichain,
+  optimism y avalanche). Necesita clave y la pide por el keyring.
+- El destino del build se contrasta contra una **tabla medida por red** —siete
+  direcciones distintas para ocho redes— y cualquier desviación aborta la
+  construcción, en vez de firmar contra un contrato que no es el medido.
+- `priceImpact` se lee como **porcentaje** (no como fracción, que es lo que
+  publica Jupiter): una orden de 1 WETH da 1 bp, no 100. Cuando la fuente omite
+  el campo —medido a partir de unos 10 WETH— la cotización **no se emite**, en
+  lugar de rellenarlo con un cero que afirmaría que la orden no mueve el precio.
+- `plan_swap` vuelve a cotizar con el destinatario real y compara contra el
+  precio mostrado antes de construir (`QuoteMovedError`, tolerancia de 100 bps).
+
+### Añadido — Varios motores por ranura
+
+- `EngineRegistry` guarda una **pila** por tipo de motor: `activate` sustituye,
+  `add` suma un respaldo sin retirar al titular, `remove` saca uno concreto.
+- `swap_priority` en `EngineManifest` declara la preferencia, para que el orden
+  no dependa de en qué orden se activaron desde la interfaz. Los empates se
+  desempatan por `engine_id`.
+- `planners_for(chain_key)` devuelve los motores que construyen en esa red,
+  ordenados; `PrepareSwap` construye con el que **observó** la cotización.
+- `Quote` incorpora `engine_id`: el `venue_id` identifica el protocolo, no el
+  motor, así que sin él no se podía saber quién produjo una cifra y construir
+  con otro motor habría cambiado el venue sin decirlo.
+
+### Añadido — Oportunidades de predicción (UI)
+
+- Pestaña Predicción: tabla **Cestas con margen**, con el coste de comprar todos
+  los resultados frente al pago garantizado de 1.
+- Umbral de margen mínimo ajustable en la vista (por defecto 50 bps). El
+  recálculo usa `FindPredictionOpportunities.from_reports` sobre los informes ya
+  traídos, así que moverlo **no vuelve a consultar la fuente**.
+- Aviso permanente de que el margen es bruto: no descuenta gas ni comisiones, no
+  comprueba profundidad y las patas hay que ejecutarlas simultáneamente.
+- `FindPredictionOpportunities` en el `Container` y resolución de un almacén de
+  credenciales caído sin bloquear motores de claves opcionales.
+
 ### Añadido — Etapa 7 (UI)
 
 - Interfaz de escritorio con PySide6 + qasync (`src/amigocompora/ui`).

@@ -24,6 +24,9 @@ from amigocompora.app.scheduler import Scheduler
 from amigocompora.app.usecases.analyze_prediction_market import AnalyzePredictionMarkets
 from amigocompora.app.usecases.analyze_with_ai import AnalyzeWithAi
 from amigocompora.app.usecases.compare_prices import ComparePrices
+from amigocompora.app.usecases.find_prediction_opportunities import (
+    FindPredictionOpportunities,
+)
 from amigocompora.app.usecases.prepare_swap import PrepareSwap
 from amigocompora.app.usecases.scan_opportunities import ScanOpportunities
 from amigocompora.app.usecases.watch_scan import WatchedPair, WatchScan
@@ -72,6 +75,7 @@ class Container:
     compare_prices: ComparePrices
     scan_opportunities: ScanOpportunities
     analyze_markets: AnalyzePredictionMarkets
+    find_prediction_opportunities: FindPredictionOpportunities
     prepare_swap: PrepareSwap
     analyze_with_ai: AnalyzeWithAi
     alert_center: AlertCenter
@@ -137,6 +141,7 @@ async def build_container(
     watch_scan.set_pairs(_watched_pairs(effective_settings))
     # Publicar oportunidades del barrido periódico como alertas.
     watch_scan.subscribe(lambda opps: _publish_opportunities(alert_center, opps))
+    analyze_markets = AnalyzePredictionMarkets(registry=registry, gateway=gateway)
     return Container(
         settings=effective_settings,
         clock=effective_clock,
@@ -145,7 +150,12 @@ async def build_container(
         registry=registry,
         compare_prices=compare_prices,
         scan_opportunities=scan_opportunities,
-        analyze_markets=AnalyzePredictionMarkets(registry=registry, gateway=gateway),
+        analyze_markets=analyze_markets,
+        find_prediction_opportunities=FindPredictionOpportunities(
+            analyze=analyze_markets,
+            gateway=gateway,
+            clock=effective_clock,
+        ),
         prepare_swap=PrepareSwap(registry=registry, gateway=gateway),
         analyze_with_ai=AnalyzeWithAi(registry=registry, gateway=gateway),
         alert_center=alert_center,

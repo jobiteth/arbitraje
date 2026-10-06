@@ -344,6 +344,7 @@ class DexScreenerEngine:
 
         return Quote(
             venue=row.venue,
+            engine_id=MANIFEST.engine_id,
             pair=pair,
             amount_in=amount_in,
             amount_out=amount_out,

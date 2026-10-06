@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -20,8 +20,17 @@ from PySide6.QtWidgets import (
 )
 
 from amigocompora.app.confirmation import PendingAction
-from amigocompora.domain.models import UnsignedTransaction
+from amigocompora.domain.models import PlannedTransaction
 from amigocompora.ui.theme import COLOR_BORDER, COLOR_CARD, COLOR_MUTED
+
+#: Un payload en base64 o un calldata ocupan cientos de caracteres y no caben en
+#: el diálogo. Se recorta sólo para **mostrar**: el valor completo sigue en el
+#: objeto, que es lo que se exporta.
+_CLIP_CHARS: Final = 120
+
+
+def _clip(value: str) -> str:
+    return value if len(value) <= _CLIP_CHARS else f"{value[:_CLIP_CHARS]}…"
 
 #: Tareas de fondo vivas. Guardar la referencia evita que el recolector de
 #: basura cancele una corrutina recién lanzada desde un handler de Qt.
@@ -105,19 +114,15 @@ class ConfirmationDialog(QDialog):
         layout.addWidget(buttons)
 
     @staticmethod
-    def _tx_widget(tx: UnsignedTransaction) -> QWidget:
+    def _tx_widget(tx: PlannedTransaction) -> QWidget:
         box = QFrame()
         box.setStyleSheet(f"background: #0f1115; border: 1px solid {COLOR_BORDER}; border-radius: 6px;")
         lay = QVBoxLayout(box)
         lay.setContentsMargins(10, 8, 10, 8)
-        for label, value in (
-            ("Cadena (EIP-155)", str(tx.chain_id)),
-            ("Destino", tx.to_address),
-            ("Valor", str(tx.value)),
-            ("Descripción", tx.description),
-            ("Calldata", (tx.calldata[:120] + "…") if len(tx.calldata) > 120 else tx.calldata),
-        ):
-            row = QLabel(f"<span style='color:{COLOR_MUTED}'>{label}:</span> {value}")
+        # La vista no sabe de qué red es el payload: cada tipo se describe a sí
+        # mismo y aquí sólo se pinta. Añadir una red nueva no toca este diálogo.
+        for label, value in tx.describe():
+            row = QLabel(f"<span style='color:{COLOR_MUTED}'>{label}:</span> {_clip(value)}")
             row.setTextFormat(Qt.RichText)
             row.setTextInteractionFlags(Qt.TextSelectableByMouse)
             row.setWordWrap(True)

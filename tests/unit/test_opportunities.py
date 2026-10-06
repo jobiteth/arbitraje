@@ -33,6 +33,7 @@ def _venue(name: str) -> Venue:
 def _quote(pair: TradingPair, venue: str, out: str, fee: int | None) -> Quote:
     return Quote(
         venue=_venue(venue),
+        engine_id="dexscreener",
         pair=pair,
         amount_in=TokenAmount.from_decimal(1, 18, "WETH"),
         amount_out=TokenAmount.from_decimal(out, 6, "USDC"),

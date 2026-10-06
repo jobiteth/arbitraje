@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QPushButton,
     QTableWidget,
@@ -19,11 +23,21 @@ from PySide6.QtWidgets import (
 )
 
 from amigocompora.app.container import Container
-from amigocompora.domain.chains import CHAINS
-from amigocompora.domain.models import Opportunity, PriceComparison
+from amigocompora.domain.addresses import is_evm_address, is_solana_address
+from amigocompora.domain.chains import CHAINS, AddressFormat, chain
+from amigocompora.domain.errors import ConfirmationDeniedError
+from amigocompora.domain.models import Opportunity, PlannedTransaction, PriceComparison, Quote
 from amigocompora.engines.catalog import quote_token, tokens_for
 from amigocompora.ui.theme import COLOR_MUTED
 from amigocompora.ui.widgets import spawn
+
+#: Aviso que acompaña a todo payload exportado. Va dentro del fichero y no sólo
+#: en la pantalla: el fichero sobrevive a la sesión y viaja a otro sitio, y quien
+#: lo abra tiene que saber que no es una transacción emitida.
+_UNSIGNED_NOTICE = (
+    "Transacción SIN FIRMAR. Amigocompora no firma ni emite transacciones. "
+    "Revísala y fírmala con tu propia cartera."
+)
 
 
 class PricesPage(QWidget):
@@ -31,6 +45,7 @@ class PricesPage(QWidget):
         super().__init__(parent)
         self._container = container
         self._comparison: PriceComparison | None = None
+        self._prepared: PlannedTransaction | None = None
 
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
@@ -65,6 +80,7 @@ class PricesPage(QWidget):
 
         self._status = QLabel("")
         self._status.setStyleSheet(f"color: {COLOR_MUTED};")
+        self._status.setWordWrap(True)
         lay.addWidget(self._status)
 
         self._table = QTableWidget(0, 7)
@@ -84,9 +100,36 @@ class PricesPage(QWidget):
         lay.addWidget(QLabel("<b>Oportunidades (diferencial neto ≥ 10 bps)</b>"))
         lay.addWidget(self._opp_table)
 
+        # Acciones sobre la cotización elegida. Deshabilitadas hasta que haya una
+        # fila seleccionada y un motor capaz de construir: un botón que existe y
+        # falla al pulsarlo enseña a desconfiar de los botones.
+        actions = QHBoxLayout()
+        self._swap_btn = QPushButton("Preparar swap…")
+        self._swap_btn.setObjectName("secondary")
+        self._swap_btn.setToolTip(
+            "Construye la transacción sin firmar de la cotización seleccionada. "
+            "Amigocompora no la firma ni la emite."
+        )
+        self._swap_btn.clicked.connect(self._on_prepare_swap)
+        self._swap_btn.setEnabled(False)
+        actions.addWidget(self._swap_btn)
+
+        self._save_btn = QPushButton("Guardar payload…")
+        self._save_btn.setObjectName("secondary")
+        self._save_btn.setToolTip("Exporta a JSON la última transacción sin firmar que confirmaste.")
+        self._save_btn.clicked.connect(self._on_save_payload)
+        self._save_btn.setEnabled(False)
+        actions.addWidget(self._save_btn)
+        actions.addStretch()
+        lay.addLayout(actions)
+
+        self._table.itemSelectionChanged.connect(self._on_quote_selected)
         self._chain.currentIndexChanged.connect(self._refresh_tokens)
         self._refresh_tokens()
 
+    # ------------------------------------------------------------------ #
+    # Filtros
+    # ------------------------------------------------------------------ #
     def _refresh_tokens(self) -> None:
         key = self._chain.currentData()
         self._base.clear()
@@ -137,6 +180,7 @@ class PricesPage(QWidget):
             self._opp_table.setRowCount(0)
         finally:
             self._btn.setEnabled(True)
+            self._on_quote_selected()
 
     def _fill_table(self, comp: PriceComparison) -> None:
         self._table.setRowCount(0)
@@ -170,3 +214,115 @@ class PricesPage(QWidget):
             self._opp_table.setItem(row, 3, QTableWidgetItem(str(opp.net_spread_bps)))
             mark = "✓" if opp.is_actionable else "—"
             self._opp_table.setItem(row, 4, QTableWidgetItem(mark))
+
+    # ------------------------------------------------------------------ #
+    # Preparar el swap
+    # ------------------------------------------------------------------ #
+    def _selected_quote(self) -> Quote | None:
+        rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
+        if not rows or self._comparison is None:
+            return None
+        ranked = self._comparison.ranked
+        index = rows[0].row()
+        return ranked[index] if 0 <= index < len(ranked) else None
+
+    def _on_quote_selected(self) -> None:
+        self._swap_btn.setEnabled(
+            self._selected_quote() is not None and self._container.prepare_swap.is_available()
+        )
+
+    def _recipient_candidates(self, chain_key: str) -> list[str]:
+        """Las direcciones ya configuradas que son válidas en esa red.
+
+        Ofrecer las propias antes que un campo vacío no es comodidad: teclear una
+        dirección a mano es la forma más común de perder fondos, y la lista sale
+        de lo que el usuario ya declaró en su configuración.
+        """
+        spec = chain(chain_key)
+        solana = spec.address_format is AddressFormat.SOLANA_BASE58
+        check = is_solana_address if solana else is_evm_address
+        return [address for address in self._container.settings.watch_addresses if check(address)]
+
+    def _ask_recipient(self, chain_key: str) -> str | None:
+        candidates = self._recipient_candidates(chain_key)
+        title = "Destino del swap"
+        if candidates:
+            text, accepted = QInputDialog.getItem(
+                self,
+                title,
+                "Dirección que recibe (elige una tuya o pega otra):",
+                candidates,
+                0,
+                True,  # editable: la lista es un atajo, no un límite
+            )
+        else:
+            text, accepted = QInputDialog.getText(self, title, "Dirección que recibe:")
+        if not accepted:
+            return None
+        return text.strip() or None
+
+    def _on_prepare_swap(self) -> None:
+        quote = self._selected_quote()
+        if quote is None:
+            self._status.setText("Selecciona primero una cotización de la tabla.")
+            return
+        recipient = self._ask_recipient(quote.pair.chain)
+        if recipient is None:
+            return
+        self._swap_btn.setEnabled(False)
+        self._status.setText("Construyendo la transacción sin firmar…")
+        spawn(self._do_prepare(quote, recipient))
+
+    async def _do_prepare(self, quote: Quote, recipient: str) -> None:
+        try:
+            transaction = await self._container.prepare_swap(quote, recipient=recipient)
+            self._prepared = transaction
+            self._save_btn.setEnabled(True)
+            self._status.setText(
+                "Transacción preparada y confirmada. Amigocompora NO la ha firmado "
+                "ni emitido: guárdala y fírmala en tu cartera."
+            )
+        except ConfirmationDeniedError:
+            # Decir «error» aquí sería mentir: el usuario hizo lo correcto.
+            self._status.setText("Cancelaste la preparación. No se construyó nada.")
+        except Exception as error:
+            self._status.setText(f"Error: {error}")
+        finally:
+            self._on_quote_selected()
+
+    def _on_save_payload(self) -> None:
+        if self._prepared is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Guardar transacción sin firmar",
+            "swap-sin-firmar.json",
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(
+                json.dumps(_payload_document(self._prepared), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            self._status.setText(f"No se pudo guardar: {error}")
+            return
+        self._status.setText(
+            f"Guardada en {path}. Sigue SIN FIRMAR: nada se ha emitido."
+        )
+
+
+def _payload_document(transaction: PlannedTransaction) -> dict[str, str]:
+    """Documento exportable de un payload sin firmar.
+
+    Se construye desde `describe()` —los mismos campos que se mostraron en el
+    diálogo de confirmación— y no volcando el objeto: lo que se exporta tiene que
+    ser exactamente lo que el usuario leyó y aprobó, no una representación
+    interna que puede cambiar sin que el diálogo cambie.
+    """
+    document: dict[str, str] = {"tipo": type(transaction).__name__}
+    document.update(dict(transaction.describe()))
+    document["aviso"] = _UNSIGNED_NOTICE
+    return document

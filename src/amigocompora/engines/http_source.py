@@ -298,12 +298,62 @@ class JsonSource:
             self._cache.set(key, payload)
             return None if payload is _ABSENT else payload
 
+    async def post_json(
+        self,
+        url: str,
+        *,
+        json_body: Any,
+        absent_statuses: frozenset[int] = frozenset(),
+        cache_key: str | None = None,
+    ) -> Any:
+        """Envía un cuerpo JSON y devuelve la respuesta ya parseada.
+
+        **Por omisión no usa la caché, a propósito.** Una respuesta a un POST
+        depende de lo que se envió, y en el caso que motivó esto —el endpoint de
+        swap de Jupiter— describe algo que además **caduca**: una transacción sin
+        firmar vale hasta cierta altura de bloque. Servirla desde una caché con
+        TTL sería devolver algo que ya no se puede emitir con la apariencia de
+        estar recién pedido, que es la peor forma de fallar.
+
+        `cache_key` abre la puerta a lo contrario para las fuentes que sí lo
+        necesitan: hay APIs que sólo admiten POST para **leer** —la de Uniswap
+        entre ellas, que cotiza con `POST /quote`—, y ahí no cachear significa
+        gastar una petición de cuota cada vez que la interfaz repinta. Pasar una
+        clave es afirmar dos cosas: que la respuesta depende sólo de esa clave, y
+        que no caduca dentro del TTL. Quien no pueda afirmar las dos, no la pasa.
+
+        Comparte con `get_json` todo lo demás: el intervalo mínimo, el lock que
+        serializa las llamadas del motor, los reintentos acotados y la
+        traducción de los fallos a errores del dominio.
+        """
+        client = self._require_client()
+
+        if cache_key is None:
+            async with self._lock:
+                return await self._fetch_with_retry(client, url, None, absent_statuses, json_body)
+
+        key: _CacheKey = (url, (("cache-key", cache_key),))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return None if cached is _ABSENT else cached
+
+        async with self._lock:
+            # Se vuelve a mirar dentro del lock: dos corrutinas que pidieron lo
+            # mismo a la vez sólo deben gastar una petición.
+            cached = self._cache.get(key)
+            if cached is not None:
+                return None if cached is _ABSENT else cached
+            payload = await self._fetch_with_retry(client, url, None, absent_statuses, json_body)
+            self._cache.set(key, payload)
+            return None if payload is _ABSENT else payload
+
     async def _fetch_with_retry(
         self,
         client: httpx.AsyncClient,
         url: str,
         params: dict[str, str] | None,
         absent_statuses: frozenset[int] = frozenset(),
+        json_body: Any = None,
     ) -> Any:
         """Pide el JSON reintentando un número acotado de veces si la fuente limita.
 
@@ -338,7 +388,7 @@ class JsonSource:
             attempt += 1
             await self._respect_rate_limit()
             try:
-                payload = await self._fetch(client, url, params, absent_statuses)
+                payload = await self._fetch(client, url, params, absent_statuses, json_body)
             except _Throttled as throttled:
                 self._last_request = time.monotonic()
                 self._widen_interval()
@@ -376,9 +426,14 @@ class JsonSource:
         url: str,
         params: dict[str, str] | None,
         absent_statuses: frozenset[int] = frozenset(),
+        json_body: Any = None,
     ) -> Any:
         try:
-            response = await client.get(url, params=params)
+            response = (
+                await client.post(url, json=json_body)
+                if json_body is not None
+                else await client.get(url, params=params)
+            )
         except httpx.HTTPError as error:
             raise SourceUnavailableError(
                 f"no se pudo consultar «{self._name}»: {type(error).__name__}. "
@@ -401,6 +456,7 @@ class JsonSource:
             raise SourceResponseError(
                 f"«{self._name}» respondió {response.status_code} a una petición "
                 f"que debería ser válida; puede que su API haya cambiado."
+                f"{_body_hint(response)}"
             )
 
         try:
@@ -416,6 +472,25 @@ class JsonSource:
 # --------------------------------------------------------------------------- #
 # Lectura defensiva del JSON
 # --------------------------------------------------------------------------- #
+def _body_hint(response: httpx.Response, *, limit: int = 200) -> str:
+    """Fragmento del cuerpo de un error, para que el mensaje sea accionable.
+
+    Una API que rechaza una petición por un campo mal formado lo dice en el
+    cuerpo —Jupiter responde `missing field 'userPublicKey'`—, y sin él quien
+    depura se queda con un número y una suposición. Se acota y se colapsa el
+    espacio en blanco porque esto acaba en una línea de log y en un `QLabel`.
+    """
+    try:
+        text = " ".join(response.text.split())
+    except Exception:
+        # El cuerpo puede no ser texto legible; el mensaje no vale perder el
+        # error original por intentar enriquecerlo.
+        return ""
+    if not text:
+        return ""
+    return f" Respuesta: {text[:limit]}{'…' if len(text) > limit else ''}"
+
+
 def as_mapping(value: Any, field: str, source: str) -> dict[str, Any]:
     """Exige que `value` sea un objeto JSON, con un error que diga dónde falló."""
     if not isinstance(value, dict):

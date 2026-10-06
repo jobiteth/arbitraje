@@ -85,6 +85,27 @@ class SourceResponseError(MarketDataError):
     """
 
 
+class QuoteMovedError(MarketDataError):
+    """El precio se movió entre lo que el usuario vio y lo que se iba a construir.
+
+    No es un fallo técnico ni de la fuente: es el mercado siendo el mercado. Se
+    lanza **antes** de construir el payload, porque confirmar una operación con
+    un precio distinto al que se mostró es exactamente lo que este producto no
+    puede hacer. La salida es volver a cotizar y decidir sobre la cifra nueva.
+    """
+
+    def __init__(self, *, shown: str, fresh: str, drift_bps: int, tolerance_bps: int) -> None:
+        self.shown = shown
+        self.fresh = fresh
+        self.drift_bps = drift_bps
+        self.tolerance_bps = tolerance_bps
+        super().__init__(
+            f"El precio se movió {drift_bps} bps desde la cotización que viste "
+            f"({shown} → {fresh}), más de los {tolerance_bps} bps tolerados. No se "
+            f"construyó nada: vuelve a cotizar y decide sobre el precio nuevo."
+        )
+
+
 class UnsupportedOperationError(AmigocomporaError):
     """El motor activo no implementa la capacidad opcional solicitada."""
 

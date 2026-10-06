@@ -47,6 +47,16 @@ no desviarse.
   después de restar comisiones de ambos lados.
 - **Overround.** Cuánto se desvía de 1 la suma de probabilidades de un mercado
   de predicción. Positivo = margen; negativo = discrepancia.
+- **Cesta (`BasketOpportunity`).** Comprar una participación de **cada**
+  resultado de un mercado. Paga exactamente 1 ocurra lo que ocurra, así que si
+  cuesta menos de 1 el margen es `1 − coste`. Sólo existe con overround negativo,
+  y es bruto: no descuenta gas ni profundidad. Ver
+  `app/usecases/find_prediction_opportunities.py`.
+- **Descuento vs. retorno s/ capital.** Sobre una cesta que cuesta 0,96 el
+  descuento es 400 bps (el margen de 0,04 medido contra el pago de 1) pero el
+  retorno es 417 bps (medido contra el capital desembolsado, 0,96). Se publican
+  los dos: cuál importa depende de si el coste de oportunidad se mide contra el
+  pago o contra el desembolso.
 - **`x·y=k`.** Fórmula del pool de producto constante (Uniswap V2 y clones).
 
 ## Infraestructura

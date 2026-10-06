@@ -6,9 +6,19 @@ Descubre por dos vías:
   instalando un paquete, sin tocar el núcleo.
 - **registro manual** (`register`): lo que usan los tests y el arranque local.
 
-Hay un motor activo por `EngineKind`. Sustituirlo es una operación en caliente:
-se abre el nuevo **antes** de cerrar el anterior, de modo que si el nuevo falla
-al abrir, el que estaba sigue funcionando y la aplicación no se queda sin motor.
+Hay **varios motores activos por `EngineKind`, en orden de preferencia**. El
+primero es el titular de la ranura; los siguientes son respaldo y se usan cuando
+el primero no llega a una red o no puede responder.
+
+Que sean varios y no uno es lo que permite las dos cosas que se piden a la vez:
+**comparar** —dos fuentes cotizando la misma red dan dos precios, y la mejor
+ejecución sale de tenerlas las dos— y **no detenerse** —si una fuente se cae o
+se agota su cuota, la siguiente de la lista construye el swap sin que el usuario
+note nada más que una espera—.
+
+Añadir un motor a la ranura es una operación en caliente: se abre el nuevo
+**antes** de publicarlo, de modo que si falla al abrir, los que estaban siguen
+funcionando y la aplicación no se queda sin ninguno.
 
 Un motor de terceros roto no puede tumbar el arranque: cada entry point se carga
 de forma aislada y los fallos se registran y se omiten.
@@ -39,6 +49,7 @@ from amigocompora.domain.protocols import (
     EngineManifest,
     EngineProvider,
     PredictionMarketEngine,
+    SwapPlanner,
     validate_config,
 )
 
@@ -78,7 +89,7 @@ class RegisteredEngine:
 
 
 class EngineRegistry:
-    """Catálogo de motores disponibles y titular del motor activo por ranura."""
+    """Catálogo de motores disponibles y titular de los motores activos por ranura."""
 
     __slots__ = ("_active", "_available", "_config_resolver", "_guard", "_listeners")
 
@@ -90,7 +101,9 @@ class EngineRegistry:
         self._guard = guard
         self._config_resolver: ConfigResolver = config_resolver or (lambda _manifest: {})
         self._available: dict[str, RegisteredEngine] = {}
-        self._active: dict[EngineKind, Engine] = {}
+        #: Una **lista** por ranura, no un motor suelto: el primero es el
+        #: preferido y los demás son respaldo. Ver el docstring del módulo.
+        self._active: dict[EngineKind, list[Engine]] = {}
         self._listeners: list[EngineListener] = []
 
     # ------------------------------------------------------ descubrimiento #
@@ -144,12 +157,12 @@ class EngineRegistry:
             ) from None
 
     # --------------------------------------------------------- activación  #
-    async def activate(self, engine_id: str) -> Engine:
-        """Activa un motor en su ranura, sustituyendo al anterior si lo había.
+    async def _open(self, engine_id: str) -> Engine:
+        """Instancia y abre un motor **sin publicarlo** todavía.
 
-        Orden deliberado: instanciar y abrir el nuevo primero. Si falla, el
-        motor que estaba activo sigue intacto y la excepción sube sin dejar la
-        ranura vacía.
+        Existe separada de `activate` y `add` porque las dos necesitan lo mismo
+        —abrir antes de publicar— y ese orden es la garantía de que un motor que
+        no arranca deja la ranura exactamente como estaba.
         """
         entry = self.lookup(engine_id)
         manifest = entry.manifest
@@ -162,27 +175,86 @@ class EngineRegistry:
         except Exception as error:
             await _close_quietly(incoming)
             raise EngineError(f"el motor «{manifest.name}» no pudo arrancar: {error}") from error
+        return incoming
 
-        outgoing = self._active.get(manifest.kind)
-        self._active[manifest.kind] = incoming
-        if outgoing is not None:
-            await _close_quietly(outgoing)
+    async def activate(self, engine_id: str) -> Engine:
+        """Deja ese motor como **único** activo de su ranura.
+
+        Es la operación del panel de motores: elegir uno retira los que hubiera.
+        Para sumar un motor conservando los demás, ver `add`.
+        """
+        incoming = await self._open(engine_id)
+        kind = incoming.manifest.kind
+        outgoing = self._active.get(kind, [])
+
+        self._active[kind] = [incoming]
+        for engine in outgoing:
+            await _close_quietly(engine)
 
         _log.info(
             "engine.activated",
-            kind=manifest.kind.value,
-            engine_id=manifest.engine_id,
-            replaced=outgoing is not None,
+            kind=kind.value,
+            engine_id=incoming.manifest.engine_id,
+            replaced=len(outgoing),
         )
-        self._notify(manifest.kind, incoming)
+        self._notify(kind, incoming)
         return incoming
 
-    async def deactivate(self, kind: EngineKind) -> None:
-        outgoing = self._active.pop(kind, None)
-        if outgoing is None:
+    async def add(self, engine_id: str) -> Engine:
+        """Suma un motor a su ranura **sin retirar** los que ya estaban.
+
+        El nuevo entra el último de la lista, pero eso **no** lo deja en segundo
+        lugar: la preferencia la decide `swap_priority` del manifiesto, no el
+        orden de llegada. Así, añadir un respaldo no cambia quién responde
+        primero, que es lo que pasaría si el orden de la lista fuera la
+        preferencia.
+        """
+        incoming = await self._open(engine_id)
+        kind = incoming.manifest.kind
+        stack = self._active.setdefault(kind, [])
+
+        if any(engine.manifest.engine_id == incoming.manifest.engine_id for engine in stack):
+            # Ya estaba activo. Se cierra el recién abierto: dejarlo sin
+            # publicar sería una conexión viva que nadie va a usar ni cerrar.
+            await _close_quietly(incoming)
+            return incoming
+
+        stack.append(incoming)
+        _log.info(
+            "engine.added",
+            kind=kind.value,
+            engine_id=incoming.manifest.engine_id,
+            # La clave **no** se llama `stack`: structlog la reserva para el
+            # traceback y espera texto, así que un entero ahí rompe el log.
+            stack_size=len(stack),
+        )
+        self._notify(kind, incoming)
+        return incoming
+
+    async def remove(self, engine_id: str) -> None:
+        """Retira un motor concreto de su ranura, si estaba activo."""
+        for kind, stack in tuple(self._active.items()):
+            found = next(
+                (engine for engine in stack if engine.manifest.engine_id == engine_id),
+                None,
+            )
+            if found is None:
+                continue
+            stack.remove(found)
+            await _close_quietly(found)
+            if not stack:
+                del self._active[kind]
+            _log.info("engine.removed", kind=kind.value, engine_id=engine_id)
+            self._notify(kind, stack[0] if stack else None)
             return
-        await _close_quietly(outgoing)
-        _log.info("engine.deactivated", kind=kind.value)
+
+    async def deactivate(self, kind: EngineKind) -> None:
+        outgoing = self._active.pop(kind, [])
+        if not outgoing:
+            return
+        for engine in outgoing:
+            await _close_quietly(engine)
+        _log.info("engine.deactivated", kind=kind.value, count=len(outgoing))
         self._notify(kind, None)
 
     async def aclose(self) -> None:
@@ -192,16 +264,45 @@ class EngineRegistry:
 
     # ---------------------------------------------------------------- uso  #
     def active(self, kind: EngineKind) -> Engine:
-        """Motor activo de esa ranura, o `NoActiveEngineError`."""
-        engine = self._active.get(kind)
-        if engine is None:
+        """Motor **preferido** de esa ranura, o `NoActiveEngineError`."""
+        stack = self._active.get(kind)
+        if not stack:
             raise NoActiveEngineError(
                 f"no hay motor activo para «{kind.label}». Selecciona uno en el panel de motores."
             )
-        return engine
+        return stack[0]
+
+    def active_stack(self, kind: EngineKind) -> tuple[Engine, ...]:
+        """Todos los motores activos de la ranura, el preferido primero."""
+        return tuple(self._active.get(kind, ()))
+
+    def planners_for(self, chain_key: str) -> tuple[SwapPlanner, ...]:
+        """Motores activos capaces de construir un swap **en esa red**, en orden.
+
+        Se filtra por lo que el manifiesto declara (`swap_chains`) y no
+        preguntándole a cada motor, porque hay que saber quién puede antes de
+        usarlo y el manifiesto ya lo responde sin gastar una conexión.
+
+        Devolver **varios** y no el mejor es deliberado: quien llama los recorre
+        y pasa al siguiente cuando uno no responde. Es lo que hace que una fuente
+        caída no detenga la operación. Ver `app.usecases.prepare_swap`.
+
+        El orden es por `swap_priority` y, en caso de empate, por `engine_id`:
+        determinista, y sin depender del orden en que se activaron los motores.
+        """
+        candidates = [
+            engine
+            for engine in self._active.get(EngineKind.DEX_QUOTES, ())
+            if chain_key in engine.manifest.swap_chains and isinstance(engine, SwapPlanner)
+        ]
+        candidates.sort(
+            key=lambda engine: (engine.manifest.swap_priority, engine.manifest.engine_id)
+        )
+        return tuple(candidates)
 
     def active_or_none(self, kind: EngineKind) -> Engine | None:
-        return self._active.get(kind)
+        stack = self._active.get(kind)
+        return stack[0] if stack else None
 
     # Accesores tipados por ranura. Se escriben uno a uno —y no con un
     # `active_as(kind, protocol)` genérico— porque mypy no admite pasar una
@@ -229,11 +330,15 @@ class EngineRegistry:
         return engine
 
     def active_manifest(self, kind: EngineKind) -> EngineManifest | None:
-        engine = self._active.get(kind)
-        return engine.manifest if engine is not None else None
+        stack = self._active.get(kind)
+        return stack[0].manifest if stack else None
 
     def is_active(self, engine_id: str) -> bool:
-        return any(engine.manifest.engine_id == engine_id for engine in self._active.values())
+        return any(
+            engine.manifest.engine_id == engine_id
+            for stack in self._active.values()
+            for engine in stack
+        )
 
     # --------------------------------------------------------- observación #
     def subscribe(self, listener: EngineListener) -> Callable[[], None]:
@@ -255,7 +360,10 @@ class EngineRegistry:
                 _log.exception("engine.listener_failed", kind=kind.value)
 
     def __repr__(self) -> str:
-        active = {kind.value: engine.manifest.engine_id for kind, engine in self._active.items()}
+        active = {
+            kind.value: [engine.manifest.engine_id for engine in stack]
+            for kind, stack in self._active.items()
+        }
         return f"EngineRegistry(disponibles={len(self._available)}, activos={active})"
 
 

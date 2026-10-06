@@ -21,10 +21,10 @@ from typing import Final, Protocol, runtime_checkable
 
 from amigocompora.domain.errors import EngineConfigError
 from amigocompora.domain.models import (
+    PlannedTransaction,
     PredictionMarket,
     Quote,
     TradingPair,
-    UnsignedTransaction,
     Venue,
 )
 from amigocompora.domain.modes import Capability
@@ -67,6 +67,32 @@ class EngineManifest:
     #: de llamar al motor. El registro las publica para que la UI pueda avisar
     #: de qué parte de un motor está inerte en el modo activo.
     capabilities: frozenset[Capability] = field(default_factory=frozenset)
+    #: Redes en las que el motor sabe **construir** un swap, no sólo leer
+    #: precios. Vacío = el motor no construye nada.
+    #:
+    #: Va en el manifiesto y no se deduce instanciando porque la decisión de a
+    #: qué motor pedirle el payload hay que tomarla **antes** de abrirlo: abrir
+    #: varios motores para preguntarles si saben hacer algo gastaría conexiones
+    #: y cuota en una pregunta que el manifiesto ya responde.
+    #:
+    #: Es lo que hace que cubrir una red nueva no toque el núcleo. Un motor que
+    #: añada una red la declara aquí y el caso de uso lo encuentra solo; y como
+    #: varios motores pueden declarar la misma red, la preferencia entre ellos
+    #: —el agregado o el directo— es una decisión de configuración, no de código.
+    swap_chains: frozenset[str] = field(default_factory=frozenset)
+    #: Orden de preferencia entre los motores que declaran la **misma** red en
+    #: `swap_chains`. Menor = se le pide primero el payload.
+    #:
+    #: Existe porque «qué motor construye este swap» no puede decidirse por el
+    #: orden en que el usuario activó los motores: eso cambiaría la ruta de
+    #: ejecución cada vez que alguien reordena la lista en la interfaz, y un
+    #: cambio de preferencia debe ser una decisión, no un efecto secundario. Con
+    #: la prioridad en el manifiesto, la preferencia es explícita y comprobable.
+    #:
+    #: El valor por omisión es el mismo para todos, así que en caso de empate
+    #: desempata el `engine_id`: el orden tiene que ser determinista y no
+    #: depender del orden de inserción de un diccionario.
+    swap_priority: int = 100
     #: Claves de configuración obligatorias (API keys, URLs de RPC). Se
     #: resuelven desde el keyring del SO, nunca desde disco.
     required_config: tuple[str, ...] = ()
@@ -91,6 +117,23 @@ class EngineManifest:
             raise EngineConfigError(
                 f"el motor {self.engine_id} declara {', '.join(sorted(overlap))} "
                 f"como obligatoria y opcional a la vez"
+            )
+        # Un manifiesto que promete construir swaps en alguna red y no declara
+        # la capacidad se contradice. Se detecta al construirlo —que es cuando
+        # se escribe— en vez de cuando alguien pide un swap y no aparece.
+        if self.swap_chains and Capability.PREPARE_TX not in self.capabilities:
+            raise EngineConfigError(
+                f"el motor {self.engine_id} declara redes de swap "
+                f"({', '.join(sorted(self.swap_chains))}) pero no declara la "
+                f"capacidad {Capability.PREPARE_TX.value}"
+            )
+        # Una prioridad negativa no significa nada —no hay un «antes del
+        # primero»— y casi siempre sería un cero de más al teclear. Se detecta
+        # al construir el manifiesto, que es cuando se escribe.
+        if self.swap_priority < 0:
+            raise EngineConfigError(
+                f"el motor {self.engine_id} declara swap_priority="
+                f"{self.swap_priority}: la prioridad no puede ser negativa"
             )
 
     @property
@@ -177,7 +220,7 @@ class DexQuoteEngine(Engine, Protocol):
 
 
 @runtime_checkable
-class SwapPlanner(Protocol):
+class SwapPlanner(Engine, Protocol):
     """Capacidad **opcional** de un motor DEX: construir el payload de un swap.
 
     Deliberadamente separada de `DexQuoteEngine`. Un motor de sólo lectura no
@@ -186,11 +229,35 @@ class SwapPlanner(Protocol):
     superficie de código capaz de generar transacciones se mantiene mínima y
     localizable.
 
-    Construir no es firmar ni emitir: devuelve una `UnsignedTransaction` para
+    Extiende `Engine` —y no es un protocolo suelto— porque un planificador **es**
+    un motor: tiene manifiesto y ciclo de vida, y quien lo elige necesita poder
+    leer su `engine_id` para comprobar que es el mismo que observó la cotización.
+    Sin eso habría que adivinar qué motor construye cada cotización.
+
+    Construir no es firmar ni emitir: devuelve una `PlannedTransaction` para
     que el usuario la inspeccione o la exporte. La aplicación no tiene claves.
+
+    ### Dos clases de backend, el mismo contrato
+
+    La ranura no distingue cómo se obtuvo el payload, y por eso caben las dos
+    formas de llegar a un swap:
+
+    - **Agregado.** Un motor que reparte la orden entre varios venues y
+      devuelve el resultado ya neto (caso medido: Jupiter en Solana). Se
+      activa cuando hay que ejecutar a cualquier precio disponible.
+    - **Directo.** Un motor que habla con un venue concreto —el pool que la
+      comparación señaló como mejor— y construye contra él. Se activa cuando
+      se sabe dónde se quiere ejecutar y no se quiere ceder la ruta a un
+      tercero.
+
+    Añadir el segundo no toca el núcleo: se publica otro entry point y se
+    activa en la ranura, igual que cualquier motor. Lo que **no** cambia entre
+    backends es lo que este contrato garantiza: la implementación decide cómo
+    llega al payload, y responde de que el payload corresponde a la cotización
+    que se le pasó.
     """
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction: ...
+    async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction: ...
 
 
 @runtime_checkable

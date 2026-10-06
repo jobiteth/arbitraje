@@ -25,7 +25,7 @@ from uuid import uuid4
 from amigocompora.app.mode_guard import ModeGuard
 from amigocompora.domain.clock import Clock, SystemClock
 from amigocompora.domain.errors import ConfirmationDeniedError
-from amigocompora.domain.models import UnsignedTransaction
+from amigocompora.domain.models import PlannedTransaction
 from amigocompora.domain.modes import Capability
 
 
@@ -49,7 +49,7 @@ class PendingAction:
     title: str
     requested_at: datetime
     details: tuple[str, ...] = ()
-    transaction: UnsignedTransaction | None = None
+    transaction: PlannedTransaction | None = None
 
     @property
     def is_irreversible(self) -> bool:
@@ -147,7 +147,7 @@ class ConfirmationGateway:
         title: str,
         *,
         details: Sequence[str] = (),
-        transaction: UnsignedTransaction | None = None,
+        transaction: PlannedTransaction | None = None,
     ) -> PendingAction:
         """Devuelve la acción autorizada, o lanza.
 

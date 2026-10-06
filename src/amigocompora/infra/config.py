@@ -25,7 +25,7 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-from amigocompora.domain.addresses import is_evm_address
+from amigocompora.domain.addresses import is_evm_address, is_solana_address
 from amigocompora.domain.chains import CHAINS, ChainSpec, chain
 from amigocompora.domain.errors import AmigocomporaError
 from amigocompora.domain.modes import DEFAULT_MODE, OperationMode
@@ -200,9 +200,21 @@ class Settings(BaseSettings):
     @field_validator("watch_addresses")
     @classmethod
     def _validate_addresses(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        invalid = [address for address in value if not is_evm_address(address)]
+        # Se aceptan las dos formas que el producto cubre hoy. La lista no
+        # declara la red de cada dirección, así que la validación tiene que ser
+        # «una de las dos» y no «EVM»: exigir `0x` dejaría fuera cualquier
+        # cartera de Solana, que es una red de primera clase en el resto del
+        # sistema.
+        invalid = [
+            address
+            for address in value
+            if not (is_evm_address(address) or is_solana_address(address))
+        ]
         if invalid:
-            raise ValueError(f"direcciones mal formadas: {', '.join(invalid)}")
+            raise ValueError(
+                f"direcciones mal formadas: {', '.join(invalid)}. Se espera una "
+                f"dirección EVM (0x + 40 hex) o un pubkey de Solana en base58."
+            )
         return value
 
     @model_validator(mode="after")

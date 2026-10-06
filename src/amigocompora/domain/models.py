@@ -194,6 +194,20 @@ class Quote:
     pair: TradingPair
     amount_in: TokenAmount
     amount_out: TokenAmount
+    #: Motor que observó esta cotización (`EngineManifest.engine_id`).
+    #:
+    #: Va en la cotización y no en el `Venue` a propósito. El `Venue` identifica
+    #: **dónde** se opera —el pool o el agregado— y es deliberadamente igual lo
+    #: mire quien lo mire, para que dos motores que observan el mismo pool no
+    #: parezcan dos sitios distintos. Lo que sí es del motor es **cómo se
+    #: construye** el payload: dos motores pueden cotizar el mismo par contra el
+    #: mismo pool y producir transacciones completamente distintas.
+    #:
+    #: Se necesita porque construir con un motor distinto del que cotizó sería
+    #: cambiar el venue a espaldas del usuario: la cifra que vio y el payload que
+    #: va a firmar tienen que salir del mismo sitio. Ver
+    #: `app.usecases.prepare_swap`.
+    engine_id: str
     #: Comisión del venue, o `None` si la fuente no la separa de `amount_out`.
     fee_bps: BasisPoints | None
     price_impact_bps: BasisPoints
@@ -210,6 +224,13 @@ class Quote:
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
+        # Una cotización sin motor no se puede construir: nadie sabría a quién
+        # pedirle el payload. Se corta al crearla, que es cuando se sabe.
+        if not self.engine_id:
+            raise InvalidAmountError(
+                "la cotización necesita el `engine_id` del motor que la observó: "
+                "sin él no se puede saber qué motor debe construir el swap"
+            )
         # Los dos campos describen la misma cifra, así que o están los dos o no
         # está ninguno. Permitir «comisión desconocida con procedencia
         # publicada» dejaría pasar un estado que no quiere decir nada.
@@ -444,6 +465,26 @@ class PredictionMarket:
 # --------------------------------------------------------------------------- #
 # Acciones propuestas
 # --------------------------------------------------------------------------- #
+#: Par etiqueta/valor de un payload sin firmar. Es la forma en que la UI muestra
+#: una transacción sin tener que saber de qué red es: cada tipo se describe a sí
+#: mismo y la vista sólo pinta lo que recibe.
+TransactionField = tuple[str, str]
+
+
+def _require_confirmable(description: str) -> None:
+    """Ninguna transacción se construye sin una descripción legible.
+
+    El usuario tiene que poder leer qué está confirmando. Un payload sin
+    descripción obliga a confiar en la máquina, que es lo contrario del
+    principio rector del producto.
+    """
+    if not description:
+        raise InvalidAmountError(
+            "la transacción necesita una descripción legible: el usuario tiene "
+            "que entender qué está confirmando"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class UnsignedTransaction:
     """Payload de transacción **sin firmar**, para revisión del usuario.
@@ -457,7 +498,7 @@ class UnsignedTransaction:
     formato de transacción lo exige numérico. Por eso este tipo sólo sirve para
     redes EVM; obtener el entero desde una clave de red es
     `ChainSpec.require_eip155_id()`, que falla explícitamente en las que no lo
-    tienen.
+    tienen. Para Solana, ver `UnsignedSolanaTransaction`.
     """
 
     chain_id: int
@@ -470,10 +511,71 @@ class UnsignedTransaction:
     def __post_init__(self) -> None:
         if not self.to_address:
             raise InvalidAmountError("la transacción necesita una dirección destino")
-        if not self.description:
-            raise InvalidAmountError(
-                "la transacción necesita una descripción legible: el usuario tiene "
-                "que entender qué está confirmando"
-            )
+        _require_confirmable(self.description)
         if self.value.raw < 0:
             raise InvalidAmountError("el valor de la transacción no puede ser negativo")
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        """Campos para mostrar al usuario, en el orden en que se leen."""
+        return (
+            ("Red", f"EVM (chain id {self.chain_id})"),
+            ("Destino", self.to_address),
+            ("Valor", str(self.value)),
+            ("Descripción", self.description),
+            ("Calldata", self.calldata),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnsignedSolanaTransaction:
+    """Transacción de Solana sin firmar, tal como la entrega el agregado.
+
+    **Hermano de `UnsignedTransaction`, no una generalización suya**, y la
+    distinción es deliberada. En Solana no hay `chain_id` —la red va implícita y
+    se ancla por el blockhash— ni `calldata`: la transacción es un mensaje
+    versionado completo, serializado y en base64, que ya trae sus instrucciones
+    y sus cuentas. Meterlo en `UnsignedTransaction` con los campos sobrantes en
+    `None` convertiría dos invariantes hoy ciertas —«`chain_id` siempre es
+    EIP-155», «`calldata` siempre es hexadecimal»— en dos campos que cada
+    consumidor tendría que comprobar antes de usarlos. Cada tipo dice la verdad
+    sobre su red y la unión `PlannedTransaction` es la que los unifica en la
+    frontera.
+
+    `last_valid_block_height` es la **caducidad**, y se toma de la fuente en vez
+    de deducirse del payload. El blockhash está dentro del mensaje versionado y
+    extraerlo obligaría a deserializarlo junto con sus *lookup tables*; la API ya
+    publica la altura, que además es la cifra que el usuario necesita: «esto vale
+    hasta la altura N». Una transacción de Solana que caduca es papel mojado, así
+    que la caducidad no es un detalle de presentación, es parte del dato.
+    """
+
+    transaction_b64: str
+    last_valid_block_height: int
+    fee_payer: str
+    description: str
+
+    def __post_init__(self) -> None:
+        if not self.transaction_b64:
+            raise InvalidAmountError("la transacción de Solana llegó vacía")
+        if self.last_valid_block_height <= 0:
+            raise InvalidAmountError(
+                "la transacción de Solana necesita la altura de bloque en la que "
+                "caduca: sin ella no se puede saber si sigue siendo emitible"
+            )
+        if not self.fee_payer:
+            raise InvalidAmountError("la transacción necesita el pagador de la comisión")
+        _require_confirmable(self.description)
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (
+            ("Red", "Solana"),
+            ("Pagador de comisión", self.fee_payer),
+            ("Válida hasta la altura", str(self.last_valid_block_height)),
+            ("Descripción", self.description),
+            ("Transacción (base64)", self.transaction_b64),
+        )
+
+
+#: Lo que un motor de swap puede devolver. La UI la consume a través de
+#: `describe()`, así que añadir una red nueva no toca la vista.
+type PlannedTransaction = UnsignedTransaction | UnsignedSolanaTransaction

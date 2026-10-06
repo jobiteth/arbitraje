@@ -41,27 +41,67 @@ en el `venue_id`, y aquí no hay comisión que meter.
 
 Sin API key: se usa el endpoint abierto `lite-api.jup.ag`. Jupiter ofrece también
 un `api.jup.ag` con clave y límites más altos, pero no hay clave disponible para
-medirlo y este proyecto no publica rutas de código que no haya ejecutado.
+medirlo y este proyecto no publica rutas de código que no haya ejecutado. El
+endpoint de swap, medido, tampoco la pide.
+
+### Construir el swap: lo que se midió y por qué el motor re-cotiza
+
+Jupiter construye la transacción en `POST /swap/v1/swap`, y lo que se comprobó
+contra la API real decide el diseño entero de `plan_swap`:
+
+- **El endpoint no revalida la cotización que se le pasa.** Enviando el mismo
+  `quoteResponse` con el `outAmount` inflado diez veces, responde **HTTP 200** y
+  entrega una transacción. Es decir: construir desde una cotización guardada
+  produce un payload que nadie ha verificado, con el mínimo garantizado de la
+  ruta calculado sobre una cifra inventada. Por eso `plan_swap` **vuelve a
+  cotizar** y compara antes de construir; ver `MAX_QUOTE_DRIFT_BPS`.
+- **No simula por defecto.** Con una cuenta sin fondos recién generada, la
+  respuesta trae `simulationError: None` y `simulationSlot: None`. `None` aquí
+  significa «no se simuló», no «la transacción está bien»: leerlo como un visto
+  bueno sería exactamente el error que el producto no se puede permitir.
+- **El payload caduca y no es determinista.** Dos llamadas consecutivas con la
+  misma entrada devuelven `lastValidBlockHeight` distinto (431989574 y
+  431989575, medido), y la transacción cambia. No es cacheable —que es lo que
+  justifica el `post_json` sin caché de `JsonSource`— y su validez hay que
+  publicarla, porque una transacción de Solana que caduca es papel mojado.
+- **Los errores de validación son 422**, no 400: pubkey fuera del alfabeto
+  base58 devuelve `Parse error: Invalid`, y una de 31 bytes `Parse error:
+  WrongSize`. Es la misma regla que aplica `require_solana_address` en el
+  dominio, así que el destino se valida antes de gastar la petición.
+
+Lo que **no** se midió: el caso de una cotización caducada de verdad entre dos
+llamadas. La comprobación de deriva cubre el caso que sí importa —el precio que
+el usuario vio— y el resto lo decide la propia red al emitir.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Final
 
 import structlog
 
 from amigocompora.domain.clock import Clock, SystemClock
+from amigocompora.domain.errors import (
+    NoQuotesError,
+    QuoteMovedError,
+    SourceResponseError,
+    UnsupportedOperationError,
+)
 from amigocompora.domain.models import (
     Measurement,
     Quote,
     TradingPair,
+    UnsignedSolanaTransaction,
     Venue,
     VenueKind,
 )
 from amigocompora.domain.modes import Capability
-from amigocompora.domain.money import BasisPoints, TokenAmount
+from amigocompora.domain.money import EXACT, BasisPoints, TokenAmount
 from amigocompora.domain.protocols import EngineKind, EngineManifest
 from amigocompora.engines.http_source import JsonSource, as_mapping, optional_decimal
 
@@ -70,6 +110,7 @@ _log = structlog.get_logger(__name__)
 SOURCE_NAME: Final = "Jupiter"
 HOST: Final = "lite-api.jup.ag"
 QUOTE_URL: Final = f"https://{HOST}/swap/v1/quote"
+SWAP_URL: Final = f"https://{HOST}/swap/v1/swap"
 
 #: La única red de este motor. Jupiter es el agregador **de Solana**: no hay una
 #: tabla de redes que ampliar aquí, y fingir que la hay sugeriría que añadir otra
@@ -88,7 +129,13 @@ MANIFEST: Final = EngineManifest(
         "publica. En cambio no desglosa esa comisión, así que sus cotizaciones "
         "comparan precios pero no se usan para diferenciales netos."
     ),
-    capabilities=frozenset({Capability.READ_CHAIN, Capability.COMPUTE_ROUTE}),
+    capabilities=frozenset(
+        {Capability.READ_CHAIN, Capability.COMPUTE_ROUTE, Capability.PREPARE_TX}
+    ),
+    # La única red que sabe construir. Cualquier otro motor que declare
+    # `solana` aquí compite con éste, y la preferencia se decide en
+    # configuración, no en el código.
+    swap_chains=frozenset({CHAIN_KEY}),
     required_config=(),
     allowed_hosts=(HOST,),
 )
@@ -120,6 +167,18 @@ _ABSENT_STATUSES: Final = frozenset({400, 404})
 #: motores: una ejecución que se come el 10 % no informa, estorba.
 MAX_PRICE_IMPACT: Final = BasisPoints(1_000)
 
+#: Deriva máxima tolerada entre la cotización que el usuario vio y la que hay en
+#: el momento de construir el swap. 100 bps = 1 %.
+#:
+#: El endpoint de swap **no** revalida la cotización que se le pasa —medido: un
+#: `outAmount` inflado x10 se acepta con un 200—, así que la comprobación es
+#: nuestra o no existe. El umbral no es cero porque un mercado se mueve entre
+#: que se pinta la tabla y que el usuario pulsa: exigir identidad convertiría el
+#: botón en un botón que casi nunca funciona. Un 1 % es lo bastante holgado para
+#: absorber ese parpadeo y lo bastante estrecho para que el usuario no firme algo
+#: distinto de lo que decidió.
+MAX_QUOTE_DRIFT_BPS: Final = BasisPoints(100)
+
 
 class JupiterEngine:
     """Cotizaciones de Solana tal como las ejecutaría el agregador."""
@@ -132,6 +191,7 @@ class JupiterEngine:
         clock: Clock | None = None,
         ttl_seconds: float = 5.0,
         timeout_seconds: float = 15.0,
+        min_interval_seconds: float = 1.0,
     ) -> None:
         self._clock = clock or SystemClock()
         self._source = JsonSource(
@@ -145,7 +205,7 @@ class JupiterEngine:
             # —comprobado—, así que no hay forma de saber la cuota salvo
             # agotarla. Se elige un ritmo conservador y el intervalo adaptativo
             # de `JsonSource` se encarga del resto si aun así nos limita.
-            min_interval_seconds=1.0,
+            min_interval_seconds=min_interval_seconds,
         )
 
     @property
@@ -171,10 +231,6 @@ class JupiterEngine:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         if pair.chain != CHAIN_KEY:
             return ()
-        if pair.base.address is None or pair.quote.address is None:
-            # Jupiter identifica los tokens por mint. El SOL nativo se cotiza
-            # como WSOL, que `catalog.wrapped_native` ya devuelve con su mint.
-            return ()
         if amount_in.raw > MAX_U64:
             _log.info(
                 "jupiter.amount_over_u64",
@@ -183,11 +239,37 @@ class JupiterEngine:
             )
             return ()
 
-        payload = await self._source.get_json(
+        payload = await self._quote_payload(pair, amount_in)
+        if payload is None:
+            # Par sin ruta. Es una respuesta, no un fallo: la red sigue y los
+            # demás pares del barrido también.
+            _log.debug("jupiter.no_route", pair=pair.symbol)
+            return ()
+
+        quote = self._to_quote(payload, pair, amount_in)
+        return () if quote is None else (quote,)
+
+    async def _quote_payload(
+        self, pair: TradingPair, amount_in: TokenAmount
+    ) -> Mapping[str, Any] | None:
+        """La cotización **cruda** de la fuente, o `None` si no hay nada que cotizar.
+
+        Existe separada de `quote()` porque el endpoint de swap necesita el
+        `quoteResponse` completo, no la `Quote` del dominio: ésta es una lectura
+        derivada y no conserva lo que Jupiter necesita para construir. Ver
+        `plan_swap`.
+        """
+        input_mint = pair.base.address
+        output_mint = pair.quote.address
+        if input_mint is None or output_mint is None:
+            # Jupiter identifica los tokens por mint. El SOL nativo se cotiza
+            # como WSOL, que `catalog.wrapped_native` ya devuelve con su mint.
+            return None
+        raw = await self._source.get_json(
             QUOTE_URL,
             params={
-                "inputMint": pair.base.address,
-                "outputMint": pair.quote.address,
+                "inputMint": input_mint,
+                "outputMint": output_mint,
                 "amount": str(amount_in.raw),
                 "slippageBps": str(SLIPPAGE_BPS),
                 "swapMode": "ExactIn",
@@ -199,14 +281,137 @@ class JupiterEngine:
             },
             absent_statuses=_ABSENT_STATUSES,
         )
-        if payload is None:
-            # Par sin ruta. Es una respuesta, no un fallo: la red sigue y los
-            # demás pares del barrido también.
-            _log.debug("jupiter.no_route", pair=pair.symbol)
-            return ()
+        if raw is None:
+            return None
+        return as_mapping(raw, "respuesta", SOURCE_NAME)
 
-        quote = self._to_quote(as_mapping(payload, "respuesta", SOURCE_NAME), pair, amount_in)
-        return () if quote is None else (quote,)
+    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedSolanaTransaction:
+        """Construye la transacción sin firmar del swap que describe `quote`.
+
+        No firma ni emite: devuelve el payload para que el usuario lo revise.
+
+        ### Por qué vuelve a cotizar
+
+        El endpoint de swap acepta cualquier `quoteResponse` sin comprobarlo
+        —medido: con el `outAmount` inflado x10 responde 200 y construye—, así
+        que pasarle la cotización que el usuario vio en pantalla equivale a
+        construir sobre un precio que nadie ha verificado y que puede ser de
+        hace minutos. Se re-cotiza, se compara con lo que se mostró y sólo se
+        construye si la diferencia cabe en `MAX_QUOTE_DRIFT_BPS`; si no, se
+        lanza `QuoteMovedError` y no se construye **nada**. La alternativa
+        —construir y avisar— dejaría en manos del usuario detectar la
+        discrepancia comparando dos cifras de un diálogo, que es justo el trabajo
+        que no se le puede pedir a quien está confirmando una operación.
+        """
+        if quote.pair.chain != CHAIN_KEY:
+            raise UnsupportedOperationError(
+                f"este motor sólo construye swaps en {CHAIN_KEY}: se pidió "
+                f"{quote.pair.chain}. Activa un motor que cubra esa red."
+            )
+
+        # 1. Cotización fresca, y comprobación de que sigue siendo la misma
+        #    operación que el usuario decidió.
+        payload = await self._quote_payload(quote.pair, quote.amount_in)
+        if payload is None:
+            raise NoQuotesError(
+                f"«{quote.pair.symbol}» ya no tiene ruta en {SOURCE_NAME}: la que "
+                f"viste al cotizar se agotó. Vuelve a cotizar."
+            )
+        fresh_raw = _raw_amount(payload.get("outAmount"))
+        if fresh_raw is None or fresh_raw <= 0:
+            raise SourceResponseError(
+                f"«{SOURCE_NAME}» devolvió una cotización sin `outAmount` legible "
+                f"({payload.get('outAmount')!r}); no se puede construir nada con ella."
+            )
+        self._require_same_price(quote, fresh_raw)
+
+        # 2. Construir. Sin caché en `post_json`: ver su docstring y el del
+        #    módulo — el payload caduca y no es determinista.
+        response = await self._source.post_json(
+            SWAP_URL,
+            json_body={
+                "quoteResponse": payload,
+                "userPublicKey": recipient,
+                "wrapAndUnwrapSol": True,
+            },
+        )
+        body = as_mapping(response, "respuesta de swap", SOURCE_NAME)
+        return self._to_unsigned(quote, body, fresh_raw, recipient)
+
+    def _require_same_price(self, quote: Quote, fresh_raw: int) -> None:
+        """Aborta si el precio se movió más de lo tolerado desde lo que se vio."""
+        shown_raw = quote.amount_out.raw
+        drift = EXACT.divide(Decimal(abs(fresh_raw - shown_raw)), Decimal(shown_raw))
+        drift_bps = BasisPoints.from_ratio(drift)
+        if drift_bps.value <= MAX_QUOTE_DRIFT_BPS.value:
+            return
+        token = quote.pair.quote
+        _log.info(
+            "jupiter.quote_moved",
+            pair=quote.pair.symbol,
+            shown_raw=shown_raw,
+            fresh_raw=fresh_raw,
+            drift_bps=drift_bps.value,
+        )
+        raise QuoteMovedError(
+            shown=str(quote.amount_out),
+            fresh=str(TokenAmount(fresh_raw, token.decimals, token.symbol)),
+            drift_bps=drift_bps.value,
+            tolerance_bps=MAX_QUOTE_DRIFT_BPS.value,
+        )
+
+    def _to_unsigned(
+        self,
+        quote: Quote,
+        body: Mapping[str, Any],
+        fresh_raw: int,
+        recipient: str,
+    ) -> UnsignedSolanaTransaction:
+        """Traduce la respuesta del swap, o falla diciendo qué campo no cuadró."""
+        payload = body.get("swapTransaction")
+        if not isinstance(payload, str) or not payload:
+            raise SourceResponseError(
+                f"«{SOURCE_NAME}» respondió al swap sin `swapTransaction`; no hay "
+                f"transacción que revisar."
+            )
+        # Se decodifica de verdad y no se confía en el nombre del campo: si algún
+        # día dejara de ser base64, mejor saberlo aquí que en el diálogo de
+        # confirmación, donde el usuario ya está decidiendo.
+        try:
+            size = len(base64.b64decode(payload, validate=True))
+        except (binascii.Error, ValueError) as error:
+            raise SourceResponseError(
+                f"«{SOURCE_NAME}» devolvió un `swapTransaction` que no es base64 "
+                f"válido ({error})."
+            ) from error
+
+        height = body.get("lastValidBlockHeight")
+        if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
+            raise SourceResponseError(
+                f"«{SOURCE_NAME}» no publicó una altura de caducidad legible "
+                f"({height!r}); sin ella no se puede saber hasta cuándo vale."
+            )
+
+        token = quote.pair.quote
+        fresh = TokenAmount(fresh_raw, token.decimals, token.symbol)
+        _log.info(
+            "jupiter.swap_planned",
+            pair=quote.pair.symbol,
+            out_raw=fresh_raw,
+            last_valid_block_height=height,
+            tx_bytes=size,
+        )
+        return UnsignedSolanaTransaction(
+            transaction_b64=payload,
+            last_valid_block_height=height,
+            fee_payer=recipient,
+            description=(
+                f"Swap en {quote.venue.name}: entregas {quote.amount_in} y recibes "
+                f"{fresh} según la ruta simulada, con {SLIPPAGE_BPS} bps de "
+                f"deslizamiento tolerado. La transacción caduca en la altura "
+                f"{height}."
+            ),
+        )
 
     def _to_quote(
         self,
@@ -252,6 +457,7 @@ class JupiterEngine:
 
         return Quote(
             venue=VENUE,
+            engine_id=MANIFEST.engine_id,
             pair=pair,
             amount_in=amount_in,
             amount_out=TokenAmount(out_raw, pair.quote.decimals, pair.quote.symbol),
