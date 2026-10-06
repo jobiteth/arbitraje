@@ -67,7 +67,7 @@ class PrepareSwap:
                 f"Recibes (estimado): {quote.amount_out}",
                 f"Precio de ejecución: {quote.price}",
                 f"Comisión del venue: {_fee_line(quote)}",
-                f"Impacto de precio: {quote.price_impact_bps}",
+                f"Impacto de precio: {_impact_line(quote)}",
                 f"Destino: {shorten(destination)}",
                 "Amigocompora no firmará ni emitirá esta transacción.",
             ),
@@ -135,3 +135,16 @@ def _fee_line(quote: Quote) -> str:
     if quote.fee_bps is None:
         return "no desglosada por la fuente (ya descontada de lo que recibes)"
     return str(quote.fee_bps)
+
+
+def _impact_line(quote: Quote) -> str:
+    """Impacto de precio, con el mismo cuidado que la comisión.
+
+    Un `None` aquí no es un cero y no puede pintarse como tal: diría que la
+    orden no mueve el precio, que es justo lo que no se sabe. Se dice que la
+    fuente no lo publica **y** que el importe recibido ya lo lleva dentro, que
+    es lo que sí se sabe.
+    """
+    if quote.price_impact_bps is None:
+        return "no publicado por la fuente (ya está dentro de lo que recibes)"
+    return str(quote.price_impact_bps)

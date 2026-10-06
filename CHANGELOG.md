@@ -5,6 +5,41 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Añadido — Motor de 0x (ZeroEx), con el build apagado por omisión
+
+- `engines/zeroex`: cotiza repartiendo la orden entre los venues que agrega 0x
+  en **nueve** redes EVM —las ocho de Uniswap más Robinhood Chain, que aquel no
+  cubre— y construye el payload sin firmar **sólo si se le pide**.
+- El build viene **desactivado** porque 0x cobra una comisión de volumen medida
+  en 15,02 bps (el 0,15 % de lo que se recibe), ya descontada del importe.
+  Apagado no es una condición escondida: el manifiesto de la instancia deja de
+  declarar `PREPARE_TX` y `swap_chains`, así que ni el registro lo ofrece como
+  constructor de ninguna red ni la interfaz pinta un botón que falle. Se enciende
+  con `enable_swap_build`, y cualquier valor que no se reconozca se lee como
+  «no», para que una errata no empiece a cobrar sin que nadie lo haya pedido.
+- Se publica la comisión que **de verdad** se paga (`fees.zeroExFee` más
+  `integratorFee`), y sólo si está expresada en el token que se recibe; cobrada
+  en otro token se publica `None` antes que una cifra que mezcla unidades.
+- El `value` del payload se lee en decimal **o** hexadecimal: medido, esta API
+  manda `"0"` donde la de Uniswap manda `"0x00"`. Un lector de una sola forma
+  habría abortado cada swap, o callado un valor nativo distinto de cero.
+- No integra `/gasless/quote`: ese flujo termina en `/gasless/submit`, donde 0x
+  **emite** la transacción por el usuario. Amigocompora no firma ni emite, así
+  que el motor no podría completar nunca su propio flujo.
+
+### Cambiado — El impacto de precio puede faltar
+
+- `Quote.price_impact_bps` pasa a ser opcional, simétrico con `fee_bps`: la v2
+  de 0x **eliminó** el campo. Estimarlo está descartado por una razón medida, no
+  por prudencia —la resta habitual confunde el excedente por deslizamiento con
+  el impacto, y calcularlo contra una orden diminuta del mismo par da un 0,93 %
+  que es de ruta y no de profundidad—, así que `None` significa «la fuente no lo
+  dice» y la interfaz lo escribe así en lugar de pintar un cero.
+- `Quote.impact_basis` e `impact_is_known` acompañan al campo, con la misma
+  coherencia que la comisión: o están los dos o no está ninguno. Un impacto
+  desconocido **no** degrada `is_exact`, porque `amount_out` sigue medido y es
+  la cifra con la que se compara.
+
 ### Añadido — Motor de Uniswap (agregado de EVM)
 
 - `engines/uniswap`: cotiza y construye por la Trading API de Uniswap en las

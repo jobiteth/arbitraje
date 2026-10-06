@@ -210,15 +210,40 @@ class Quote:
     engine_id: str
     #: Comisión del venue, o `None` si la fuente no la separa de `amount_out`.
     fee_bps: BasisPoints | None
-    price_impact_bps: BasisPoints
+    #: Impacto de precio, o `None` si la fuente **no lo publica**.
+    #:
+    #: Mismo razonamiento que en `fee_bps`, y por el mismo camino: tres formas
+    #: de contarlo —publicar 0, estimarlo, o decir que no se sabe— y las dos
+    #: primeras descartadas. El caso medido es la API de 0x, que **eliminó** el
+    #: campo en su versión 2: tenía `estimatedPriceImpact` en la v1 y ya no lo
+    #: devuelve, junto con el parámetro que lo limitaba. Lo dice su propia
+    #: documentación, y no es un fallo de la respuesta sino una decisión suya.
+    #:
+    #: Estimarlo está descartado por una razón concreta y medida, no por
+    #: prudencia: la recomendación habitual —comparar el valor de lo entregado
+    #: con el de lo recibido— **no mide el impacto**. 0x avisa de que esa resta
+    #: confunde el excedente por slippage positivo con impacto, y hay una trampa
+    #: peor que se comprobó aquí: calcularlo contra una orden diminuta del mismo
+    #: par da un 0,93 % de «impacto» en una orden de 1 WETH, que no mueve el
+    #: precio de nadie. La causa es que a ese tamaño el agregador enruta por
+    #: Curve y a tamaño normal por Uniswap V3, así que la diferencia es de ruta
+    #: y no de profundidad. Publicar ese número habría pintado un 100 bps falso
+    #: en cada cotización.
+    #:
+    #: `None` significa exactamente «la fuente no lo dice». Lo que no se pierde
+    #: es la comparación: `amount_out` ya viene neto de impacto, así que sigue
+    #: siendo comparable contra cualquier otro venue.
+    price_impact_bps: BasisPoints | None
     observed_at: datetime
     liquidity: TokenAmount | None = None
     #: Procedencia de `fee_bps`, y `None` cuando `fee_bps` lo es. Por defecto lo
     #: más honesto que puede afirmar un motor genérico; cada motor real lo ajusta
     #: a lo que de verdad publica su fuente.
     fee_basis: Measurement | None = Measurement.REPORTED
-    #: Procedencia de `price_impact_bps`, que siempre existe.
-    impact_basis: Measurement = Measurement.DERIVED
+    #: Procedencia de `price_impact_bps`, y `None` cuando no hay impacto que
+    #: procede de ningún sitio. La coherencia entre los dos la exige
+    #: `__post_init__`, igual que con la comisión.
+    impact_basis: Measurement | None = Measurement.DERIVED
     #: Nota del motor sobre cómo se obtuvo la cifra, para mostrar junto al dato.
     source_note: str = ""
 
@@ -239,6 +264,14 @@ class Quote:
                 f"fee_bps={self.fee_bps!r} y fee_basis={self.fee_basis!r} no son "
                 f"coherentes: una comisión desconocida no tiene procedencia, y "
                 f"una conocida la necesita"
+            )
+        # La misma regla para el impacto, ahora que también puede faltar.
+        if (self.price_impact_bps is None) != (self.impact_basis is None):
+            raise InvalidAmountError(
+                f"price_impact_bps={self.price_impact_bps!r} e "
+                f"impact_basis={self.impact_basis!r} no son coherentes: un "
+                f"impacto desconocido no tiene procedencia, y uno conocido la "
+                f"necesita"
             )
         if self.amount_in.symbol != self.pair.base.symbol:
             raise CurrencyMismatchError(
@@ -269,8 +302,24 @@ class Quote:
         sigue siendo válido. Lo que falta es el desglose, y eso lo dice
         `fee_is_known`. Mezclar las dos cosas en una sola bandera haría que la
         UI marcara como «aproximada» una cifra que está medida al dígito.
+
+        Lo mismo vale para un impacto desconocido, y por la misma razón: falta
+        una cifra que describe lo que ya está dentro de `amount_out`, no la
+        cifra con la que se compara.
         """
-        return (self.fee_basis is None or self.fee_basis.is_exact) and self.impact_basis.is_exact
+        return (self.fee_basis is None or self.fee_basis.is_exact) and (
+            self.impact_basis is None or self.impact_basis.is_exact
+        )
+
+    @property
+    def impact_is_known(self) -> bool:
+        """Si la fuente publica el impacto, aparte de aplicarlo.
+
+        Simétrico de `fee_is_known`: quien necesite la cifra —para avisar de un
+        impacto alto, por ejemplo— tiene que preguntar, en vez de leer un `None`
+        como si fuera un cero.
+        """
+        return self.price_impact_bps is not None
 
     @property
     def price(self) -> Price:

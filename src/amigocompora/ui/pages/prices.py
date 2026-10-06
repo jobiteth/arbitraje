@@ -196,8 +196,17 @@ class PricesPage(QWidget):
             if not quote.fee_is_known:
                 item_fee.setForeground(Qt.yellow)
             self._table.setItem(row, 3, item_fee)
-            item_imp = QTableWidgetItem(f"{quote.price_impact_bps} [{quote.impact_basis.value}]")
-            if not quote.is_exact:
+            # Un impacto sin publicar no es un cero: se escribe igual que en el
+            # diálogo de confirmación, para que las dos vistas digan lo mismo de
+            # la misma cotización.
+            impact = (
+                str(quote.price_impact_bps)
+                if quote.price_impact_bps is not None
+                else "— no publicado"
+            )
+            impact_basis = quote.impact_basis.value if quote.impact_basis is not None else "—"
+            item_imp = QTableWidgetItem(f"{impact} [{impact_basis}]")
+            if not quote.impact_is_known or not quote.is_exact:
                 item_imp.setForeground(Qt.yellow)
             self._table.setItem(row, 4, item_imp)
             self._table.setItem(row, 5, QTableWidgetItem(str(quote.liquidity) if quote.liquidity else "—"))
