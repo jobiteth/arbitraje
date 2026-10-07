@@ -5,17 +5,27 @@ uno, y la de cestas deriva de ella la única condición de arbitraje que se pued
 afirmar sin un modelo de valoración externo — que comprar todos los resultados
 cueste menos que el pago garantizado de 1.
 
-El umbral es un control de la vista, no de la consulta: moverlo recalcula sobre
-los informes ya traídos (`FindPredictionOpportunities.from_reports`) y no vuelve
-a pedir nada a la fuente. Es la razón por la que ese método está separado de
-`__call__`, y aquí es donde se aprovecha.
+Los dos umbrales son controles de la vista, no de la consulta: ni el de margen ni
+el de ventana vuelven a pedir nada a la fuente. El de margen recalcula las cestas
+sobre los informes ya traídos (`FindPredictionOpportunities.from_reports`) y el de
+ventana recorta la lista de mercados ya traída. Es la razón por la que esos
+métodos están separados, y aquí es donde se aprovechan.
+
+La ventana, además, **se pide** en la siguiente búsqueda: con «24 h» el motor
+ordena por fecha de cierre y filtra en el servidor, para que los 30 mercados que
+se traen sean los que cierran pronto y no los 30 de más volumen de los cuales sólo
+tres cierran mañana. Recortar en cliente lo ya traído no basta para eso, y por eso
+se hacen las dos cosas.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -38,6 +48,15 @@ from amigocompora.domain.money import BasisPoints
 from amigocompora.ui.theme import COLOR_MUTED, COLOR_SUCCESS
 from amigocompora.ui.widgets import spawn
 
+#: Ventanas de cierre que ofrece el selector, de la más corta a la más larga.
+#: `None` es «todas», que es la vista por volumen de siempre.
+_WINDOWS: tuple[tuple[str, timedelta | None], ...] = (
+    ("todas", None),
+    ("24 h", timedelta(hours=24)),
+    ("7 días", timedelta(days=7)),
+    ("30 días", timedelta(days=30)),
+)
+
 #: Aviso permanente bajo la tabla de cestas. El margen que se muestra es bruto y
 #: el caso de uso lo documenta en detalle; esto es lo que el usuario tiene que
 #: leer antes de sacar una conclusión de la cifra.
@@ -47,6 +66,29 @@ _BASKET_CAVEAT = (
     "plataforma, no comprueba que haya profundidad a esos precios, y las patas hay "
     "que ejecutarlas a la vez. Es una desviación a revisar, no una orden."
 )
+
+
+def countdown(closes_at: datetime | None, now: datetime) -> str:
+    """Cuánto falta para el cierre, en una unidad y sin decimales.
+
+    Una fecha absoluta obliga a restarla mentalmente contra el reloj, y con 30
+    filas eso no se hace: se lee. La unidad se elige para que quepa de un vistazo
+    —minutos si falta menos de una hora, horas si falta menos de dos días, días a
+    partir de ahí— y lo que sobra se trunca hacia abajo, porque decir «en 2 días»
+    cuando faltan 47 h es adelantar el cierre.
+    """
+    if closes_at is None:
+        return "—"
+    if closes_at.tzinfo is None:
+        closes_at = closes_at.replace(tzinfo=UTC)
+    remaining = closes_at - now
+    if remaining.total_seconds() <= 0:
+        return "cerrado"
+    if remaining < timedelta(hours=1):
+        return f"en {int(remaining.total_seconds() // 60)} min"
+    if remaining < timedelta(days=2):
+        return f"en {remaining.days * 24 + remaining.seconds // 3600} h"
+    return f"en {remaining.days} días"
 
 
 class PredictionPage(QWidget):
@@ -60,7 +102,18 @@ class PredictionPage(QWidget):
         top = QHBoxLayout()
         self._search = QLineEdit()
         self._search.setPlaceholderText("Buscar en la pregunta… (vacío = todos)")
+        self._search.returnPressed.connect(self._on_search)
         top.addWidget(self._search, stretch=1)
+        top.addWidget(QLabel("Cierran en:"))
+        self._window = QComboBox()
+        for etiqueta, ventana in _WINDOWS:
+            self._window.addItem(etiqueta, ventana)
+        self._window.setToolTip(
+            "Limita la lista a los mercados que cierran dentro de esa ventana y la "
+            "ordena por el reloj. «todas» es la vista por volumen."
+        )
+        self._window.currentIndexChanged.connect(self._on_window_changed)
+        top.addWidget(self._window)
         self._btn = QPushButton("Buscar")
         self._btn.clicked.connect(self._on_search)
         top.addWidget(self._btn)
@@ -71,7 +124,9 @@ class PredictionPage(QWidget):
         lay.addWidget(self._status)
 
         self._table = QTableWidget(0, 6)
-        self._table.setHorizontalHeaderLabels(["Pregunta", "Favorito", "Total %", "Overround", "Coherente", "Cierre"])
+        self._table.setHorizontalHeaderLabels(
+            ["Pregunta", "Favorito", "Total %", "Overround", "Coherente", "Cierra"]
+        )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
@@ -122,12 +177,16 @@ class PredictionPage(QWidget):
         lay.addWidget(self._basket_note)
 
         self._table.itemSelectionChanged.connect(self._on_select)
+        self._all_reports: tuple[MarketReport, ...] = ()
         self._reports: tuple[MarketReport, ...] = ()
         self._update_edge_hint()
 
     # ------------------------------------------------------------------ #
     # Búsqueda
     # ------------------------------------------------------------------ #
+    def _window_choice(self) -> timedelta | None:
+        return self._window.currentData()
+
     def _on_search(self) -> None:
         self._btn.setEnabled(False)
         self._status.setText("Consultando Polymarket…")
@@ -136,20 +195,60 @@ class PredictionPage(QWidget):
     async def _do_search(self) -> None:
         try:
             text = self._search.text().strip() or None
-            reports = await self._container.analyze_markets(limit=30, search=text)
-            self._reports = reports
-            self._fill(reports)
-            self._refresh_baskets()
-            self._status.setText(f"{len(reports)} mercado(s) · lo incoherente primero")
+            window = self._window_choice()
+            reports = await self._container.analyze_markets(
+                limit=30, search=text, closing_within=window
+            )
+            self._all_reports = reports
+            self._show(reports)
+            self._status.setText(
+                f"{len(self._reports)} mercado(s)"
+                + (" · lo que antes cierra, primero" if window else " · lo incoherente primero")
+            )
         except Exception as error:
             self._status.setText(f"Error: {error}")
             self._table.setRowCount(0)
             self._baskets.setRowCount(0)
+            self._all_reports = ()
             self._reports = ()
         finally:
             self._btn.setEnabled(True)
 
+    def _on_window_changed(self) -> None:
+        """Recorta lo ya traído, sin volver a pedir nada a la fuente.
+
+        Sólo **recorta**: cambiar a una ventana más corta nunca puede añadir
+        filas, porque lo que no se trajo no está. Con «todas» se recupera la
+        lista entera tal como llegó, que es lo que hace que el selector sea
+        reversible y se pueda probar sin coste.
+        """
+        window = self._window_choice()
+        if window is None:
+            self._show(self._all_reports)
+            return
+        now = self._container.clock.now()
+        self._show(
+            tuple(
+                report
+                for report in self._all_reports
+                if (left := report.market.time_left(now)) is not None and left <= window
+            )
+        )
+
+    def _show(self, reports: tuple[MarketReport, ...]) -> None:
+        """Pinta los informes que quedan visibles y recalcula las cestas.
+
+        `self._reports` es lo que se está viendo, no lo que se trajo: la
+        selección de una fila y las cestas se resuelven contra esa lista, y
+        dejarla apuntando a los informes sin filtrar haría que elegir la tercera
+        fila hablara del tercer mercado de otra lista.
+        """
+        self._reports = reports
+        self._fill(reports)
+        self._refresh_baskets()
+
     def _fill(self, reports: tuple[MarketReport, ...]) -> None:
+        now = self._container.clock.now()
         self._table.setRowCount(0)
         for rep in reports:
             row = self._table.rowCount()
@@ -159,8 +258,14 @@ class PredictionPage(QWidget):
             self._table.setItem(row, 2, QTableWidgetItem(f"{rep.total_percent:.2f} %"))
             self._table.setItem(row, 3, QTableWidgetItem(str(rep.overround_bps)))
             self._table.setItem(row, 4, QTableWidgetItem("✓" if rep.is_coherent else "✗"))
-            closes = rep.market.closes_at.isoformat() if rep.market.closes_at else "—"
-            self._table.setItem(row, 5, QTableWidgetItem(closes))
+            closes_at = rep.market.closes_at
+            item = QTableWidgetItem(countdown(closes_at, now))
+            # La fecha exacta sigue disponible: la cuenta atrás es para leer la
+            # tabla de un vistazo, no para esconder el dato.
+            item.setToolTip(
+                closes_at.isoformat() if closes_at is not None else "La fuente no publica fecha de cierre"
+            )
+            self._table.setItem(row, 5, item)
         self._table.resizeRowsToContents()
 
     def _on_select(self) -> None:

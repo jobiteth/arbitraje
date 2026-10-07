@@ -250,9 +250,10 @@ class PricesPage(QWidget):
         previous = self._contra.currentData()
         self._base.clear()
         self._contra.clear()
-        for token in self._available_tokens(key):
-            self._base.addItem(token.symbol, token)
-            self._contra.addItem(token.symbol, token)
+        tokens = self._available_tokens(key)
+        for etiqueta, token in zip(_labels(tokens), tokens, strict=True):
+            self._base.addItem(etiqueta, token)
+            self._contra.addItem(etiqueta, token)
 
         # La pata contraria: se conserva la que el usuario ya había elegido si
         # sigue existiendo en esta red, y si no se cae a la stablecoin de
@@ -263,13 +264,10 @@ class PricesPage(QWidget):
         # Conservarla importa porque esta función también se llama al añadir un
         # token por dirección: repintar las listas no es motivo para deshacer una
         # elección que el usuario acaba de hacer.
-        elegido = (
-            self._contra.findText(previous.symbol) if previous is not None else -1
-        )
+        elegido = _index_of(self._contra, previous)
         if elegido < 0:
             default = quote_token(key) or wrapped_native(key)
-            if default is not None:
-                elegido = self._contra.findText(default.symbol)
+            elegido = _index_of(self._contra, default)
         if elegido >= 0:
             self._contra.setCurrentIndex(elegido)
         self._update_direction_labels()
@@ -350,7 +348,7 @@ class PricesPage(QWidget):
             if entrega is None or recibe is None:
                 self._status.setText("Elige el token y la moneda contra la que cotizarlo.")
                 return
-            if entrega.symbol == recibe.symbol and entrega.address == recibe.address:
+            if entrega.is_same_asset(recibe):
                 # Se dice en vez de impedirlo: los dos desplegables son libres a
                 # propósito —bloquear combinaciones entre ellos convierte un
                 # error evidente en un desplegable que se mueve solo y no se
@@ -681,6 +679,45 @@ class PricesPage(QWidget):
         self._status.setText(
             f"Guardada en {path}. Sigue SIN FIRMAR: nada se ha emitido."
         )
+
+
+def _labels(tokens: tuple[Token, ...]) -> tuple[str, ...]:
+    """Etiquetas de los desplegables, desempatando los homónimos por dirección.
+
+    Dos tokens distintos pueden publicar el mismo `symbol()`: en Polygon el USDC
+    nativo y el puenteado desde Ethereum se llaman los dos «USDC». Repetir la
+    etiqueta deja al usuario eligiendo a ciegas entre dos cosas que no son la
+    misma —y una de ellas es el colateral que acepta Polymarket—, así que sólo
+    cuando un símbolo aparece más de una vez se le añade el principio de la
+    dirección, que es lo que sí distingue. Con símbolos únicos la etiqueta queda
+    limpia, que es el caso normal.
+    """
+    repetidos = {
+        token.symbol
+        for token in tokens
+        if sum(otro.symbol == token.symbol for otro in tokens) > 1
+    }
+    return tuple(
+        token.qualified_symbol if token.symbol in repetidos else token.symbol
+        for token in tokens
+    )
+
+
+def _index_of(combo: QComboBox, token: Token | None) -> int:
+    """Índice de un token en el desplegable, por identidad y no por etiqueta.
+
+    Se busca por `is_same_asset` y no por texto porque las etiquetas ya no
+    identifican unívocamente —`USDC` puede ser dos tokens— y porque el texto de
+    una etiqueta es presentación: si mañana cambia el formato, la elección del
+    usuario no tiene por qué perderse.
+    """
+    if token is None:
+        return -1
+    for index in range(combo.count()):
+        candidato = combo.itemData(index)
+        if isinstance(candidato, Token) and candidato.is_same_asset(token):
+            return index
+    return -1
 
 
 def _payload_document(transaction: PlannedTransaction) -> dict[str, str]:

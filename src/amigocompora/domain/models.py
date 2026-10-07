@@ -9,7 +9,7 @@ nunca `float` (ver `money`).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Final
@@ -58,6 +58,45 @@ class Token:
     def is_native(self) -> bool:
         return self.address is None
 
+    def is_same_asset(self, other: Token) -> bool:
+        """Si `other` es **este mismo token**, no sólo uno que se llama igual.
+
+        El símbolo no identifica un token: dos contratos distintos pueden
+        publicar el mismo. El caso está medido, no supuesto —en Polygon el USDC
+        nativo (`0x3c49…3359`) y el USDC puenteado, «USDC.e» (`0x2791…4174`),
+        devuelven los dos `symbol() == "USDC"`—, y son tokens distintos: viven en
+        piscinas distintas y sólo uno de los dos lo acepta Polymarket como
+        colateral. Decidir por símbolo no sólo haría imposible expresar el par
+        que los cambia, sino que volvería indistinguibles dos cosas que no lo
+        son en todo lo que compare por nombre.
+
+        Lo que identifica es la dirección, y el token nativo no tiene: dos
+        nativos de la misma red con el mismo símbolo sí son el mismo token.
+        La dirección se compara sin distinguir mayúsculas porque el *checksum*
+        EIP-55 es una convención de presentación, no parte de la identidad —
+        la misma regla que ya aplica `domain.chains`.
+        """
+        if self.chain != other.chain or self.symbol != other.symbol:
+            return False
+        if self.address is None or other.address is None:
+            return self.address is None and other.address is None
+        return self.address.lower() == other.address.lower()
+
+    @property
+    def qualified_symbol(self) -> str:
+        """El símbolo acompañado de lo que hace falta para desempatar homónimos.
+
+        Sólo se usa cuando hay que distinguir —los dos lados de un par que se
+        llaman igual, o dos entradas del mismo nombre en un desplegable—, así que
+        no tiene que ser bonito: tiene que bastar para saber cuál es cuál. Diez
+        caracteres de dirección separan el USDC nativo de Polygon del puenteado,
+        que es el caso que existe. Un token nativo no tiene dirección, y ahí lo
+        que desempata es decir que lo es.
+        """
+        if self.address is None:
+            return f"{self.symbol} (nativo)"
+        return f"{self.symbol} {self.address[:10]}…"
+
     def amount(self, value: Decimal | int | str) -> TokenAmount:
         """Construye una cantidad de este token desde unidades humanas."""
         return TokenAmount.from_decimal(value, self.decimals, self.symbol)
@@ -74,7 +113,7 @@ class TradingPair:
     quote: Token
 
     def __post_init__(self) -> None:
-        if self.base.symbol == self.quote.symbol:
+        if self.base.is_same_asset(self.quote):
             raise CurrencyMismatchError(f"un par no puede ser {self.base.symbol} contra sí mismo")
         if self.base.chain != self.quote.chain:
             raise CurrencyMismatchError(
@@ -84,7 +123,16 @@ class TradingPair:
 
     @property
     def symbol(self) -> str:
-        return f"{self.base.symbol}/{self.quote.symbol}"
+        """Etiqueta del par para la tabla, el diálogo y el registro.
+
+        Con símbolos distintos es lo obvio —`USDC/WETH`—. Con el mismo símbolo en
+        los dos lados no lo es: `USDC/USDC` no dice qué se cambia por qué, ni
+        sirve para leer después el registro de ejecuciones. Ahí se añade el
+        principio de la dirección, que es lo único que distingue a los dos.
+        """
+        if self.base.symbol != self.quote.symbol:
+            return f"{self.base.symbol}/{self.quote.symbol}"
+        return f"{self.base.qualified_symbol}/{self.quote.qualified_symbol}"
 
     @property
     def chain(self) -> str:
@@ -534,6 +582,23 @@ class PredictionMarket:
     @property
     def favourite(self) -> MarketOutcome:
         return max(self.outcomes, key=lambda outcome: outcome.price)
+
+    def time_left(self, now: datetime) -> timedelta | None:
+        """Cuánto falta para que cierre, o `None` si no se sabe o ya cerró.
+
+        Un mercado sin fecha de cierre y uno ya cerrado se responden igual
+        —`None`— porque para quien pregunta «cuánto queda» las dos cosas son lo
+        mismo: no hay tiempo por delante. Distinguirlos es trabajo de quien tenga
+        el dato de si el mercado está abierto, no de esta cuenta.
+
+        El cierre en el instante exacto cuenta como cerrado: un mercado que
+        termina justo ahora ya no admite una orden, y devolver un `timedelta` de
+        cero invitaría a operarlo.
+        """
+        _require_aware(now, "now")
+        if self.closes_at is None or self.closes_at <= now:
+            return None
+        return self.closes_at - now
 
 
 # --------------------------------------------------------------------------- #

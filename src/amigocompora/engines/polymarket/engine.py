@@ -16,7 +16,8 @@ Dos cosas que conviene saber al leer la tabla que produce:
 - Se piden sólo mercados **abiertos** y ordenados por volumen. Un mercado
   cerrado tiene precios congelados en 0 y 1, y mezclarlos con los abiertos
   llenaría la tabla de probabilidades del 100 % que no son una predicción de
-  nada.
+  nada. Cuando lo que se busca es **lo que está terminando**, el orden pasa a
+  ser el del reloj y la ventana se filtra contra la fecha de cierre.
 
 Sin API key: la API Gamma es pública y de sólo lectura.
 """
@@ -26,7 +27,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
@@ -132,8 +133,20 @@ class PolymarketEngine:
         *,
         limit: int = 20,
         search: str | None = None,
+        closing_within: timedelta | None = None,
     ) -> Sequence[PredictionMarket]:
-        """Mercados abiertos, los de más volumen primero.
+        """Mercados abiertos.
+
+        Sin `closing_within` se ordenan por volumen: son los que tienen precios
+        que significan algo. Con `closing_within` el orden pasa a ser el del
+        reloj —lo que antes cierra, primero— y sólo entran los que cierran dentro
+        de esa ventana, que es la vista de «lo que está terminando».
+
+        Ese orden se pide a la fuente **y** se vuelve a aplicar aquí. Pedirlo
+        hace que el `limit` se gaste en lo que cierra pronto en vez de en lo que
+        cierra dentro de un año; aplicarlo aquí hace que la lista sea correcta
+        aunque la fuente ignore los parámetros, que es lo que se comprueba en las
+        pruebas con una respuesta que no los respeta.
 
         El filtro por texto se aplica en cliente sobre la pregunta del mercado:
         así el comportamiento del buscador no depende de parámetros de la API
@@ -145,26 +158,34 @@ class PolymarketEngine:
         needle = (search or "").strip().lower()
         # Con búsqueda hay que traer bastante más, porque el filtro cae después.
         requested = min(limit * (_OVERFETCH * 4 if needle else _OVERFETCH), _MAX_FETCH)
-        payload = await self._source.get_json(
-            f"{API_ROOT}/markets",
-            params={
-                "closed": "false",
-                "active": "true",
-                "limit": str(requested),
-                "order": "volumeNum",
-                "ascending": "false",
-            },
-        )
 
-        observed_at = self._clock.now()
+        now = self._clock.now()
+        params = {
+            "closed": "false",
+            "active": "true",
+            "limit": str(requested),
+            "order": "endDate" if closing_within is not None else "volumeNum",
+            "ascending": "true" if closing_within is not None else "false",
+        }
+        if closing_within is not None:
+            params["end_date_min"] = _iso(now)
+            params["end_date_max"] = _iso(now + closing_within)
+
+        payload = await self._source.get_json(f"{API_ROOT}/markets", params=params)
+
         found: list[PredictionMarket] = []
         for raw in as_sequence(payload, "markets", SOURCE_NAME):
             entry = raw if isinstance(raw, dict) else {}
             if needle and needle not in str(entry.get("question") or "").lower():
                 continue
-            market = self._to_market(entry, observed_at)
-            if market is not None:
-                found.append(market)
+            market = self._to_market(entry, now)
+            if market is None:
+                continue
+            if closing_within is not None:
+                remaining = market.time_left(now)
+                if remaining is None or remaining > closing_within:
+                    continue
+            found.append(market)
             if len(found) >= limit:
                 break
         return tuple(found)
@@ -274,6 +295,16 @@ def _decode_json_array(value: Any) -> list[Any] | None:
     except ValueError:
         return None
     return decoded if isinstance(decoded, list) else None
+
+
+def _iso(moment: datetime) -> str:
+    """Marca ISO-8601 en UTC, que es el formato que acepta la fuente.
+
+    Se fija el sufijo `Z` en vez de dejar el `+00:00` de `isoformat` porque es lo
+    que se midió que la API devuelve y acepta; y se recortan los microsegundos,
+    que no aportan nada a una ventana medida en días.
+    """
+    return moment.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _parse_moment(value: Any) -> datetime | None:

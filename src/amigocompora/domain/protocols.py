@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 from enum import StrEnum
 from typing import Final, Protocol, runtime_checkable
 
@@ -300,8 +301,21 @@ class PredictionMarketEngine(Engine, Protocol):
     """Lectura de mercados de predicción y sus probabilidades implícitas."""
 
     async def markets(
-        self, *, limit: int = 20, search: str | None = None
-    ) -> Sequence[PredictionMarket]: ...
+        self,
+        *,
+        limit: int = 20,
+        search: str | None = None,
+        closing_within: timedelta | None = None,
+    ) -> Sequence[PredictionMarket]:
+        """Mercados abiertos, por volumen; o los que cierran dentro de una ventana.
+
+        `closing_within` no es un filtro más: cambia el **orden**. Sin él se pide
+        lo de más volumen, que es donde los precios significan algo. Con él se
+        pide lo que antes cierra, que es la vista de «lo que está terminando», y
+        un mercado sin fecha de cierre legible se queda fuera: no se puede
+        afirmar que cierre pronto quien no dice cuándo cierra.
+        """
+        ...
 
     async def market(self, market_id: str) -> PredictionMarket: ...
 

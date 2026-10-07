@@ -120,6 +120,17 @@ _EXTRA_SPECS: Final[Mapping[str, Sequence[tuple[str, int, str]]]] = {
         ("WBTC", 8, "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f"),
         ("ARB", 18, "0x912ce59144191c1204e64559fe8253a0e49e6548"),
     ),
+    # En Polygon el USDC existe dos veces y no son el mismo token: el nativo,
+    # que es la stablecoin de referencia de la red, y el puenteado desde
+    # Ethereum («USDC.e»). Los dos contratos publican `symbol() == "USDC"` —eso
+    # está medido, no supuesto—, así que se distinguen por dirección, que es lo
+    # que hace `Token.is_same_asset`. El puenteado entra en el catálogo porque
+    # tiene la liquidez y porque es el **colateral que acepta Polymarket**:
+    # sin él, cambiar USDC nativo por colateral exigiría pegar la dirección a
+    # mano, y su par contra el nativo es una de las piscinas de más volumen de
+    # la red. Va después del nativo para que quien busque «USDC» a secas —una
+    # configuración, por ejemplo— encuentre el nativo, que es el de referencia.
+    "polygon": (("USDC", 6, "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),),
     "unichain": (("WBTC", 8, "0x0555e30da8f98308edb960aa94c0db47230d2b9c"),),
     "optimism": (("OP", 18, "0x4200000000000000000000000000000000000042"),),
     "avalanche": (
@@ -189,7 +200,7 @@ def suggested_pairs(chain_key: str) -> tuple[TradingPair, ...]:
     return tuple(
         TradingPair(base=token, quote=quote)
         for token in tokens_for(chain_key)
-        if token.symbol != quote.symbol
+        if not token.is_same_asset(quote)
     )
 
 
