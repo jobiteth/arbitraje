@@ -87,6 +87,18 @@ DEFAULT_ENGINE_IDS: Final[Mapping[str, str]] = {
     # configurar ninguna clave. El usuario puede cambiar a Claude/DeepSeek/ChatGPT
     # desde el panel de motores o fijarlo en config.toml.
     EngineKind.AI_ADVISOR.value: "stub_advisor",
+    # LI.FI y no Relay, y por una razón que no es de gusto: Relay declara su
+    # clave en `required_config`, así que autoactivarlo sin credencial fallaría en
+    # el arranque y dejaría la ranura igual de vacía. LI.FI cotiza y construye
+    # sin clave —la suya es `optional_config`— y su manifiesto ya se declara
+    # «antes que Relay» con `bridge_priority=50`.
+    #
+    # Sin esta línea la ranura se quedaba vacía: `sole_engine_for` sólo
+    # autoactiva cuando hay **un** motor instalado de la ranura, y desde que hay
+    # dos puentes no hay ninguno que sea el único. La pestaña «Entre redes» se
+    # abría, dejaba elegir redes, tokens e importe, y al buscar contestaba que no
+    # había a quién preguntar.
+    EngineKind.CROSS_CHAIN.value: "lifi",
 }
 
 
@@ -261,7 +273,17 @@ async def build_container(
     # Los dos pasos van separados —leer saldos y valorarlos— porque cuestan cosas
     # muy distintas: leer es una llamada por red, valorar es una cotización por
     # token con fondos. Ver `usecases.wallet`.
-    read_wallet = ReadWallet(registry=registry, guard=guard, clock=effective_clock)
+    # La misma tienda que las pantallas de tokens: lo que el usuario añade aquí es
+    # lo que la cartera tiene que leer, o un token añadido nunca tendría saldo.
+    token_store = UserTokenStore(config_module.config_dir() / "tokens.json")
+    read_wallet = ReadWallet(
+        registry=registry,
+        guard=guard,
+        clock=effective_clock,
+        added_tokens=lambda chain_key: tuple(
+            token for token in token_store.load() if token.chain == chain_key
+        ),
+    )
     value_wallet = ValueWallet(valuation=ValueInReference(registry=registry))
 
     # El camino que firma y emite. Se construye **siempre**, incluso con la
@@ -317,7 +339,7 @@ async def build_container(
         # aplicación se lanza desde el menú de inicio y el directorio de trabajo
         # es cualquiera. Se lee por el **módulo** —ver la nota del registro de
         # ejecuciones— para que el aislamiento de la suite lo pueda desviar.
-        token_store=UserTokenStore(config_module.config_dir() / "tokens.json"),
+        token_store=token_store,
         secrets=effective_store,
         read_wallet=read_wallet,
         value_wallet=value_wallet,
@@ -675,18 +697,25 @@ async def _activate_configured_engines(registry: EngineRegistry, settings: Setti
     dejar que el usuario elija otro motor en el panel, no morir en el `main`. Y
     se registra por motor, para que un nombre mal escrito al final de una lista
     no se lleve por delante al que sí era correcto.
+
+    Una ranura **declarada vacía** (`cross_chain = []`) se queda vacía, y no es lo
+    mismo que no declararla: sin la clave rige el valor por omisión, con la clave
+    puesta a cero el usuario está diciendo que no quiere ninguno. Es la misma
+    lectura que `allowed_tokens`, donde una lista vacía significa «nada» y no «sin
+    restricción»; sin esa distinción apagar una ranura no se podía ni escribir.
     """
     catalog = registry.available()
     installed = {manifest.engine_id for manifest in catalog}
     for kind in EngineKind:
-        configured = _configured_engines(settings.active_engines.get(kind.value))
-        if not configured:
+        if kind.value in settings.active_engines:
+            configured = _configured_engines(settings.active_engines[kind.value])
+        else:
             preferred = DEFAULT_ENGINE_IDS.get(kind.value)
             fallback = preferred if preferred in installed else sole_engine_for(catalog, kind)
-            if fallback is None:
-                _log.info("engine.slot_empty", kind=kind.value)
-                continue
-            configured = (fallback,)
+            configured = () if fallback is None else (fallback,)
+        if not configured:
+            _log.info("engine.slot_empty", kind=kind.value)
+            continue
 
         for position, engine_id in enumerate(configured):
             try:

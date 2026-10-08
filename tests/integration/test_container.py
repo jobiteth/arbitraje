@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from amigocompora.app.confirmation import Decision
-from amigocompora.app.container import build_container
+from amigocompora.app.container import DEFAULT_ENGINE_IDS, build_container
 from amigocompora.domain.errors import (
     ConfirmationDeniedError,
     ExecutionError,
@@ -91,19 +91,94 @@ def _quote(pair: TradingPair) -> Quote:
 
 
 async def test_container_builds_with_all_slots() -> None:
+    """**Ninguna** ranura queda vacía al arrancar sin configuración.
+
+    Se recorre `EngineKind` entero y no una lista escrita a mano, que es lo que
+    falló: esta prueba nombraba tres ranuras porque tres eran las que había, y
+    cuando se añadieron puentes y cartera siguió pasando en verde mientras la
+    pestaña «Entre redes» se abría muerta. Un motor instalado que nadie activa es
+    una pantalla que deja elegir redes, tokens e importe y contesta al final que
+    no hay a quién preguntar.
+
+    La regla que se fija es la del arranque: si una ranura tiene motores
+    instalados, al abrir la aplicación hay uno puesto. Recorrer el enum hace que
+    añadir una ranura nueva sin decidir su valor por omisión rompa aquí, y no en
+    las manos del usuario.
+    """
     container = await build_container(
         Settings(),
         secret_store=InMemorySecretStore(),
         configure_logs=False,
     )
     try:
-        # Las tres ranuras quedan con un motor activo por defecto.
-        assert container.registry.active_manifest(EngineKind.DEX_QUOTES) is not None
-        assert container.registry.active_manifest(EngineKind.PREDICTION_MARKETS) is not None
+        instalados = container.registry.available()
+        for kind in EngineKind:
+            if not any(entry.manifest.kind is kind for entry in instalados):
+                continue  # Ranura sin motores instalados: no hay nada que activar.
+            assert container.registry.active_manifest(kind) is not None, (
+                f"la ranura «{kind.label}» tiene motores instalados y ninguno activo: "
+                f"su pantalla se abre pero no puede responder"
+            )
+        # El asistente por defecto es el offline: la ranura de IA queda utilizable
+        # sin configurar ninguna clave.
         advisor = container.registry.active_manifest(EngineKind.AI_ADVISOR)
         assert advisor is not None
-        # El asistente por defecto es el offline.
         assert advisor.engine_id == "stub_advisor"
+    finally:
+        await container.aclose()
+
+
+async def test_ningun_motor_por_omision_exige_credencial() -> None:
+    """Un motor por omisión con clave obligatoria deja la ranura igual de vacía.
+
+    Es la razón concreta por la que el puente por omisión es LI.FI y no Relay:
+    Relay declara su clave en `required_config`, así que autoactivarlo en una
+    instalación nueva falla en `validate_config` y el arranque lo registra como
+    `engine.autostart_failed` —un aviso en el log, que nadie lee— dejando la
+    pantalla sin motor igual que antes. Elegir el que no pide nada no es una
+    preferencia: es lo único que cumple la promesa de que la ranura venga puesta.
+    """
+    container = await build_container(
+        Settings(),
+        secret_store=InMemorySecretStore(),
+        configure_logs=False,
+    )
+    try:
+        por_id = {
+            entry.manifest.engine_id: entry.manifest for entry in container.registry.available()
+        }
+        for kind_value, engine_id in DEFAULT_ENGINE_IDS.items():
+            manifest = por_id.get(engine_id)
+            assert manifest is not None, f"«{engine_id}» no está instalado"
+            assert manifest.required_config == (), (
+                f"«{engine_id}» es el motor por omisión de «{kind_value}» y exige "
+                f"{manifest.required_config}: en una instalación nueva no arrancaría"
+            )
+    finally:
+        await container.aclose()
+
+
+async def test_una_ranura_declarada_vacia_se_queda_vacia() -> None:
+    """Y no se rellena con el valor por omisión, que es otra cosa.
+
+    Sin la clave en `config.toml` rige lo que la aplicación trae puesto; con la
+    clave escrita a cero el usuario está diciendo que no quiere ninguno. Si las dos
+    formas significaran lo mismo, apagar una ranura no se podría ni expresar:
+    escribir `cross_chain = []` devolvería el motor por omisión y parecería que la
+    configuración se ignora.
+
+    Es la misma lectura que `allowed_tokens`, donde una lista vacía significa
+    «nada permitido» y no «sin restricción».
+    """
+    container = await build_container(
+        Settings.model_validate({"active_engines": {"cross_chain": []}}),
+        secret_store=InMemorySecretStore(),
+        configure_logs=False,
+    )
+    try:
+        assert container.registry.active_manifest(EngineKind.CROSS_CHAIN) is None
+        # Y sólo esa: las demás siguen con su valor por omisión.
+        assert container.registry.active_manifest(EngineKind.DEX_QUOTES) is not None
     finally:
         await container.aclose()
 

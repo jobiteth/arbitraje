@@ -46,7 +46,14 @@ from PySide6.QtWidgets import (
 )
 
 from amigocompora.app.container import Container, build_container
-from amigocompora.domain.models import PriceComparison, Quote, TradingPair, Venue, VenueKind
+from amigocompora.domain.models import (
+    PriceComparison,
+    Quote,
+    Token,
+    TradingPair,
+    Venue,
+    VenueKind,
+)
 from amigocompora.domain.modes import OperationMode
 from amigocompora.domain.money import BasisPoints
 from amigocompora.domain.protocols import EngineManifest
@@ -87,7 +94,9 @@ class CarteraFalsa:
     async def aclose(self) -> None:
         return None
 
-    async def holdings(self, profile: WalletProfile, chain_key: str) -> ChainHoldings:
+    async def holdings(
+        self, profile: WalletProfile, chain_key: str, *, tokens: tuple[Token, ...] = ()
+    ) -> ChainHoldings:
         del profile
         return ChainHoldings(chain=chain_key, holdings=self._posiciones.get(chain_key, ()))
 
@@ -301,7 +310,7 @@ async def test_ninguna_pestana_recorta_su_contenido() -> None:
 # 2. La cartera dentro del swap
 # --------------------------------------------------------------------------- #
 async def test_la_pantalla_de_swap_tiene_la_lista_de_tokens() -> None:
-    """La cartera es una sección del swap, y el swap es la primera pestaña.
+    """La cartera es una columna de la pestaña de swap, y el swap es la primera.
 
     Se afirma sobre las seis pestañas enteras, en orden, y no sólo sobre la
     primera: la composición es lo que hace que esto sea «una pantalla, tipo
@@ -320,9 +329,22 @@ async def test_la_pantalla_de_swap_tiene_la_lista_de_tokens() -> None:
         # La cartera cuelga de la pestaña de swap: no es una pestaña.
         assert window._tabs.indexOf(window._wallet) == -1
         assert window._prices.isAncestorOf(window._wallet)
-        # Y está en el hueco de debajo de la tarjeta de conversión, que es el
-        # sitio que la página reserva justo para esto.
-        assert window._prices._below.indexOf(window._wallet) >= 0
+        # Y está en la columna de la **derecha**, que es el sitio que la página
+        # reserva para ella. Antes iba debajo de la tarjeta de conversión; con dos
+        # tarjetas apiladas, el saldo que se mira antes de escribir un importe
+        # quedaba a media pantalla de distancia del importe.
+        assert window._prices._side_lay.indexOf(window._wallet) >= 0
+        # La columna está a la derecha de verdad, y no sólo dentro de su layout. Se
+        # comparan las coordenadas **llevadas a la misma pestaña**: `x()` es relativo
+        # al padre de cada widget, así que la cartera y la tarjeta tienen cada una el
+        # suyo —el panel y el armazón que se desplaza— y compararlos en crudo daría
+        # dos números que no significan lo mismo. `mapTo` los pone en el mismo sistema,
+        # que es lo que distingue «al lado» de «debajo».
+        x_cartera = window._wallet.mapTo(window._prices, window._wallet.rect().topLeft()).x()
+        x_tarjeta = window._prices._card.mapTo(
+            window._prices, window._prices._card.rect().topLeft()
+        ).x()
+        assert x_cartera > x_tarjeta
 
 
 # --------------------------------------------------------------------------- #

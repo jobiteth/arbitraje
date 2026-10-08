@@ -89,9 +89,14 @@ async def _seccion(
 ) -> AsyncIterator[tuple[Container, BridgesSection]]:
     """La tarjeta montada sobre un contenedor de verdad.
 
-    `con_motor` enciende o apaga la ranura de puentes: sin ella —que es como viene
-    la configuración por defecto, porque `DEFAULT_ENGINE_IDS` no tiene puente— el
-    motivo es otro, y esa diferencia es la que la prueba tiene que poder ver.
+    `con_motor` enciende o apaga la ranura de puentes, y con ella cambia el motivo
+    por el que no se puede operar: esa diferencia es la que la prueba tiene que
+    poder ver. Se declara explícito en los dos sentidos —`active_engines` cuando
+    se quiere, ranura vacía cuando no— y no se hereda del valor por omisión:
+    mientras `DEFAULT_ENGINE_IDS` no traía puente, apagarlo «no haciendo nada» era
+    lo mismo que la configuración real, y por eso ninguna prueba de aquí notó que
+    la pestaña se abría muerta en una instalación nueva. Que la ranura venga
+    puesta lo fija ahora `test_container.py`, que es donde se decide.
     """
     terminos = dict(_TERMINOS)
     if cadenas is not None:
@@ -99,8 +104,10 @@ async def _seccion(
     if tokens is not None:
         terminos["allowed_tokens"] = list(tokens)
     config: dict[str, object] = {"mode": modo.value, "execution": terminos}
-    if con_motor:
-        config["active_engines"] = {"cross_chain": "lifi"}
+    # Declarada, en los dos sentidos: con motor o explícitamente vacía. Omitir la
+    # clave activaría el valor por omisión, que desde que la ranura trae LI.FI ya
+    # no es «vacía».
+    config["active_engines"] = {"cross_chain": "lifi" if con_motor else []}
     container = await build_container(
         Settings.model_validate(config),
         secret_store=_store(con_cartera=con_cartera),

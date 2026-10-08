@@ -38,6 +38,7 @@ tabla de política siga siendo la única fuente de verdad sobre qué se puede ha
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Final
 
@@ -96,6 +97,9 @@ class ReadWallet:
     registry: EngineRegistry
     guard: ModeGuard
     clock: Clock | None = None
+    #: Los tokens que el usuario añadió por dirección, por red. Sin esto un token
+    #: añadido no tiene saldo en EVM: el contrato no se descubre, se pregunta.
+    added_tokens: Callable[[str], tuple[Token, ...]] | None = None
 
     async def __call__(
         self,
@@ -125,7 +129,8 @@ class ReadWallet:
         async def una(chain_key: str) -> ChainHoldings:
             async with semaforo:
                 try:
-                    return await engine.holdings(profile, chain_key)
+                    anadidos = self.added_tokens(chain_key) if self.added_tokens else ()
+                    return await engine.holdings(profile, chain_key, tokens=anadidos)
                 except Exception as error:
                     # El protocolo dice que el motor no lanza, y el nuestro no lo
                     # hace; pero un motor puede venir de un paquete de terceros, y

@@ -111,7 +111,13 @@ class WalletEngineImpl:
     async def aclose(self) -> None:
         await self._reader.aclose()
 
-    async def holdings(self, profile: WalletProfile, chain_key: str) -> ChainHoldings:
+    async def holdings(
+        self,
+        profile: WalletProfile,
+        chain_key: str,
+        *,
+        tokens: tuple[Token, ...] = (),
+    ) -> ChainHoldings:
         """Los saldos de una red, por el lector de su familia.
 
         El perfil decide el lector y la red decide **si esa cartera sirve para
@@ -143,10 +149,12 @@ class WalletEngineImpl:
 
         if profile.kind is WalletKind.SOLANA:
             return await self._solana.holdings(chain_key, profile.address)
-        return await self._evm.holdings(chain_key, profile.address, tokens_to_read(chain_key))
+        return await self._evm.holdings(
+            chain_key, profile.address, tokens_to_read(chain_key, tokens)
+        )
 
 
-def tokens_to_read(chain_key: str) -> tuple[Token, ...]:
+def tokens_to_read(chain_key: str, added: tuple[Token, ...] = ()) -> tuple[Token, ...]:
     """Los contratos por los que preguntar en una red EVM.
 
     En EVM esto no se puede deducir de la cadena —el saldo vive en el contrato
@@ -173,7 +181,13 @@ def tokens_to_read(chain_key: str) -> tuple[Token, ...]:
         chain=chain_key,
         address=None,
     )
-    return (nativo, *tokens_for(chain_key))
+    known = (nativo, *tokens_for(chain_key))
+    extra = tuple(
+        token
+        for token in added
+        if token.chain == chain_key and not any(token.is_same_asset(k) for k in known)
+    )
+    return (*known, *extra)
 
 
 class WalletProvider:

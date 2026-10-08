@@ -25,6 +25,7 @@ from amigocompora.infra.secrets import (
     build_config_resolver,
     env_var_name,
     has_placeholders,
+    placeholder_names,
     resolve_placeholders,
 )
 
@@ -328,6 +329,26 @@ def test_text_without_placeholders_is_untouched() -> None:
     url = "https://mainnet.example.org/rpc"
     assert resolve_placeholders(url, InMemorySecretStore()) == url
     assert has_placeholders(url) is False
+
+
+def test_los_nombres_referenciados_se_pueden_leer_sin_resolverlos() -> None:
+    """La interfaz necesita el **nombre** para ofrecer la casilla, no el valor.
+
+    Es lo que permite que la pantalla de credenciales pida la clave de un nodo
+    sin tener escrita en ninguna parte la lista de proveedores de RPC.
+    """
+    assert placeholder_names("https://x/${INFURA_API_KEY}") == ("INFURA_API_KEY",)
+    assert placeholder_names("https://mainnet.example.org/rpc") == ()
+
+
+def test_un_nombre_repetido_se_cuenta_una_vez() -> None:
+    """Dos marcadores iguales son una credencial, no dos casillas."""
+    assert placeholder_names("https://${K}.x/${K}") == ("K",)
+
+
+def test_los_nombres_salen_en_el_orden_en_que_aparecen() -> None:
+    """Para que dos casillas no se intercambien de sitio entre dos arranques."""
+    assert placeholder_names("https://${UNO}/${DOS}") == ("UNO", "DOS")
 
 
 def test_placeholder_in_a_broken_store_does_not_swallow_the_error(

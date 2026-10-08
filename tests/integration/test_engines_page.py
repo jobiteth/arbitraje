@@ -305,3 +305,134 @@ async def test_una_credencial_de_motor_nombra_su_variable_sin_condiciones() -> N
         assert de_motor, "el catálogo trae motores con credenciales declaradas"
         assert all("allow_env_key" not in pagina._secret_notes[k] for k in de_motor)
         assert container.settings.execution.allow_env_key is False
+
+
+# --------------------------------------------------------------------------- #
+# Las claves de los nodos RPC
+# --------------------------------------------------------------------------- #
+#: Configuración con un nodo propio cuya clave viaja dentro de la URL. Es el caso
+#: de Infura, de Alchemy y de cualquier proveedor de RPC: la clave no es una
+#: credencial de motor y no tenía ninguna casilla donde escribirse.
+_CON_NODO_PROPIO: dict[str, object] = {
+    "execution": {"allow_env_key": False},
+    "chains": [
+        {
+            "chain": "ethereum",
+            "endpoints": [
+                {
+                    "url": "https://mainnet.infura.io/v3/${INFURA_API_KEY}",
+                    "label": "infura",
+                    "priority": 10,
+                }
+            ],
+        }
+    ],
+}
+
+
+def test_los_nombres_de_un_endpoint_salen_de_la_configuracion() -> None:
+    """La lista de proveedores no está escrita en la interfaz, se lee del fichero.
+
+    Es la misma regla que ya cumplen las credenciales de motor, que salen del
+    manifiesto: escribir «Infura» en la pantalla habría dejado fuera a Alchemy, a
+    QuickNode y a cualquier nodo propio, que usan este mismo mecanismo.
+    """
+    from amigocompora.ui.pages.engines import rpc_secret_usage
+
+    uso = rpc_secret_usage(Settings.model_validate(_CON_NODO_PROPIO))
+
+    assert list(uso) == ["INFURA_API_KEY"]
+    assert uso["INFURA_API_KEY"] == ("el nodo «infura» de ethereum",)
+
+
+def test_un_nodo_sin_marcador_no_pide_ninguna_credencial() -> None:
+    """Un nodo público no lleva clave: ofrecerle una casilla sería inventar un paso."""
+    from amigocompora.ui.pages.engines import rpc_secret_usage
+
+    ajustes = Settings.model_validate(
+        {"chains": [{"chain": "ethereum", "endpoints": [{"url": "https://rpc.libre/eth"}]}]}
+    )
+    assert rpc_secret_usage(ajustes) == {}
+
+
+async def test_la_clave_del_nodo_tiene_su_casilla() -> None:
+    """Y la casilla dice en qué nodo se usa, que es lo que se rompe si falta."""
+    async with _pagina(InMemorySecretStore(), ajustes=_CON_NODO_PROPIO) as (_, pagina):
+        clave = app_secret_key("INFURA_API_KEY")
+
+        assert clave in pagina._secret_fields, "la clave del nodo se puede escribir"
+        assert pagina._secret_states[clave].text() == "sin configurar"
+        assert "infura" in pagina._secret_notes[clave]
+
+
+async def test_la_clave_del_nodo_no_arrastra_la_condicion_de_la_firma() -> None:
+    """Su variable de entorno se lee siempre: la resuelve el contenedor al arrancar.
+
+    `allow_env_key` gobierna a los proveedores que firman, no a los marcadores de
+    `config.toml`. Contar aquí ese requisito mandaría a encender una opción que no
+    tiene nada que ver con esta credencial.
+    """
+    async with _pagina(InMemorySecretStore(), ajustes=_CON_NODO_PROPIO) as (container, pagina):
+        nota = pagina._secret_notes[app_secret_key("INFURA_API_KEY")]
+
+        assert app_env_var_name("INFURA_API_KEY") in nota
+        assert "allow_env_key" not in nota
+        assert container.settings.execution.allow_env_key is False
+
+
+async def test_se_puede_guardar_una_clave_que_el_fichero_aun_no_menciona() -> None:
+    """El huevo y la gallina: la clave se guarda antes de que la URL la nombre.
+
+    Sin esto, la casilla sólo aparece cuando `config.toml` ya tiene el marcador, y
+    el marcador no se puede probar hasta que la clave está guardada.
+    """
+    async with _pagina(InMemorySecretStore()) as (container, pagina):
+        pagina._custom_name.setText("ALCHEMY_API_KEY")
+        pagina._custom_value.setText("clave-de-prueba")
+        pagina._on_save_custom()
+
+        clave = app_secret_key("ALCHEMY_API_KEY")
+        assert container.secrets.get(clave) == "clave-de-prueba"
+        assert pagina._secret_states[clave].text() == "configurada"
+        assert pagina._custom_value.text() == "", "el valor no se queda en la pantalla"
+
+
+async def test_guardar_una_clave_sin_uso_dice_que_nadie_la_usa_todavia() -> None:
+    """Guardada no es en uso, y la diferencia tiene que leerse.
+
+    Una credencial que nadie lee es justo lo que parece estar funcionando: el
+    estado diría «configurada» y el nodo seguiría siendo el público.
+    """
+    async with _pagina(InMemorySecretStore()) as (_, pagina):
+        pagina._custom_name.setText("ALCHEMY_API_KEY")
+        pagina._custom_value.setText("clave-de-prueba")
+        pagina._on_save_custom()
+
+        nota = pagina._secret_notes[app_secret_key("ALCHEMY_API_KEY")]
+        assert "ningún nodo de config.toml la usa todavía" in nota
+        assert "${ALCHEMY_API_KEY}" in nota, "y se dice exactamente qué escribir"
+
+
+async def test_un_nombre_que_no_se_puede_referenciar_no_se_guarda() -> None:
+    """Un nombre que ningún `${...}` puede nombrar daría una credencial inservible.
+
+    Y peor que inservible: con aspecto de configurada. Se rechaza antes de tocar
+    el llavero y se dice qué forma tiene que tener.
+    """
+    async with _pagina(InMemorySecretStore()) as (container, pagina):
+        pagina._custom_name.setText("mi clave!")
+        pagina._custom_value.setText("clave-de-prueba")
+        pagina._on_save_custom()
+
+        assert container.secrets.get(app_secret_key("mi clave!")) is None
+        assert "config.toml" in pagina._status.text()
+
+
+async def test_guardar_sin_nombre_no_escribe_nada() -> None:
+    """Un valor sin nombre no se puede ni guardar ni leer después."""
+    async with _pagina(InMemorySecretStore()) as (_, pagina):
+        pagina._custom_value.setText("clave-de-prueba")
+        pagina._on_save_custom()
+
+        assert "nombre" in pagina._status.text()
+        assert pagina._custom_value.text() == "clave-de-prueba", "no se pierde lo escrito"

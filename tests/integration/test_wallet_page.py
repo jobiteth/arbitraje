@@ -148,7 +148,9 @@ class CarteraFalsa:
     async def aclose(self) -> None:
         return None
 
-    async def holdings(self, profile: WalletProfile, chain_key: str) -> ChainHoldings:
+    async def holdings(
+        self, profile: WalletProfile, chain_key: str, *, tokens: tuple[Token, ...] = ()
+    ) -> ChainHoldings:
         self.leidas.append(chain_key)
         if chain_key in self._fallos:
             return ChainHoldings(chain=chain_key, error=self._fallos[chain_key])
@@ -971,7 +973,9 @@ class CarteraConFreno(CarteraFalsa):
         self._frenos[address.lower()] = asyncio.Event()
         return self._frenos[address.lower()]
 
-    async def holdings(self, profile: WalletProfile, chain_key: str) -> ChainHoldings:
+    async def holdings(
+        self, profile: WalletProfile, chain_key: str, *, tokens: tuple[Token, ...] = ()
+    ) -> ChainHoldings:
         self.leidas.append(chain_key)
         clave = profile.address.lower()
         if (freno := self._frenos.get(clave)) is not None:

@@ -10,6 +10,8 @@ cartera» en un trámite invisible, y lo que no se ve no se hace.
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
 from amigocompora.app.container import Container
 from amigocompora.domain.errors import KeyCustodyError
 from amigocompora.domain.protocols import EngineKind
+from amigocompora.infra.config import Settings
 from amigocompora.infra.secrets import (
     AUTONOMY_PASSPHRASE_SECRET,
     PRIVATE_KEY_SECRET,
@@ -35,10 +38,47 @@ from amigocompora.infra.secrets import (
     app_env_var_name,
     app_secret_key,
     env_var_name,
+    placeholder_names,
     secret_key,
 )
 from amigocompora.ui.theme import COLOR_DANGER, COLOR_MUTED, COLOR_WARNING
 from amigocompora.ui.widgets import Card, ScrollArea, spawn
+
+#: Lo que tiene que cumplir el nombre de una credencial de la aplicación para que
+#: un `${NOMBRE}` de `config.toml` pueda referenciarla. Es la misma forma que
+#: acepta `resolve_placeholders`: un nombre que no la cumpla se podría guardar en
+#: el llavero, pero ninguna URL podría llamarlo nunca — una credencial que no se
+#: puede usar es peor que no tenerla, porque parece configurada.
+_NOMBRE_VALIDO = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def rpc_secret_usage(settings: Settings) -> dict[str, tuple[str, ...]]:
+    """Qué credenciales usan los nodos declarados, y en qué nodos.
+
+    La clave de un nodo RPC —Infura, Alchemy, QuickNode o uno propio— viaja
+    **dentro** de la URL, así que no es una credencial de motor y no aparecía en
+    ninguna parte de la interfaz: había que saber que `${INFURA_API_KEY}` se
+    resuelve desde el llavero como `app:INFURA_API_KEY` y guardarla por fuera.
+
+    Se recorren los endpoints **declarados** y no los efectivos: los respaldos
+    públicos los añade el propio registro y ninguno lleva marcador, así que
+    mirarlos sólo alargaría el recorrido.
+
+    Se devuelve el sitio donde se usa cada una porque es lo que distingue una
+    casilla útil de una lista de nombres: «va en el nodo «infura» de ethereum»
+    dice qué se rompe si falta.
+    """
+    usage: dict[str, list[str]] = {}
+    for chain_settings in settings.chains:
+        for endpoint in chain_settings.endpoints:
+            for name in placeholder_names(endpoint.url):
+                # `display_name` censura la URL cuando no hay etiqueta: la clave
+                # que falta puede estar al lado de otra que sí está puesta.
+                place = f"el nodo «{endpoint.display_name}» de {chain_settings.chain}"
+                places = usage.setdefault(name, [])
+                if place not in places:
+                    places.append(place)
+    return {name: tuple(places) for name, places in sorted(usage.items())}
 
 
 class EnginesPage(QWidget):
@@ -178,10 +218,92 @@ class EnginesPage(QWidget):
 
         self._credentials_rows: dict[str, tuple[QLabel, QPushButton, QPushButton]] = {}
         self._fill_credentials()
+        card.body().addLayout(self._build_custom_secret())
         # Plegada o abierta según haga falta, que es lo que decide si esta tarjeta
         # es la respuesta a una pregunta o un muro de catorce campos.
         card.set_collapsible(expanded=self._falta_la_clave())
         return card
+
+    def _build_custom_secret(self) -> QHBoxLayout:
+        """La fila para guardar una credencial que todavía no tiene casilla.
+
+        Las casillas de arriba salen de lo que ya está declarado —el manifiesto de
+        un motor, un `${NOMBRE}` escrito en `config.toml`—, y eso deja un hueco con
+        forma de huevo y gallina: la clave de un nodo nuevo no tiene dónde ponerse
+        hasta que el fichero la menciona, y el fichero no se puede probar hasta que
+        la clave está guardada. Aquí se guarda por su nombre, en cualquier orden.
+
+        El valor va enmascarado y el nombre no: el nombre es lo que luego hay que
+        escribir en `config.toml`, así que tiene que poder leerse y copiarse.
+        """
+        fila = QHBoxLayout()
+        fila.addWidget(QLabel("Otra credencial:"))
+
+        self._custom_name = QLineEdit()
+        self._custom_name.setPlaceholderText("INFURA_API_KEY")
+        self._custom_name.setToolTip(
+            "El nombre con el que se referencia desde config.toml. Una clave "
+            "guardada como INFURA_API_KEY se usa escribiendo "
+            "${INFURA_API_KEY} dentro de la URL del nodo."
+        )
+        fila.addWidget(self._custom_name, stretch=1)
+
+        self._custom_value = QLineEdit()
+        self._custom_value.setEchoMode(QLineEdit.EchoMode.Password)
+        self._custom_value.setPlaceholderText("valor")
+        fila.addWidget(self._custom_value, stretch=2)
+
+        guardar = QPushButton("Guardar")
+        guardar.clicked.connect(self._on_save_custom)
+        fila.addWidget(guardar)
+        return fila
+
+    def _on_save_custom(self) -> None:
+        """Guarda la credencial escrita y le crea su casilla, si no la tenía.
+
+        Guardar **no** la pone en uso: para que se use, la URL de un nodo en
+        `config.toml` tiene que nombrarla. Se dice aquí, porque una credencial
+        guardada que nadie lee es exactamente lo que parece estar funcionando.
+        """
+        name = self._custom_name.text().strip()
+        value = self._custom_value.text().strip()
+        if not name or not value:
+            self._status.setText(
+                "Para guardar una credencial hacen falta las dos cosas: el nombre "
+                "con el que se referencia y el valor."
+            )
+            return
+        if not _NOMBRE_VALIDO.match(name):
+            self._status.setText(
+                f"«{name}» no se puede referenciar desde config.toml: el nombre "
+                f"empieza por una letra y sigue con letras, números o «_»."
+            )
+            return
+
+        key = app_secret_key(name)
+        if key not in self._secret_fields:
+            usage = rpc_secret_usage(self._container.settings)
+            self._add_secret_row(
+                self._secrets_grid,
+                self._secrets_grid.rowCount(),
+                key,
+                f"Clave de nodo — {name}",
+                (
+                    f"Va dentro de la URL de {', '.join(usage[name])}."
+                    if name in usage
+                    else f"Guardada, pero ningún nodo de config.toml la usa todavía: "
+                    f"escribe ${{{name}}} dentro de la URL de un endpoint para "
+                    f"que se resuelva al arrancar."
+                ),
+                required=False,
+            )
+
+        self._secret_fields[key].setText(value)
+        self._custom_value.clear()
+        self._custom_name.clear()
+        # Se reutiliza el camino de guardado de las demás —mismo llavero, mismo
+        # aviso, mismo vaciado del campo— en vez de escribir aquí un segundo.
+        self._on_save_secret(key)
 
     def _falta_la_clave(self) -> bool:
         """Si la cartera está sin configurar, en los términos que hacen falta aquí.
@@ -222,11 +344,29 @@ class EnginesPage(QWidget):
         for position, (key, label, note, required) in enumerate(rows):
             self._add_secret_row(self._secrets_grid, position, key, label, note, required=required)
 
+        position = len(rows)
+
+        # Las claves de los nodos RPC. No hay ninguna lista de proveedores escrita
+        # aquí: se leen los `${NOMBRE}` que la propia configuración usa en sus
+        # endpoints, igual que las de motor se leen del manifiesto. Escribir
+        # «Infura» en la interfaz habría dejado fuera a Alchemy, a QuickNode y a
+        # cualquier nodo propio, que usan exactamente el mismo mecanismo.
+        for name, places in rpc_secret_usage(self._container.settings).items():
+            self._add_secret_row(
+                self._secrets_grid,
+                position,
+                app_secret_key(name),
+                f"Clave de nodo — {name}",
+                f"Va dentro de la URL de {', '.join(places)}. Sin ella ese nodo se "
+                f"descarta al arrancar y la red usa los respaldos públicos.",
+                required=False,
+            )
+            position += 1
+
         # Una credencial por opción declarada en el manifiesto de un motor
         # registrado. Se leen del manifiesto y no de una lista escrita aquí: un
         # motor nuevo publica sus claves y aparecen solas, que es lo que hace que
         # añadir un motor no toque la interfaz.
-        position = len(rows)
         for entry in self._container.registry.available():
             manifest = entry.manifest
             for option in manifest.config_options:
@@ -298,19 +438,20 @@ class EnginesPage(QWidget):
         """
         if key.startswith("app:"):
             env = app_env_var_name(key.removeprefix("app:"))
-            # Estas dos credenciales las lee un proveedor —el que firma, el que
-            # arma la autonomía— que **sólo** mira la variable si la configuración
-            # lo autoriza; las de motor las resuelve el registro, que mira el
-            # entorno siempre. Nombrarla sin decir la condición mandaría a un
-            # servidor sin llavero a poner una variable que nadie va a leer, que es
-            # justo lo que el `require()` de al lado se cuida de no hacer.
+            # La clave privada y la frase las lee un proveedor —el que firma, el
+            # que arma la autonomía— que **sólo** mira la variable si la
+            # configuración lo autoriza; las de motor las resuelve el registro, y
+            # las de los nodos RPC las resuelve el contenedor al arrancar, que
+            # miran el entorno siempre. Nombrar la variable sin decir la condición
+            # mandaría a un servidor sin llavero a poner una variable que nadie va
+            # a leer, que es justo lo que el `require()` de al lado se cuida de no
+            # hacer; decir la condición donde no la hay sería el error simétrico.
+            condicionada = key in self._secret_sources
             via = (
-                f"variable equivalente {env}"
-                if self._container.settings.execution.allow_env_key
-                else (
-                    f"variable equivalente {env}, que sólo se lee si se enciende "
-                    f"[execution] allow_env_key"
-                )
+                f"variable equivalente {env}, que sólo se lee si se enciende "
+                f"[execution] allow_env_key"
+                if condicionada and not self._container.settings.execution.allow_env_key
+                else f"variable equivalente {env}"
             )
         else:
             engine_id, _, option = key.partition(":")

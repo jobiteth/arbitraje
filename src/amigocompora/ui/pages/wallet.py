@@ -89,6 +89,7 @@ from amigocompora.ui.theme import (
     COLOR_SUCCESS,
     COLOR_WARNING,
 )
+from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import (
     Card,
     Field,
@@ -96,6 +97,7 @@ from amigocompora.ui.widgets import (
     spawn,
     token_labels,
     tokens_for_chain,
+    width_for_chars,
 )
 
 #: La cartera que se enseña al abrir si hay clave configurada.
@@ -294,13 +296,26 @@ class WalletPage(QWidget):
     #: que ponerlo en la misma antes de tocar las patas.
     swap_requested = Signal(object)
 
-    def __init__(self, container: Container, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        container: Container,
+        parent: QWidget | None = None,
+        *,
+        balances: WalletBalances | None = None,
+    ) -> None:
         super().__init__(parent)
         self._container = container
         self._snapshot: WalletSnapshot | None = None
         self._tokens: list[Token] = list(container.token_store.load())
         self._full_figures = False
         self._profile: WalletProfile | None = None
+        #: Los saldos compartidos con la tarjeta de swap. Esta página los **lee**
+        #: enteros —nueve redes, porque necesita el patrimonio— y los **publica**
+        #: en la caché común, que es lo que evita que la tarjeta de al lado vuelva
+        #: a preguntar por la misma red que ésta acaba de leer. Si nadie la pasa
+        #: —una `WalletPage` suelta, que es como la montan las pruebas— se crea una
+        #: propia: funciona igual y sólo deja de compartir.
+        self._balances = balances or WalletBalances(container.read_wallet)
         #: Las filas de la última lectura, **con** las que están a cero. Se
         #: guardan enteras y se filtran al pintar: si el filtro se aplicara aquí,
         #: desmarcar «Sólo con saldo» no tendría nada que volver a enseñar y el
@@ -347,11 +362,14 @@ class WalletPage(QWidget):
         self._state.setObjectName("hint")
         card.header.addWidget(self._state)
 
-        top = QHBoxLayout()
+        # La dirección ocupa su propia fila, a todo el ancho del panel. Antes iba en
+        # la misma fila que el botón «Volver a la mía» y la red, con un mínimo de
+        # 380 px: en una columna de 340 eso recortaba los tres controles a la vez, y
+        # el texto de los botones se leía cortado. Así la dirección —que es lo que
+        # más hay que leer— tiene el ancho entero, y los botones van debajo.
         self._address = QLineEdit("")
         self._address.setReadOnly(True)
         self._address.setCursorPosition(0)
-        self._address.setMinimumWidth(380)
         self._address.setToolTip(
             "La dirección que se lee. Con clave configurada es la cartera que firma; "
             "si se mira otra, las acciones que mueven dinero se apagan."
@@ -359,7 +377,7 @@ class WalletPage(QWidget):
         address_field = Field("DIRECCIÓN")
         address_field.add(self._address, 1)
 
-        self._lookup_address = QPushButton("Mirar otra…")
+        self._lookup_address = QPushButton("Otra cartera…")
         self._lookup_address.setObjectName("secondary")
         self._lookup_address.setToolTip(
             "Lee los saldos de una dirección que no es la que firma —una cartera de "
@@ -368,21 +386,42 @@ class WalletPage(QWidget):
             "y retirar no."
         )
         self._lookup_address.clicked.connect(self._on_lookup_address)
-        address_field.add(self._lookup_address)
 
-        self._use_mine = QPushButton("Volver a la mía")
+        self._use_mine = QPushButton("Mi cartera")
         self._use_mine.setObjectName("secondary")
         self._use_mine.clicked.connect(self._on_use_mine)
 
         self._chain = QComboBox()
-        self._chain.setMinimumWidth(190)
+        # El ancho lo fija un número de caracteres y no el ítem más largo, que aquí
+        # es el nombre entero de una red con su clave. Es la misma decisión que en el
+        # desplegable de red de la tarjeta de swap: el ancho natural de un
+        # `QComboBox` es el de su entrada más larga, y en una columna de 340 px eso
+        # deja el campo más estrecho que su contenido.
+        self._chain.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._chain.setMinimumContentsLength(12)
+        # Y un suelo explícito, porque la política sola no basta: cuando el número de
+        # entradas es menor que `minimumContentsLength`, Qt mide el texto que hay
+        # dentro —«Todas las redes», que es la única entrada mientras la cartera no
+        # se ha leído— y devuelve más de lo que la columna tiene. Medido en la
+        # pantalla real: 96 px de ancho para un campo que pedía 218.
+        self._chain.setMinimumWidth(width_for_chars(self._chain, 18))
         chain_field = Field("RED")
         chain_field.add(self._chain, 1)
 
-        top.addWidget(address_field, 2)
-        top.addWidget(self._use_mine, 0, Qt.AlignBottom)
-        top.addWidget(chain_field, 1)
-        card.add_row(top)
+        # Fila 1: la dirección, a todo el ancho. Fila 2: el cambio de cartera y la red.
+        # Dos filas y no una porque el panel es estrecho: la misma fila con los
+        # tres controles dejaba a cada uno con menos ancho del que su texto necesita.
+        # Fila 2: los dos cambios de cartera, a la izquierda. Fila 3: la red, que
+        # tiene su propio campo con etiqueta y ocupa el ancho entero.
+        card.body().addWidget(address_field)
+        acciones_direccion = QHBoxLayout()
+        acciones_direccion.addWidget(self._lookup_address)
+        acciones_direccion.addWidget(self._use_mine)
+        acciones_direccion.addStretch(1)
+        card.add_row(acciones_direccion)
+        card.body().addWidget(chain_field)
 
         # El total, en grande. Es la cifra que se lee primero y la que puede
         # mentir, así que debajo lleva siempre su explicación.
@@ -402,7 +441,6 @@ class WalletPage(QWidget):
         total_row.addWidget(self._total_hint, 1)
         card.add_row(total_row)
 
-        actions = QHBoxLayout()
         self._deposit_btn = QPushButton("Depositar")
         self._deposit_btn.setToolTip(
             "Muestra la dirección de esta red en texto y en código QR, y permite "
@@ -418,11 +456,11 @@ class WalletPage(QWidget):
         )
         self._withdraw_btn.clicked.connect(self._on_withdraw)
 
-        self._refresh_btn = QPushButton("Actualizar saldos")
+        self._refresh_btn = QPushButton("Actualizar")
         self._refresh_btn.setObjectName("secondary")
         self._refresh_btn.clicked.connect(self.refresh)
 
-        self._full_btn = QPushButton("Ver cifras completas")
+        self._full_btn = QPushButton("Cifras completas")
         self._full_btn.setObjectName("secondary")
         self._full_btn.setCheckable(True)
         self._full_btn.setToolTip(
@@ -432,11 +470,14 @@ class WalletPage(QWidget):
         )
         self._full_btn.toggled.connect(self._on_full_toggled)
 
-        actions.addWidget(self._deposit_btn)
-        actions.addWidget(self._withdraw_btn)
-        actions.addStretch(1)
-        actions.addWidget(self._full_btn)
-        actions.addWidget(self._refresh_btn)
+        # Las cuatro acciones una por fila, y no en una fila compartida: con el
+        # panel lateral de ~340 px, repartir el ancho entre cuatro deja a cada una
+        # menos espacio que su texto y los recorta. Apiladas se leen enteras, y el
+        # orden —primero lo que mueve dinero, después lo que sólo mira— se mantiene.
+        actions = QVBoxLayout()
+        actions.setSpacing(8)
+        for boton in (self._deposit_btn, self._withdraw_btn, self._full_btn, self._refresh_btn):
+            actions.addWidget(boton)
         card.add_row(actions)
 
         self._notice = QLabel("")
@@ -455,21 +496,25 @@ class WalletPage(QWidget):
     # La lista de tokens
     # ------------------------------------------------------------------ #
     def _build_tokens(self) -> QWidget:
-        card = Card(
-            "Tokens con saldo",
-            subtitle="— sólo lo que tiene fondos; el buscador mira la lista entera",
-        )
+        # El subtítulo se quita: explicaba el buscador, y el buscador ya lo dice en su
+        # propio texto de ayuda. Una cabecera con título y subtítulo más tres controles
+        # no cabía en el panel y se pisaban entre sí.
+        card = Card("Tokens con saldo")
 
+        # Fila 1: el buscador, a todo el ancho. Es lo primero que se usa cuando la
+        # lista es larga, así que va arriba y ocupa el panel entero.
         self._search = QLineEdit()
         self._search.setPlaceholderText("Buscar por nombre, símbolo o dirección…")
         self._search.setClearButtonEnabled(True)
-        self._search.setMinimumWidth(320)
         self._search.setToolTip(
-            "Filtra la lista por símbolo, por nombre o por la dirección del "
-            "contrato. Si lo que pegas no está en la lista, se ofrece añadirlo."
+            "Busca en toda la lista —también en la que está a cero— por símbolo, por "
+            "nombre o por la dirección del contrato. Si lo que pegas no está, se "
+            "ofrece añadirlo."
         )
-        card.header.addWidget(self._search)
+        card.body().addWidget(self._search)
 
+        # Fila 2: las dos acciones que cambian la lista, a la izquierda, y el filtro
+        # de saldo a la derecha. Cada una con su texto completo.
         self._add_btn = QPushButton("+ Añadir token")
         self._add_btn.setObjectName("secondary")
         self._add_btn.setToolTip(
@@ -478,7 +523,6 @@ class WalletPage(QWidget):
             "guardado para la próxima vez."
         )
         self._add_btn.clicked.connect(self._on_add_token)
-        card.header.addWidget(self._add_btn)
 
         self._only_positive = QCheckBox("Sólo con saldo")
         self._only_positive.setChecked(True)
@@ -487,7 +531,10 @@ class WalletPage(QWidget):
             "Sirve para comprobar que un token está en la cartera aunque ahora no "
             "tenga nada."
         )
-        card.header.addWidget(self._only_positive)
+        # Cada uno en su fila: «+ Añadir token» y el interruptor juntos pedían 422 px
+        # y el panel tiene 381 útiles. Apilados, cada uno se lee entero.
+        card.body().addWidget(self._add_btn)
+        card.body().addWidget(self._only_positive)
 
         self._table = QTableWidget(0, 6)
         # La última columna no lleva título: es el botón de cambiar, y un
@@ -523,7 +570,7 @@ class WalletPage(QWidget):
         self._row_actions.setObjectName("hint")
         row.addWidget(self._row_actions, 1)
 
-        self._swap_btn = QPushButton("Intercambiar este token")
+        self._swap_btn = QPushButton("Intercambiar")
         self._swap_btn.setObjectName("secondary")
         self._swap_btn.setEnabled(False)
         self._swap_btn.setToolTip(
@@ -532,7 +579,7 @@ class WalletPage(QWidget):
         )
         self._swap_btn.clicked.connect(self._on_swap_selected)
 
-        self._filter_btn = QPushButton("Buscar este token")
+        self._filter_btn = QPushButton("Buscar")
         self._filter_btn.setObjectName("secondary")
         self._filter_btn.setEnabled(False)
         self._filter_btn.setToolTip(
@@ -639,6 +686,12 @@ class WalletPage(QWidget):
             return
         self._snapshot = snapshot
         self._refresh_btn.setEnabled(True)
+        # Se publican las redes leídas en la caché compartida **antes** de pintar y
+        # antes de valorar: lo que la tarjeta de swap necesita de aquí son los
+        # saldos, que ya están, no sus precios. Publicarlos ahora es lo que evita
+        # que la tarjeta de al lado vuelva a preguntar al nodo por una red que esta
+        # lectura acaba de traer entera.
+        self._publish(snapshot)
         self._paint(snapshot)
         # Y ahora los importes, sin volver a tocar los nodos: `ValueWallet`
         # recibe la foto ya leída justamente para esto.
@@ -658,6 +711,20 @@ class WalletPage(QWidget):
             return
         self._snapshot = valued
         self._paint(valued)
+
+    def _publish(self, snapshot: WalletSnapshot) -> None:
+        """Deja las redes leídas en la caché compartida con la tarjeta de swap.
+
+        Se publica **sólo** si la foto es de la cartera que firma. Una lectura de
+        otra dirección —«Mirar otra…»— es un dato cierto de una cartera ajena, y
+        dejarlo en la caché que usa el swap haría que la pantalla de al lado
+        enseñara el dinero de otra persona bajo la dirección de la propia. La
+        comprobación vive en `WalletBalances.publish`, que es donde se sabe quién
+        es el dueño legítimo de la caché; aquí sólo se le pasa el dueño de esta
+        lectura, que es la dirección del perfil leído.
+        """
+        for cadena in snapshot.chains:
+            self._balances.publish(cadena.chain, cadena, owner=snapshot.profile.address)
 
     def _clear(self) -> None:
         """Deja la lista y el total vacíos, sin tocar el motivo.
@@ -1166,7 +1233,7 @@ class WalletPage(QWidget):
 
     def _on_full_toggled(self, activo: bool) -> None:
         self._full_figures = activo
-        self._full_btn.setText("Ver cifras recortadas" if activo else "Ver cifras completas")
+        self._full_btn.setText("Cifras recortadas" if activo else "Cifras completas")
         self._repaint_rows()
 
     def _on_deposit(self) -> None:

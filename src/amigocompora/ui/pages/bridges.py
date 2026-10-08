@@ -69,6 +69,7 @@ from amigocompora.ui.theme import COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLO
 from amigocompora.ui.widgets import (
     Card,
     Field,
+    needed_width,
     set_empty,
     spawn,
     token_labels,
@@ -98,6 +99,8 @@ class BridgesSection(QWidget):
         super().__init__(parent)
         self._container = container
         self._comparison: BridgeComparison | None = None
+        #: Si ya se ajustó el ancho del campo de importe. Ver `showEvent`.
+        self._amount_sized = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -108,6 +111,26 @@ class BridgesSection(QWidget):
         self._destination_chain.currentIndexChanged.connect(self._refresh_tokens)
         self._refresh_tokens()
         self._on_route_selected()
+
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        """Ajusta el ancho del campo de importe cuando ya hay estilo aplicado.
+
+        El ancho se mide **aquí** y no en `_build` porque medirlo antes da un
+        número equivocado: el widget todavía no ha heredado la hoja de estilos y su
+        fuente no es la que va a usar. Medido en las pruebas: en construcción el
+        campo declara 204 px y una vez aplicado el estilo necesita 257.
+
+        El error es silencioso por partida doble: desde Qt 6.0 ya no se emite el
+        aviso de «sizeHint consultado antes de pulir», y el síntoma es un campo más
+        estrecho que su contenido — exactamente el defecto que la prueba de
+        recorte persigue. Se hace en el primer `showEvent`, que es tarde por
+        definición, y sólo una vez.
+        """
+        super().showEvent(event)
+        if self._amount_sized:
+            return
+        self._amount_sized = True
+        self._amount.setMinimumWidth(needed_width(self._amount))
 
     # ------------------------------------------------------------------ #
     # Construcción
@@ -126,13 +149,8 @@ class BridgesSection(QWidget):
         self._amount.setRange(0.000001, 1_000_000)
         self._amount.setDecimals(6)
         self._amount.setValue(1.0)
-        # El ancho lo fija lo que el campo **necesita** para enseñar lo que
-        # admite, no lo que parece razonable a ojo: con seis decimales y un tope
-        # de un millón, «123456.789012» no cabe en 140 px. Estaba en 140 y el
-        # campo se recortaba —el mismo defecto que la pantalla de predicción—,
-        # que en un campo de importe significa no poder leer lo que se va a
-        # entregar. El número sale de `sizeHint()`, medido, no de una estimación.
-        self._amount.setMinimumWidth(180)
+        # El ancho de este campo se ajusta al mostrarlo, no aquí: medirlo en
+        # construcción da un número que no vale. Ver `showEvent`.
         self._unit = QLabel("")
         self._unit.setStyleSheet(f"color: {COLOR_MUTED}; font-weight: 700;")
 

@@ -479,13 +479,23 @@ class WalletEngine(Engine, Protocol):
     las otras siete porque una lanzara.
     """
 
-    async def holdings(self, profile: WalletProfile, chain_key: str) -> ChainHoldings:
+    async def holdings(
+        self,
+        profile: WalletProfile,
+        chain_key: str,
+        *,
+        tokens: tuple[Token, ...] = (),
+    ) -> ChainHoldings:
         """Lo que hay en esa red para esa cartera, o el motivo por el que no se pudo.
 
         Recibe el **perfil** y no una dirección suelta porque el perfil lleva la
         familia —EVM o Solana—, y es eso lo que decide cómo se lee. Una dirección
         sin su familia obligaría al motor a adivinarla por el formato, que es
         justo la comprobación que el perfil ya hizo al construirse.
+
+        `tokens` son los que el usuario añadió por dirección: en EVM un contrato no
+        se descubre, así que sin esto un token añadido nunca tendría saldo. En
+        Solana el motor ya enumera las cuentas, y se ignora.
         """
         ...
 

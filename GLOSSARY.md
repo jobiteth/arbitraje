@@ -31,8 +31,13 @@ no desviarse.
 - **Motor (engine).** Componente descubrible por entry points que implementa un
   `Protocol` (`DexQuoteEngine`, `PredictionMarketEngine`, `AiAdvisorEngine`).
   El núcleo nunca importa una clase concreta.
-- **Ranura (`EngineKind`).** Hay un motor activo por ranura: `DEX_QUOTES`,
-  `PREDICTION_MARKETS`, `AI_ADVISOR`.
+- **Ranura (`EngineKind`).** Una clase de motor, con su propia pila activa:
+  `DEX_QUOTES`, `PREDICTION_MARKETS`, `AI_ADVISOR`, `CROSS_CHAIN` y `WALLET`. Cada
+  una trae un motor por omisión (`DEFAULT_ENGINE_IDS`), y el que se elige nunca
+  puede exigir credencial: uno con `required_config` no arrancaría en una
+  instalación nueva y dejaría la ranura vacía, que es una pantalla que se abre y
+  no puede responder. Declararla vacía en `config.toml` (`cross_chain = []`) la
+  apaga a propósito, y eso **no** es lo mismo que omitir la clave.
 - **Hot-swap.** Sustituir el motor activo sin reiniciar; se abre el nuevo antes
   de cerrar el viejo.
 - **Manifiesto.** Metadatos de un motor (id, tipo, capacidades, hosts
@@ -44,6 +49,13 @@ no desviarse.
   predicción. El *fee tier* forma parte de su identidad (`uniswap-v3@5`).
 - **Cotización (`Quote`).** Resultado de vender `amount_in` de base por quote en
   un venue. `amount_out` es **neto** (ya incluye comisión e impacto).
+- **Ruta ejecutable.** Cotización cuyo motor sabe además **construir** el swap
+  (implementa `SwapPlanner` y declara la red en `swap_chains`). No es una
+  propiedad de la cifra sino de quién la observó: `PrepareSwap` resuelve el
+  constructor por `quote.engine_id`, así que la misma cifra vista por una fuente
+  de sólo lectura —GeckoTerminal— no se puede firmar. Por eso, cuando dos
+  motores miran el mismo pool, el desempate lo gana **el que construye** y no el
+  primero de la pila ni el del mejor importe. Ver `app/usecases/compare_prices.py`.
 - **`Measurement`.** Procedencia de una cifra: `REPORTED` (la publica la
   fuente), `DERIVED` (la calculamos sobre datos publicados), `ESTIMATED` (con un
   supuesto documentado).
@@ -78,3 +90,10 @@ no desviarse.
 - **Allowlist de hosts.** Un motor sólo puede hablar con los hosts que declara.
 - **Keyring.** Almacén de credenciales del sistema operativo. Los secretos
   nunca van a `config.toml` (`extra="forbid"`) ni a los logs.
+- **Marcador `${NOMBRE}`.** Hueco dentro de un valor de `config.toml` —en
+  práctica, la clave de API dentro de la URL de un nodo— que se rellena al
+  arrancar desde el llavero (`app:NOMBRE`) o desde `AMIGOCOMPORA_NOMBRE`. Es lo
+  que permite declarar un nodo propio en un fichero que no guarda secretos. Si no
+  se resuelve, se descarta **ese endpoint** con un aviso que nombra la credencial;
+  no se deja la URL a medias ni se sustituye por vacío, porque los dos síntomas
+  —fallo de DNS, 401 sin explicación— no se parecen a la causa.

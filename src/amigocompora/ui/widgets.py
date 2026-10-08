@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -235,6 +236,47 @@ def set_empty(table: QTableWidget, placeholder: QLabel, texto: str) -> None:
     placeholder.setText(texto)
     placeholder.setVisible(vacia)
     table.setVisible(not vacia)
+
+
+def needed_width(control: QWidget) -> int:
+    """El ancho que un campo necesita **de verdad** para enseñar su contenido.
+
+    Existe porque el ancho se pide en el sitio equivocado. `sizeHint()` de un
+    campo se calcula con la fuente, y la fuente la pone la hoja de estilos de la
+    aplicación —que se instala en el `QApplication`, y no está aplicada todavía
+    cuando el widget se construye—. Medido: con el estilo sin aplicar el mismo
+    `QDoubleSpinBox` declara 225 px, y el texto que tiene que enseñar pide 182
+    más el relleno. En Windows coincide por casualidad; en una máquina con la
+    fuente por omisión más estrecha no coincidiría, y el campo se recortaría.
+
+    Se fuerza el pulido con la hoja ya puesta y **después** se pregunta, que es
+    el único orden que da la medida buena. Desde Qt 6.0 el aviso de que
+    `sizeHint()` se consulta antes de pulir dejó de emitirse, así que el fallo no
+    se ve en el log: se ve como una columna más estrecha que su contenido.
+    """
+    control.ensurePolished()
+    return max(control.sizeHint().width(), control.minimumSizeHint().width())
+
+
+def width_for_chars(control: QWidget, chars: int) -> int:
+    """El ancho que hace falta para enseñar `chars` caracteres en ese control.
+
+    Existe porque el ancho natural de un `QComboBox` es el de su **entrada más
+    larga**, y una lista de once redes con sus claves mide cientos de píxeles: en
+    una columna de 340 px eso deja el campo más estrecho que el texto que muestra.
+    `setMinimumContentsLength` es la herramienta de Qt para eso, pero sólo actúa
+    cuando hay **más** entradas que caracteres: con una sola entrada —«Todas las
+    redes», que es lo que hay mientras la cartera no se ha leído— Qt vuelve a medir
+    el texto y el campo se queda en 96 px pidiendo 218.
+
+    Esto da un suelo calculado con la fuente **ya aplicada**, que es lo único que se
+    puede afirmar sin depender de qué fuente tenga la máquina. Se mide una «M» y se
+    multiplica: es una aproximación por exceso para la mayoría de las letras, que es
+    la dirección correcta del error en un campo que se recorta.
+    """
+    control.ensurePolished()
+    metrics = QFontMetrics(control.font())
+    return metrics.horizontalAdvance("M" * chars) + 34  # margen + galón del combo
 
 
 class ScrollArea(QWidget):

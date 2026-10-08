@@ -39,7 +39,9 @@ watch_addresses = []
 # más abajo no se ignora: se cuela dentro de la tabla anterior y hace fallar el
 # arranque con un error que habla de otra cosa.
 
-# Motores activos por ranura. Si se omite, se autoactiva el preferido.
+# Motores activos por ranura. Si se omite, se autoactiva el preferido. Una lista
+# **vacía** es distinta de omitir la clave: deja la ranura apagada a propósito, y
+# la pestaña que la usa dirá que no hay motor en vez de buscar rutas.
 #
 # Una ranura admite **varios** motores a la vez. El primero manda y los demás se
 # suman, así que cotizan todos y se comparan sus precios; el orden de respuesta
@@ -53,6 +55,10 @@ watch_addresses = []
 dex_quotes = ["uniswap_v3", "uniswap_v4", "geckoterminal"]
 prediction_markets = "polymarket"
 ai_advisor = "stub_advisor"
+# Puentes para la pestaña «Entre redes». `lifi` cotiza y construye sin clave;
+# `relay` exige la suya, que se guarda en la pestaña «Motores» → «Credenciales»,
+# así que apilarlo sin ella deja un aviso en el registro y no se activa.
+cross_chain = ["lifi"]
 
 # Endpoints RPC por red (opcional). Mínimo privilegio: sólo https salvo hosts
 # locales. La API key del proveedor viaja en la URL, así que nunca uses http.

@@ -29,6 +29,7 @@ from amigocompora.ui.theme import (
     COLOR_DANGER,
     STYLESHEET,
 )
+from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import AlertBanner, QtConfirmationPrompt, ScrollArea, spawn
 
 
@@ -38,7 +39,12 @@ class MainWindow(QMainWindow):
         self._container = container
         self._alerts = alert_center
         self.setWindowTitle(f"{APP_TITLE} — {APP_SUBTITLE}")
-        self.setMinimumSize(1100, 720)
+        # El mínimo sube con el panel lateral: con la cartera a la derecha, por
+        # debajo de esto la tabla de rutas —ocho columnas— se queda sin sitio y
+        # empieza a recortar campos, que es el defecto que la prueba de recorte
+        # persigue. Es preferible una ventana que no baja de aquí a una pantalla
+        # que miente sobre lo que se puede leer.
+        self.setMinimumSize(1240, 760)
         self.setStyleSheet(STYLESHEET)
 
         # Prompt de confirmación: la UI real que pide el «sí» explícito.
@@ -89,19 +95,25 @@ class MainWindow(QMainWindow):
         alert_center.subscribe(lambda a: self._on_alert(a))
 
         # Pestañas
-        self._prices = PricesPage(container)
+        #
+        # Los saldos se leen **una vez** y los comparten las dos vistas que los
+        # enseñan: la tarjeta de swap —el saldo de la pata que se entrega— y la
+        # lista de cartera del panel lateral. Con una caché por vista, elegir un
+        # token dispararía dos peticiones al mismo nodo por el mismo dato, y en
+        # Solana el nodo es público y va racionado por ventana.
+        self._balances = WalletBalances(container.read_wallet)
+        self._wallet = WalletPage(container, balances=self._balances)
+        self._prices = PricesPage(container, balances=self._balances)
         self._prediction = PredictionPage(container)
         self._engines = EnginesPage(container)
-        self._wallet = WalletPage(container)
         self._tabs = QTabWidget()
 
-        # La cartera **no** es una pestaña: va dentro de la de swap, justo debajo
-        # de la tarjeta de conversión. Es el orden de una cartera de verdad —lo
-        # que vas a intercambiar arriba, tu cuenta y tus tokens debajo— y es donde
-        # se contesta la pregunta que se hace justo antes de convertir: cuánto
-        # tengo de esto y en qué red. En una pestaña aparte obligaba a ir y volver
-        # para leer un saldo que se está a punto de firmar.
-        self._prices.insert_below_converter(self._wallet)
+        # La cartera va **al lado** del swap y no dentro de él: la pantalla tiene
+        # dos cosas a la vez —lo que se opera y lo que se tiene— y apilarlas
+        # obligaba a bajar y subir para leer un saldo que se está a punto de
+        # firmar. Es el orden de una cartera de verdad: la operación en el centro
+        # y la cuenta en su columna.
+        self._prices.set_side_panel(self._wallet)
 
         # Los puentes sí tienen pestaña propia: cruzar de red es una operación con
         # sus dos redes, su importe y su ruta, y compartía pantalla con el swap

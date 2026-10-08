@@ -5,6 +5,86 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Corregido — La pestaña «Entre redes» se abría sin ningún motor de puentes
+
+- **Síntoma.** La pestaña dejaba elegir redes, tokens e importe, y al pulsar
+  «Buscar rutas» contestaba *«ningún motor activo sabe cruzar desde «base»: no hay
+  a quién preguntar»*. No era una red caída ni una ruta inexistente: en una
+  instalación nueva **nunca** había un motor de puentes activo.
+- **Causa.** `DEFAULT_ENGINE_IDS` no tenía entrada para la ranura `cross_chain`, y
+  el arranque sólo autoactiva sin valor por omisión cuando hay **un** motor
+  instalado de esa clase (`sole_engine_for`). Desde que hay dos puentes —LI.FI y
+  Relay— ninguno es el único, así que la ranura se quedaba vacía con un
+  `engine.slot_empty` en el log y nada más.
+- **Arreglo.** La ranura trae **LI.FI** por omisión. No es una preferencia de
+  gusto: Relay declara su clave en `required_config`, así que autoactivarlo sin
+  credencial fallaría en el arranque y dejaría la ranura igual de vacía. LI.FI
+  cotiza y construye sin clave, y su manifiesto ya se declaraba «antes que Relay»
+  con `bridge_priority=50`. Relay sigue disponible para apilarlo en cuanto tengas
+  su clave.
+- Medido contra la API después del arreglo: `0,01 ETH` Base → Polygon devuelve
+  ruta por NearIntents (252,28 POL, mínimo 251,02, 39 s) y `50 USDC` Base →
+  Polygon por AcrossV4 (49,86 USDC, comisión 0,138, 1 s).
+- **Por qué no lo vio ninguna prueba.** `test_container_builds_with_all_slots`
+  comprobaba «las tres ranuras» porque tres eran las que había cuando se escribió,
+  y siguió en verde al añadirse puentes y cartera; las pruebas de la pestaña, por
+  su parte, activaban LI.FI a mano y usaban «no declarar nada» como forma de
+  apagar la ranura, que era exactamente la configuración real. Ahora la prueba
+  recorre `EngineKind` entero —una ranura nueva sin valor por omisión rompe ahí— y
+  otra exige que ningún motor por omisión tenga `required_config`.
+
+### Cambiado — Una ranura declarada vacía se queda vacía
+
+- `cross_chain = []` en `config.toml` apaga la ranura a propósito, y ya no es lo
+  mismo que omitir la clave: sin la clave rige el valor por omisión. Es la misma
+  lectura que `allowed_tokens`, donde una lista vacía significa «nada» y no «sin
+  restricción». Hasta ahora las dos formas acababan en el mismo sitio, así que
+  apagar una ranura no se podía ni escribir.
+
+### Corregido — La ruta que se puede firmar desaparecía de la comparación
+
+- **Síntoma.** Con `geckoterminal` por delante de `uniswap_v3` en la pila, la
+  fila de Uniswap se esfumaba de la tabla; con importes algo mayores no quedaba
+  **ninguna** ruta ejecutable y el botón de firmar se apagaba sin decir por qué.
+  Nada aparecía en `failed_engines`, así que el diagnóstico apuntaba a la red
+  cuando la causa era determinista y estaba en el código.
+- **Causa.** La deduplicación por `venue_id` se quedaba con el **primero de la
+  pila**. `venue_id` nombra el pool (`uniswap-v3@5`), no la fuente, así que
+  cuando el pool elegido por GeckoTerminal coincidía con el del motor directo,
+  ganaba la observación de GeckoTerminal —que sólo sabe leer— y se descartaba en
+  silencio la de `uniswap_v3`, que es la única que `PrepareSwap` puede convertir
+  en transacción (resuelve el constructor por `quote.engine_id`).
+- **Arreglo.** El desempate entre dos mediciones del mismo pool ya no lo decide
+  el orden de la pila sino **quién sabe construir el swap**, consultado a
+  `registry.planners_for(chain)` —manifiesto, sin tocar la red— antes de cotizar.
+  No se elige la mejor cifra: se elige la que se puede firmar. Entre dos que
+  construyen, sigue mandando la pila; el desacuerdo de importes se sigue
+  registrando en el log.
+- Medido en Polygon con POL/USDC: antes, con 5 POL salían tres rutas y la de
+  `uniswap_v3` no estaba; con 25 POL las dos rutas eran de `geckoterminal` y no
+  había nada firmable. Después, `uniswap-v3@5` sale con motor `uniswap_v3` en
+  los cuatro importes probados.
+
+### Añadido — Las claves de los nodos RPC se escriben desde la aplicación
+
+- La pestaña «Motores» → «Credenciales» ofrece ahora una casilla por cada
+  `${NOMBRE}` que aparezca en las URL de `config.toml`, con el nodo y la red en
+  los que se usa. **La lista de proveedores no está escrita en la interfaz**: se
+  lee del fichero, igual que las credenciales de motor salen del manifiesto, así
+  que Infura, Alchemy, QuickNode o un nodo propio aparecen sin tocar código.
+- Y una fila «otra credencial» de nombre libre, que rompe el huevo y la gallina:
+  la clave se puede guardar **antes** de que ninguna URL la nombre, y entonces la
+  nota lo dice con todas las letras —«guardada, pero ningún nodo la usa
+  todavía»— junto al `${NOMBRE}` que hay que escribir. Una credencial que nadie
+  lee es justo lo que parece estar funcionando.
+- La ayuda de estas claves **no** arrastra la condición de `allow_env_key`: ese
+  interruptor gobierna a los proveedores que firman, no a los marcadores de
+  `config.toml`, que el contenedor resuelve siempre. Contarlo aquí mandaba a
+  encender una opción que no tiene nada que ver.
+- Un marcador sin resolver **descarta sólo ese endpoint**, con un aviso que
+  nombra la credencial y su variable de entorno; la red sigue funcionando con
+  los respaldos públicos y el arranque no se interrumpe.
+
 ### Añadido — Ejecución real: la aplicación firma y emite
 
 - **Modo `EJECUCIÓN`**, el único que concede `SIGN_TX` y `BROADCAST_TX`. Con él
@@ -76,9 +156,12 @@ versionado [SemVer](https://semver.org/lang/es/).
 - Deduplicación por `venue_id`. El identificador nombra el protocolo y la red,
   no la fuente, así que dos motores mirando el mismo pool producían dos filas y
   un `spread` que era la diferencia entre dos mediciones del mismo contrato:
-  ruido con aspecto de oportunidad. Se queda la del motor preferido —y **no** la
-  mejor de las dos, que sería escoger la cifra que más conviene de dos
-  observaciones del mismo pool— y el desacuerdo entre fuentes queda en el log.
+  ruido con aspecto de oportunidad. Se queda **una**, y **no** la mejor de las
+  dos —eso sería escoger la cifra que más conviene de dos observaciones del
+  mismo pool—; el desacuerdo entre fuentes queda en el log. El criterio del
+  desempate se corrigió después (ver «Corregido — La ruta que se puede firmar
+  desaparecía de la comparación»): manda quién construye el swap, no el orden
+  de la pila.
 - La tabla de cotizaciones gana una columna **Motor** con el `engine_id` de cada
   fila: con varios motores alimentando una sola tabla, hay que poder ver de dónde
   sale cada cifra.

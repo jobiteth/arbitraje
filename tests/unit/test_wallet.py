@@ -305,6 +305,15 @@ def test_los_tokens_que_se_leen_son_el_nativo_primero_y_luego_el_catalogo() -> N
     assert list(tokens[1:]) == list(tokens_for("polygon"))
 
 
+def test_un_token_anadido_por_el_usuario_se_lee_una_sola_vez() -> None:
+    uni = Token(symbol="UNI", decimals=18, chain="polygon", address="0x" + "b" * 40)
+    en_otra_red = Token(symbol="UNI", decimals=18, chain="base", address="0x" + "b" * 40)
+    tokens = tokens_to_read("polygon", (uni, en_otra_red, *tokens_for("polygon")))
+    assert tokens[-1] == uni
+    assert sum(t.is_same_asset(uni) for t in tokens) == 1
+    assert all(t.chain == "polygon" for t in tokens)
+
+
 class _Motor:
     """Doble del motor de cartera: devuelve lo que se le diga, sin red."""
 
@@ -324,7 +333,9 @@ class _Motor:
         self.en_vuelo = 0
         self.maximo_en_vuelo = 0
 
-    async def holdings(self, profile: WalletProfile, chain_key: str) -> ChainHoldings:
+    async def holdings(
+        self, profile: WalletProfile, chain_key: str, *, tokens: tuple[Token, ...] = ()
+    ) -> ChainHoldings:
         del profile
         self.pedidas.append(chain_key)
         self.en_vuelo += 1

@@ -381,6 +381,27 @@ def has_placeholders(text: str) -> bool:
     return bool(_PLACEHOLDER.search(text))
 
 
+def placeholder_names(text: str) -> tuple[str, ...]:
+    """Los nombres que el texto referencia, en orden y sin repetir.
+
+    Existe para que la interfaz pueda **ofrecer** la casilla de una clave de RPC
+    sin tener escrita en ninguna parte la lista de proveedores. Quien escribe
+    `${INFURA_API_KEY}` en un endpoint de `config.toml` está declarando que
+    necesita esa credencial; leer el nombre de ahí es lo que hace que añadir un
+    nodo de Alchemy, de QuickNode o de un proveedor que no existía cuando se
+    escribió esto no obligue a tocar la interfaz.
+
+    Devolver los nombres **no** revela ningún valor: un nombre es lo que ya está
+    escrito en el fichero de configuración, que es público por diseño.
+    """
+    found: list[str] = []
+    for match in _PLACEHOLDER.finditer(text):
+        name = match.group(1)
+        if name not in found:
+            found.append(name)
+    return tuple(found)
+
+
 def resolve_placeholders(
     text: str,
     store: SecretStore,

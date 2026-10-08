@@ -45,6 +45,11 @@ class ComparePrices:
         )
 
         engines = self.registry.active_dex_stack()
+        # Quién, de los activos, sabe construir el swap en esta red. Se resuelve
+        # una vez y antes de cotizar: lo responde el manifiesto, sin tocar la red.
+        builders = frozenset(
+            engine.manifest.engine_id for engine in self.registry.planners_for(pair.chain)
+        )
         by_venue: dict[str, Quote] = {}
         failed: list[str] = []
         first_error: BaseException | None = None
@@ -69,7 +74,7 @@ class ComparePrices:
                 )
                 continue
             for quote in found:
-                _keep_first(by_venue, quote, from_engine=engine_id)
+                _keep_one(by_venue, quote, from_engine=engine_id, builders=builders)
 
         if not by_venue:
             _no_quotes(pair, amount_in, engines=engines, failed=failed, first_error=first_error)
@@ -82,8 +87,14 @@ class ComparePrices:
         )
 
 
-def _keep_first(by_venue: dict[str, Quote], quote: Quote, *, from_engine: str) -> None:
-    """Se queda con la primera medición de cada venue, y registra el desacuerdo.
+def _keep_one(
+    by_venue: dict[str, Quote],
+    quote: Quote,
+    *,
+    from_engine: str,
+    builders: frozenset[str],
+) -> None:
+    """Se queda con **una** medición de cada venue, y registra el desacuerdo.
 
     Dos motores pueden medir **el mismo** sitio: el `venue_id` identifica el
     protocolo y la red, no la fuente, así que GeckoTerminal y DexScreener mirando
@@ -91,15 +102,34 @@ def _keep_first(by_venue: dict[str, Quote], quote: Quote, *, from_engine: str) -
     daría más información: daría un `spread_bps` que es la diferencia entre dos
     mediciones del mismo contrato, o sea ruido con aspecto de oportunidad.
 
-    Se queda la del motor preferido —el primero de la pila, que es el orden en
-    que llegan— y **no** la mejor de las dos. Quedarse con la mejor sería elegir,
-    de dos observaciones del mismo pool, la cifra que más conviene; el usuario
-    construiría contra un precio que no es el que hay.
+    De cuál de las dos quedarse decide **una** cosa: si el motor que la observó
+    sabe construir el swap. No se elige la mejor cifra —eso sería quedarse, de dos
+    observaciones del mismo pool, con la que más conviene, y el usuario
+    construiría contra un precio que no es el que hay—. Se elige la que se puede
+    firmar.
+
+    Medido en Polygon con POL/USDC: GeckoTerminal observa `uniswap-v3@5` y el
+    motor `uniswap_v3` observa ese mismo pool. Quedándose con la primera que
+    llega —GeckoTerminal, por ser la preferida en la pila— la fila seguía en la
+    tabla pero dejaba de poder firmarse, porque el payload sale del motor que la
+    observó (ver `PrepareSwap.planner_for`) y GeckoTerminal sólo cotiza. Con 25
+    POL las dos rutas directas colisionaban a la vez y no quedaba ninguna ruta
+    ejecutable: la tabla llena y el botón de firmar apagado, sin decir por qué.
+
+    Cuando las dos saben construir, o ninguna, se mantiene la primera: ahí sí
+    manda el orden de la pila, que es la preferencia declarada por el usuario.
     """
     previous = by_venue.get(quote.venue.venue_id)
     if previous is None:
         by_venue[quote.venue.venue_id] = quote
         return
+
+    # El criterio es la capacidad, no el importe.
+    reemplaza = from_engine in builders and previous.engine_id not in builders
+    if reemplaza:
+        by_venue[quote.venue.venue_id] = quote
+
+    kept, discarded = (quote, previous) if reemplaza else (previous, quote)
     if previous.amount_out != quote.amount_out:
         # Que dos fuentes no coincidan midiendo lo mismo es un dato sobre las
         # fuentes, no sobre el mercado. Con dos filas desaparecería; aquí queda.
@@ -107,10 +137,11 @@ def _keep_first(by_venue: dict[str, Quote], quote: Quote, *, from_engine: str) -
             "compare.same_venue_disagreement",
             venue=quote.venue.venue_id,
             pair=quote.pair.symbol,
-            kept_engine=previous.engine_id,
-            kept_out=str(previous.amount_out),
-            discarded_engine=from_engine,
-            discarded_out=str(quote.amount_out),
+            kept_engine=kept.engine_id,
+            kept_out=str(kept.amount_out),
+            discarded_engine=discarded.engine_id,
+            discarded_out=str(discarded.amount_out),
+            kept_because="construye el swap" if reemplaza else "preferida en la pila",
         )
 
 

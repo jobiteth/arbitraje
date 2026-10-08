@@ -39,6 +39,7 @@ from amigocompora.domain.errors import (
 )
 from amigocompora.domain.models import (
     Measurement,
+    PlannedTransaction,
     Quote,
     Token,
     TradingPair,
@@ -129,6 +130,35 @@ class _NotAQuoter:
     async def aopen(self) -> None: ...
 
     async def aclose(self) -> None: ...
+
+
+class _Builder(_Engine):
+    """Motor que además de cotizar sabe construir el swap de lo que cotiza.
+
+    Es la diferencia que decide el desempate cuando dos motores miden el mismo
+    pool: el payload sale del motor que observó la cotización, así que quedarse
+    con la del que sólo cotiza deja la fila sin poder firmarse.
+    """
+
+    async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
+        raise AssertionError("comparar no construye nada")
+
+    def expected_destination(self, chain_key: str) -> str | None:
+        return None
+
+
+def _builder_manifest(engine_id: str, *, priority: int = 100) -> EngineManifest:
+    """Manifiesto de un motor que declara construir swaps en la red del par."""
+    return EngineManifest(
+        engine_id=engine_id,
+        name=f"Motor {engine_id}",
+        version="1.0.0",
+        kind=EngineKind.DEX_QUOTES,
+        summary="Doble de prueba que construye.",
+        capabilities=frozenset({Capability.READ_CHAIN, Capability.PREPARE_TX}),
+        swap_chains=frozenset({"ethereum"}),
+        swap_priority=priority,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +372,99 @@ async def test_dos_venues_distintos_no_se_tocan() -> None:
         "uniswap_v3@ethereum",
         "zeroex@ethereum",
     }
+
+
+async def test_del_mismo_pool_se_queda_la_medicion_que_se_puede_firmar() -> None:
+    """Entre dos medidas del mismo pool gana la del motor que construye el swap.
+
+    Medido en Polygon con POL/USDC: GeckoTerminal observa `uniswap-v3@5` y el
+    motor `uniswap_v3` observa ese mismo pool. Quedándose con la primera de la
+    pila —GeckoTerminal— la fila seguía en la tabla pero dejaba de poder
+    firmarse, porque el payload lo construye el motor que la observó. Con dos
+    rutas directas colisionando a la vez no quedaba ninguna ruta ejecutable: la
+    tabla llena y el botón de firmar apagado.
+
+    No es quedarse con la mejor cifra: el criterio es la capacidad. Aquí el que
+    construye mide **peor** (2 690 contra 2 700) y gana igual.
+    """
+    solo_cotiza = _Engine(
+        _manifest("geckoterminal"),
+        quotes=(_pool_quote("geckoterminal", _OUT_2700),),
+    )
+    construye = _Builder(
+        _builder_manifest("uniswap_v3"),
+        quotes=(_pool_quote("uniswap_v3", _OUT_2690),),
+    )
+    comparison = await _usecase(await _registry(solo_cotiza, construye))(PAIR, AMOUNT)
+
+    assert len(comparison.quotes) == 1
+    assert comparison.quotes[0].engine_id == "uniswap_v3"
+    assert comparison.quotes[0].amount_out.raw == _OUT_2690
+
+
+async def test_el_que_construye_tampoco_se_pierde_si_cotiza_primero() -> None:
+    """El desempate no depende del orden en que lleguen las dos mediciones."""
+    construye = _Builder(
+        _builder_manifest("uniswap_v3"),
+        quotes=(_pool_quote("uniswap_v3", _OUT_2690),),
+    )
+    solo_cotiza = _Engine(
+        _manifest("geckoterminal"),
+        quotes=(_pool_quote("geckoterminal", _OUT_2700),),
+    )
+    comparison = await _usecase(await _registry(construye, solo_cotiza))(PAIR, AMOUNT)
+
+    assert len(comparison.quotes) == 1
+    assert comparison.quotes[0].engine_id == "uniswap_v3"
+
+
+async def test_entre_dos_que_construyen_sigue_mandando_la_pila() -> None:
+    """Con la capacidad empatada vuelve a decidir la preferencia del usuario.
+
+    Y no la cifra: elegir aquí la mejor de dos observaciones del mismo contrato
+    sería quedarse con el número que más conviene.
+    """
+    primera = _Builder(
+        _builder_manifest("uniswap_v3"),
+        quotes=(_pool_quote("uniswap_v3", _OUT_2690),),
+    )
+    segunda = _Builder(
+        _builder_manifest("zeroex"),
+        quotes=(_pool_quote("zeroex", _OUT_2700),),
+    )
+    comparison = await _usecase(await _registry(primera, segunda))(PAIR, AMOUNT)
+
+    assert len(comparison.quotes) == 1
+    assert comparison.quotes[0].engine_id == "uniswap_v3"
+
+
+async def test_el_que_construye_en_otra_red_no_gana_el_desempate() -> None:
+    """Construir «en general» no es construir **esta** red.
+
+    El desempate se resuelve con `planners_for(red del par)`: un motor que
+    declara swaps sólo en Base no puede firmar una ruta de Ethereum, y dejarle
+    ganar la fila volvería a dejarla sin poder construirse.
+    """
+    solo_cotiza = _Engine(
+        _manifest("geckoterminal"),
+        quotes=(_pool_quote("geckoterminal", _OUT_2700),),
+    )
+    otra_red = _Builder(
+        EngineManifest(
+            engine_id="de_base",
+            name="Motor de Base",
+            version="1.0.0",
+            kind=EngineKind.DEX_QUOTES,
+            summary="Construye, pero en otra red.",
+            capabilities=frozenset({Capability.READ_CHAIN, Capability.PREPARE_TX}),
+            swap_chains=frozenset({"base"}),
+        ),
+        quotes=(_pool_quote("de_base", _OUT_2690),),
+    )
+    comparison = await _usecase(await _registry(solo_cotiza, otra_red))(PAIR, AMOUNT)
+
+    assert len(comparison.quotes) == 1
+    assert comparison.quotes[0].engine_id == "geckoterminal"
 
 
 # --------------------------------------------------------------------------- #

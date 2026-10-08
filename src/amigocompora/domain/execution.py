@@ -26,6 +26,11 @@ from amigocompora.domain.errors import ExecutionLimitExceededError, InvalidAmoun
 #: laxo, es «no operes nunca» disfrazado de configuración.
 _UNSET: Final = "sin definir"
 
+#: Comodín para `allowed_tokens`: permite operar con cualquier token. Se escribe en
+#: la configuración como `allowed_tokens = ["*"]`. Es deliberadamente un valor
+#: explícito y no una lista vacía, porque vacía significa «nada permitido».
+ANY_TOKEN: Final = "*"  # noqa: S105  # el nombre contiene «TOKEN», pero es un símbolo de la lista, no un secreto
+
 
 class TriggerKind(StrEnum):
     """Qué dispara una operación. Los tres son combinables."""
@@ -234,6 +239,11 @@ class ExecutionLimits:
         fuera de la lista—, así que la lista blanca se escribe una vez y vale
         para los dos caminos.
         """
+        # El comodín permite cualquier token a propósito: es una decisión del usuario,
+        # escrita como tal en la configuración, y no un vacío que se confunda con
+        # «nada permitido». Sin él, la lista vacía sigue significando que no se opera.
+        if ANY_TOKEN in self.allowed_tokens:
+            return
         outside = sorted(symbol for symbol in symbols if symbol not in self.allowed_tokens)
         if outside:
             raise ExecutionLimitExceededError(

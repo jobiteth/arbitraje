@@ -50,6 +50,20 @@ class PrepareSwap:
             )
         return bool(self.registry.planners_for(chain_key))
 
+    def can_build(self, quote: Quote) -> bool:
+        """Si el motor que cotizó **esta** ruta sabe construir su swap.
+
+        Una ruta de un motor que sólo cotiza —GeckoTerminal— aparece en la tabla,
+        pero no tiene con qué construirse: el swap sale del motor que la observó.
+        Preguntarlo por la ruta concreta, y no por la red, evita que el botón de
+        firmar quede encendido y falle al pulsarlo.
+        """
+        try:
+            self.planner_for(quote)
+        except (NoActiveEngineError, UnsupportedOperationError):
+            return False
+        return True
+
     async def build(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
         """Construye el payload sin firmar. **No pide confirmación.**
 

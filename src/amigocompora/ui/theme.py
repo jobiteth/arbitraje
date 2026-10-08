@@ -130,6 +130,59 @@ QFrame#legBox {{
     border: 1px solid {COLOR_BORDER_STRONG};
     border-radius: {RADIUS}px;
 }}
+/* El panel lateral: la cartera, a la derecha de la pantalla de swap. Sin fondo
+   propio y sin borde, porque lo que lleva dentro son tarjetas y una caja que las
+   envuelva sería una caja dentro de otra. */
+QWidget#sidePanel {{
+    background: transparent;
+    border: none;
+}}
+/* El segmento de las tres operaciones —Intercambiar, Enviar, Depositar—. Es un
+   mando de selección, no tres botones de acción: el que está elegido se ve, y
+   los otros dos no compiten con el botón que firma. */
+QPushButton#segment {{
+    background: transparent;
+    border: 1px solid transparent;
+    color: {COLOR_MUTED};
+    padding: 7px 14px;
+    font-weight: 600;
+}}
+QPushButton#segment:hover {{
+    color: {COLOR_TEXT};
+    background: {COLOR_ELEVATED};
+}}
+QPushButton#segment:checked {{
+    background: {COLOR_ELEVATED};
+    border-color: {COLOR_BORDER_STRONG};
+    color: {COLOR_TEXT};
+}}
+/* El botón que abre el selector de tokens. Es la cara visible de una elección que
+   se hace en un modal: lleva el símbolo y un galón que dice que se puede cambiar,
+   y por eso no se parece a un desplegable ni a un botón de acción. */
+QPushButton#tokenButton {{
+    background: {COLOR_ELEVATED};
+    border: 1px solid {COLOR_BORDER_STRONG};
+    border-radius: {RADIUS}px;
+    color: {COLOR_TEXT};
+    padding: 6px 12px;
+    font-weight: 700;
+    font-size: 14px;
+}}
+QPushButton#tokenButton:hover {{
+    border-color: {COLOR_ACCENT};
+    background: {COLOR_CARD};
+}}
+/* El botón de invertir el par. Sin fondo y sin el azul del acento: es un mando
+   entre las dos patas, no la acción de la pantalla. */
+QPushButton#invert {{
+    background: {COLOR_ELEVATED};
+    border: 1px solid {COLOR_BORDER_STRONG};
+    color: {COLOR_TEXT};
+    border-radius: {RADIUS}px;
+    padding: 5px 14px;
+    font-weight: 600;
+}}
+QPushButton#invert:hover {{ border-color: {COLOR_ACCENT}; color: {COLOR_ACCENT}; }}
 /* El importe que se entrega, en grande y sin caja. Dentro del recuadro de la pata
    el borde sobra: el recuadro ya dice dónde se escribe, y una caja dentro de otra
    caja es lo que hacía que este campo pareciera un formulario y no un importe. */

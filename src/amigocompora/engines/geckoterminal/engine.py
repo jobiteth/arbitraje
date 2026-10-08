@@ -288,15 +288,29 @@ class GeckoTerminalEngine:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         if pair.chain not in CHAIN_SLUGS:
             return ()
-        if pair.base.address is None or pair.quote.address is None:
+        if pair.quote.address is None:
             return ()
 
         spec = chain(pair.chain)
+        # El nativo no tiene pools propios: los AMM operan con su envoltorio, y así
+        # se consulta aquí. Un par con POL nativo se busca por WPOL —que también
+        # arrastra los pools que operan el nativo sin envolver— y se casa con esa
+        # pata, pero la cotización se devuelve con el par que pidió quien llama.
+        # Antes el nativo se descartaba aquí, y por eso no había ninguna ruta.
+        if pair.base.address is None:
+            wrapped = wrapped_native(pair.chain)
+            if wrapped is None:
+                return ()
+            lookup = wrapped
+            match_pair = TradingPair(base=wrapped, quote=pair.quote)
+        else:
+            lookup = pair.base
+            match_pair = pair
         observed_at = self._clock.now()
         rows = [
             row
-            for entry in await self._pools_for(pair.base, spec)
-            if (row := self._to_row(entry, pair, spec)) is not None
+            for entry in await self._pools_for(lookup, spec)
+            if (row := self._to_row(entry, match_pair, spec)) is not None
         ]
         return tuple(
             quote
@@ -413,9 +427,17 @@ class GeckoTerminalEngine:
             )
             return None
 
-        if not pool.has_depth_for(amount_in, max_impact=MAX_PRICE_IMPACT):
+        # El pool opera el envoltorio: su aritmética exige la cantidad con el símbolo
+        # de su reserva. Para el nativo es la misma cantidad en unidades mínimas,
+        # porque envolver es un depósito uno a uno. Si los decimales no coincidieran
+        # no se cotiza, para no escalar la cifra mal en silencio. La cotización sigue
+        # mostrando la cantidad que pidió quien llama.
+        if amount_in.decimals != row.reserve_base.decimals:
             return None
-        amount_out = pool.output_for(amount_in)
+        amount_pool = TokenAmount(amount_in.raw, row.reserve_base.decimals, row.reserve_base.symbol)
+        if not pool.has_depth_for(amount_pool, max_impact=MAX_PRICE_IMPACT):
+            return None
+        amount_out = pool.output_for(amount_pool)
         if not amount_out.is_positive:
             return None
 
@@ -426,7 +448,7 @@ class GeckoTerminalEngine:
             amount_in=amount_in,
             amount_out=amount_out,
             fee_bps=row.fee_bps,
-            price_impact_bps=pool.price_impact(amount_in),
+            price_impact_bps=pool.price_impact(amount_pool),
             observed_at=observed_at,
             liquidity=pool.reserve_quote,
             fee_basis=row.fee_basis,
