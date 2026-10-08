@@ -31,13 +31,38 @@ from amigocompora.domain.modes import (
 ModeListener = Callable[[OperationMode], None]
 
 
+def _as_mode(mode: OperationMode | str) -> OperationMode:
+    """El modo de verdad, venga como venga.
+
+    Hace falta por un tropiezo de Qt que ya rompió la aplicación una vez:
+    `QComboBox.addItem(etiqueta, modo)` guarda el dato del ítem como texto —y
+    `OperationMode` es un `StrEnum`, o sea un `str`—, así que `currentData()` lo
+    devuelve como una cadena pelada. Con el desplegable de modo, elegir
+    cualquiera de ellos dejaba al guard con un `str` dentro y **toda** consulta
+    de permisos reventaba con `'str' object has no attribute 'grants'`: dejaban
+    de funcionar a la vez la cotización, los puentes y los mercados.
+
+    El guard decide qué se puede firmar, así que no se fía de quien lo llama:
+    convierte aquí, y lo que hay dentro es siempre un modo.
+    """
+    if isinstance(mode, OperationMode):
+        return mode
+    try:
+        return OperationMode(mode)
+    except ValueError:
+        validos = ", ".join(opcion.value for opcion in OperationMode)
+        raise ValueError(
+            f"«{mode}» no es un modo de operación. Los que hay son: {validos}."
+        ) from None
+
+
 class ModeGuard:
     """Guarda el modo activo y autoriza capacidades contra él."""
 
     __slots__ = ("_listeners", "_mode")
 
-    def __init__(self, mode: OperationMode = DEFAULT_MODE) -> None:
-        self._mode = mode
+    def __init__(self, mode: OperationMode | str = DEFAULT_MODE) -> None:
+        self._mode = _as_mode(mode)
         self._listeners: list[ModeListener] = []
 
     # ------------------------------------------------------------- estado  #
@@ -45,17 +70,22 @@ class ModeGuard:
     def mode(self) -> OperationMode:
         return self._mode
 
-    def set_mode(self, mode: OperationMode) -> None:
+    def set_mode(self, mode: OperationMode | str) -> None:
         """Cambia el modo activo.
 
         Sólo debe invocarse desde una acción explícita del usuario: ni un caso
         de uso ni un motor pueden subir de modo para desbloquearse a sí mismos.
+
+        Acepta el modo o su texto porque quien lo llama desde la interfaz lo
+        recibe de un `QComboBox`, que devuelve texto; ver `_as_mode`. Los
+        observadores reciben siempre el modo, nunca la cadena.
         """
-        if mode == self._mode:
+        destino = _as_mode(mode)
+        if destino == self._mode:
             return
-        self._mode = mode
+        self._mode = destino
         for listener in tuple(self._listeners):
-            listener(mode)
+            listener(destino)
 
     def subscribe(self, listener: ModeListener) -> Callable[[], None]:
         """Registra un observador y devuelve la función para darse de baja."""

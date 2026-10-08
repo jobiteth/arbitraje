@@ -157,6 +157,48 @@ def test_mode_listeners_notified() -> None:
     assert seen == [OperationMode.ASSISTED]
 
 
+def test_el_guard_digiere_el_modo_servido_como_texto() -> None:
+    """Lo que devuelve Qt es una cadena pelada, y el guard tiene que aceptarla.
+
+    No es una comodidad: es el fallo que dejó la aplicación inservible. El
+    desplegable de modo guarda el `OperationMode` como texto —es un `StrEnum`— y
+    lo devuelve como texto, así que `set_mode` recibía `"execution"` en vez del
+    modo. Al guardarle una cadena, la siguiente consulta de permisos —cotizar,
+    buscar un puente, pedir mercados— reventaba con `'str' object has no
+    attribute 'grants'`. Como el guard es quien decide qué se firma, la
+    conversión va dentro y no en quien lo llama.
+    """
+    guard = ModeGuard()
+    guard.set_mode("execution")
+    assert guard.mode is OperationMode.EXECUTION
+    assert guard.allows(Capability.BROADCAST_TX)
+
+
+def test_el_guard_tambien_nace_de_una_cadena() -> None:
+    """La otra puerta: construirlo con el texto no puede dejar un `str` dentro."""
+    guard = ModeGuard("assisted")
+    assert guard.mode is OperationMode.ASSISTED
+    assert guard.allows(Capability.PREPARE_TX)
+
+
+def test_los_observadores_reciben_el_modo_y_no_la_cadena() -> None:
+    """Quien se apunta a los cambios pinta con el modo; con texto no podría."""
+    guard = ModeGuard()
+    visto: list[OperationMode] = []
+    guard.subscribe(visto.append)
+    guard.set_mode("simulation")
+    assert visto == [OperationMode.SIMULATION]
+    assert isinstance(visto[0], OperationMode)
+
+
+def test_un_modo_que_no_existe_se_rechaza_diciendo_cuales_hay() -> None:
+    """Un texto inventado no puede colarse como modo activo."""
+    guard = ModeGuard()
+    with pytest.raises(ValueError, match="observation"):
+        guard.set_mode("turbo")
+    assert guard.mode is OperationMode.OBSERVATION
+
+
 def test_modes_granting_finds_observer_of_read() -> None:
     assert modes_granting(Capability.READ_CHAIN) == frozenset(OperationMode)
 

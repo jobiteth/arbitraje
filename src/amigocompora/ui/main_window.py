@@ -172,14 +172,29 @@ class MainWindow(QMainWindow):
     def _mode_index(self, mode: OperationMode) -> int:
         """Índice del modo en el desplegable, o 0 si no estuviera.
 
-        `findData` compara con `==`, y `OperationMode` es un `StrEnum`, así que
-        buscar por el valor sería encontrar el primero que coincida por texto.
-        Se compara por identidad para que el índice sea el del modo de verdad.
+        La comparación es por valor y no por identidad **a propósito**, aunque
+        `OperationMode` sea un `StrEnum`: Qt guarda el dato del ítem como texto,
+        así que `itemData` devuelve la cadena y una comparación con `is` no
+        acertaría nunca —el desplegable se quedaría siempre en el primer modo—.
+        Como cada modo aparece una sola vez, el valor identifica al ítem.
         """
         for index in range(self._mode_combo.count()):
             if self._mode_combo.itemData(index) == mode:
                 return index
         return 0
+
+    def _mode_value(self) -> OperationMode | None:
+        """El modo elegido, **reconstruido** desde el desplegable.
+
+        `currentData()` no devuelve el `OperationMode` que se le dio: Qt guarda
+        el dato del ítem como texto y lo devuelve como texto, y `OperationMode`
+        es un `StrEnum` (el mismo tropiezo que documenta `PredictionPage`). El
+        guard ya se defiende de eso, pero reconstruirlo aquí deja el dato bueno
+        en el sitio donde entra, en vez de depender de que el de dentro lo
+        arregle.
+        """
+        dato = self._mode_combo.currentData()
+        return None if dato is None else OperationMode(dato)
 
     def _sync_mode_combo(self, mode: OperationMode) -> None:
         """Pone el desplegable donde dice el guard. Sin volver a avisar al guard.
@@ -191,7 +206,7 @@ class MainWindow(QMainWindow):
         self._mode_combo.setCurrentIndex(self._mode_index(mode))
 
     def _on_mode_changed(self) -> None:
-        mode: OperationMode = self._mode_combo.currentData()
+        mode = self._mode_value()
         if mode is None or mode == self._container.guard.mode:
             return
         self._container.guard.set_mode(mode)
