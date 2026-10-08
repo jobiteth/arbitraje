@@ -29,6 +29,17 @@ dependencies = [
     # mano. El tope inferior no es decorativo: `web3` (el extra `[chain]`)
     # exige `>=0.14`, y fijar algo menor hace el grafo irresoluble.
     "eth-account>=0.14,<0.15",
+    # Codificar y decodificar ABI, y el keccak de los selectores. Llegan como
+    # dependencias de `eth-account`, pero se declaran porque el motor de cartera
+    # los importa sin intermediarios: apoyarse en una dependencia transitiva es
+    # quedarse a que la de arriba cambie de idea.
+    "eth-abi>=5.0",
+    "eth-utils>=5.0",
+    # El código QR de una dirección de depósito. Es Python puro y no arrastra
+    # Pillow —que traería binarios compilados a una aplicación que sólo necesita
+    # una matriz de ceros y unos para pintarla con QPainter—. Se declara aunque
+    # sólo lo use la interfaz: la interfaz es parte del paquete.
+    "segno>=1.6,<2",
 ]
 
 # Sólo necesario para motores que decodifican ABIs / contratos (M2+).
@@ -52,11 +63,14 @@ uniswap = "amigocompora.engines.uniswap:PROVIDER"
 uniswap_v3 = "amigocompora.engines.uniswap_v3:PROVIDER"
 uniswap_v4 = "amigocompora.engines.uniswap_v4:PROVIDER"
 zeroex = "amigocompora.engines.zeroex:PROVIDER"
+lifi = "amigocompora.engines.lifi:PROVIDER"
+relay = "amigocompora.engines.relay:PROVIDER"
 polymarket = "amigocompora.engines.polymarket:PROVIDER"
 stub_advisor = "amigocompora.engines.llm.providers:STUB_PROVIDER"
 claude = "amigocompora.engines.llm.providers:CLAUDE_PROVIDER"
 deepseek = "amigocompora.engines.llm.providers:DEEPSEEK_PROVIDER"
 chatgpt = "amigocompora.engines.llm.providers:CHATGPT_PROVIDER"
+wallet = "amigocompora.engines.wallet.engine:PROVIDER"
 
 [dependency-groups]
 dev = [

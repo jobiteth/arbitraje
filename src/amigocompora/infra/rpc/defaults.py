@@ -92,6 +92,24 @@ DEFAULT_ENDPOINTS: Final[Mapping[str, tuple[RpcEndpoint, ...]]] = {
         _public("unichain-rpc.publicnode.com", "publicnode"),
         _public("mainnet.unichain.org", "unichain-oficial"),
     ),
+    # Solana entra con **uno solo**, y no por falta de candidatos: se probaron
+    # ocho el 2026-10-07 y los otros siete quedaron fuera por lo que devolvieron.
+    #
+    #   drpc, ankr, rpcpool, blockdaemon   HTTP 400/401/403 — no hablan Solana sin clave
+    #   mainnet.helius-rpc.com            HTTP 401 — pide clave
+    #   solana-rpc.publicnode.com         getBalance SÍ, getTokenAccountsByOwner **403**
+    #
+    # El último es el caso que importa y el que explica la regla de este fichero.
+    # Contestaba el saldo nativo y bloqueaba las cuentas de token: puesto como
+    # respaldo daría una cartera con SOL y **sin un solo USDC**, y con el mismo
+    # aspecto que una cartera bien leída. Un endpoint así no es un respaldo más
+    # lento: es uno que miente con los datos del usuario, y eso es peor que no
+    # tener respaldo.
+    #
+    # La consecuencia hay que decirla: este nodo raciona por ventana —medido, 39
+    # peticiones seguidas y 429— y no hay un segundo que lo releve. Por eso el
+    # motor de cartera lee Solana en serie y cachea, en vez de en paralelo.
+    "solana": (_public("api.mainnet-beta.solana.com", "solana-oficial"),),
 }
 
 

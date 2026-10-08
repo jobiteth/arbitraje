@@ -44,12 +44,15 @@ from amigocompora.domain.protocols import (
     ENTRY_POINT_GROUP,
     AiAdvisorEngine,
     ConfigResolver,
+    CrossChainPlanner,
     DexQuoteEngine,
     Engine,
     EngineKind,
     EngineManifest,
     EngineProvider,
     PredictionMarketEngine,
+    PredictionOrderPlanner,
+    PredictionRedeemer,
     SwapPlanner,
     validate_config,
 )
@@ -301,10 +304,35 @@ class EngineRegistry:
         )
         return tuple(candidates)
 
+    def bridge_planners_for(self, origin_chain: str) -> tuple[CrossChainPlanner, ...]:
+        """Motores activos capaces de cruzar **desde esa red**, en orden.
+
+        El filtro es la red de **origen** y no la de destino: un puente empieza
+        donde está el dinero, y una red de la que no se puede partir no ofrece
+        ninguna ruta por mucho que se pueda llegar a ella. Se filtra por lo que
+        el manifiesto declara (`bridge_chains`), como en `planners_for`, para
+        saber quién puede antes de gastar una conexión.
+
+        Devolver **varios** y no el mejor es lo que hace que la mejor ruta la
+        decida el importe recibido y no el orden en que se activaron los motores:
+        quien llama los recorre a todos, y `rank_bridges` ordena después por lo
+        que cada uno entrega. El orden de aquí sólo desempata.
+
+        El orden es por `bridge_priority` y, a falta de eso, por `engine_id`:
+        determinista, y sin depender del orden de activación.
+        """
+        candidates = [
+            engine
+            for engine in self._active.get(EngineKind.CROSS_CHAIN, ())
+            if origin_chain in engine.manifest.bridge_chains
+            and isinstance(engine, CrossChainPlanner)
+        ]
+        candidates.sort(key=_bridge_order)
+        return tuple(candidates)
+
     def active_or_none(self, kind: EngineKind) -> Engine | None:
         stack = self._active.get(kind)
         return stack[0] if stack else None
-
     # Accesores tipados por ranura. Se escriben uno a uno —y no con un
     # `active_as(kind, protocol)` genérico— porque mypy no admite pasar una
     # clase `Protocol` donde se espera `type[T]` (`type-abstract`), y la
@@ -334,11 +362,88 @@ class EngineRegistry:
             )
         return cast("tuple[DexQuoteEngine, ...]", stack)
 
+    def bridge_planners(self) -> tuple[CrossChainPlanner, ...]:
+        """Toda la ranura de puentes, la preferida primero, o error si está vacía.
+
+        Devuelve **todas** y no sólo la preferida por la misma razón que la ranura
+        DEX: aquí lo que se pide es comparar rutas, y una lista con las rutas de
+        un solo motor no compara nada. Quien sólo necesite la titular la tiene en
+        `[0]`.
+
+        A diferencia de `bridge_planners_for`, no filtra por red: pregunta quién
+        sabe cruzar, en general. Sirve para enseñar la ranura y para saber si
+        hay algún motor de puentes activo antes de ofrecer la pestaña.
+
+        El orden es el mismo que el de `bridge_planners_for` —por
+        `bridge_priority` y, a falta de eso, por `engine_id`—, y se ordena con la
+        **misma** función: dos órdenes escritos por separado podrían discrepar, y
+        entonces la lista que se enseña y la lista que se recorre no coincidirían.
+        """
+        stack = self.active_stack(EngineKind.CROSS_CHAIN)
+        for engine in stack:
+            if not isinstance(engine, CrossChainPlanner):
+                raise EngineError(
+                    _wrong_slot(engine, EngineKind.CROSS_CHAIN, "CrossChainPlanner")
+                )
+        if not stack:
+            raise NoActiveEngineError(
+                f"no hay motor activo para «{EngineKind.CROSS_CHAIN.label}». "
+                f"Selecciona uno en el panel de motores."
+            )
+        return tuple(sorted(cast("tuple[CrossChainPlanner, ...]", stack), key=_bridge_order))
+
     def active_prediction(self) -> PredictionMarketEngine:
         engine = self.active(EngineKind.PREDICTION_MARKETS)
         if not isinstance(engine, PredictionMarketEngine):
             raise EngineError(
                 _wrong_slot(engine, EngineKind.PREDICTION_MARKETS, "PredictionMarketEngine")
+            )
+        return engine
+
+    def prediction_planner(self) -> PredictionOrderPlanner:
+        """El motor de predicción activo, **exigiendo** que sepa operar.
+
+        Es un accesor distinto de `active_prediction` y no una comprobación
+        dentro de él porque son dos preguntas distintas: «¿quién lee mercados?»
+        la responde cualquier motor de predicción, y «¿quién puede firmar una
+        orden?» sólo la responde uno que implemente el protocolo de escritura.
+        Mezclarlas haría que leer un mercado fallara por un método que leer no
+        necesita.
+
+        Se comprueba el tipo aquí y no se deja al caso de uso porque el fallo
+        tiene nombre propio —el motor activo no sabe operar— y decirlo aquí es
+        lo que evita que el usuario reciba un `AttributeError` sobre un método
+        que su motor nunca tuvo.
+        """
+        engine = self.active(EngineKind.PREDICTION_MARKETS)
+        if not isinstance(engine, PredictionOrderPlanner):
+            raise EngineError(
+                f"el motor «{engine.manifest.engine_id}» lee mercados de "
+                f"predicción pero no sabe construir ni publicar órdenes: activa "
+                f"uno que sí, o usa la pestaña sólo para mirar."
+            )
+        return engine
+
+    def prediction_redeemer(self) -> PredictionRedeemer:
+        """El motor de predicción activo, **exigiendo** que sepa cobrar.
+
+        Tercer accesor del mismo motor, y por la misma razón que el segundo: leer
+        lo que se tiene, construir una orden y cobrar una posición resuelta son
+        tres preguntas distintas, y cada una la responde un protocolo distinto.
+        Un motor que sólo lee mercados no tiene por qué saber firmar, y uno que
+        sepa firmar órdenes no tiene por qué saber cobrar.
+
+        Se comprueba el tipo aquí y no se deja al caso de uso porque el fallo
+        tiene nombre propio —el motor activo no sabe cobrar— y decirlo aquí es lo
+        que evita que el usuario reciba un `AttributeError` sobre un método que su
+        motor nunca tuvo.
+        """
+        engine = self.active(EngineKind.PREDICTION_MARKETS)
+        if not isinstance(engine, PredictionRedeemer):
+            raise EngineError(
+                f"el motor «{engine.manifest.engine_id}» lee mercados de "
+                f"predicción pero no sabe cobrar una posición ya resuelta: activa "
+                f"uno que sí, o usa la pestaña sólo para mirar."
             )
         return engine
 
@@ -384,6 +489,21 @@ class EngineRegistry:
             for kind, stack in self._active.items()
         }
         return f"EngineRegistry(disponibles={len(self._available)}, activos={active})"
+
+
+def _bridge_order(engine: CrossChainPlanner) -> tuple[int, str]:
+    """El orden de la ranura de puentes: prioridad y, a falta de ella, identidad.
+
+    Se escribe una vez y la usan los dos accesores. Dos órdenes escritos por
+    separado podrían discrepar, y entonces la lista que la interfaz enseña y la
+    lista que el caso de uso recorre no coincidirían — con lo que «la mejor ruta
+    primero» dejaría de ser cierto justo en el sitio donde se elige.
+
+    Y no es el orden de activación a propósito: `add` mete al motor nuevo el
+    último de la lista, así que ordenar por posición haría que añadir un respaldo
+    cambiara quién responde primero.
+    """
+    return (engine.manifest.bridge_priority, engine.manifest.engine_id)
 
 
 def _wrong_slot(engine: Engine, kind: EngineKind, protocol_name: str) -> str:

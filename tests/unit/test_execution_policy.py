@@ -33,6 +33,7 @@ from amigocompora.app.confirmation import (
 )
 from amigocompora.app.execution_policy import (
     POLICY_REASON,
+    REDEEM_KIND,
     AutonomyPolicy,
     ExecutionLedger,
     LedgerEntry,
@@ -48,7 +49,17 @@ from amigocompora.domain.errors import (
     ModeNotPermittedError,
 )
 from amigocompora.domain.execution import ExecutionLimits, TriggerKind
-from amigocompora.domain.models import ExecutionIntent, Quote, TradingPair, Venue, VenueKind
+from amigocompora.domain.models import (
+    BroadcastReceipt,
+    BroadcastStatus,
+    ExecutionIntent,
+    PredictionPosition,
+    PredictionRedeemIntent,
+    Quote,
+    TradingPair,
+    Venue,
+    VenueKind,
+)
 from amigocompora.domain.modes import Capability, OperationMode
 from amigocompora.engines.catalog import quote_token, wrapped_native
 
@@ -632,6 +643,202 @@ def test_spending_in_another_unit_is_not_summed_and_is_announced(tmp_path: Path)
     avisos = [item for item in captured if item["event"] == "autonomy.mixed_notional_units"]
     assert len(avisos) == 1
     assert avisos[0]["ignored"] == ["DAI"]
+
+
+# --------------------------------------------------------------------------- #
+# El cobro: dinero que entra no consume el tope de lo que sale
+# --------------------------------------------------------------------------- #
+def _posicion(shares: str = "12.5", *, redeemable: bool = True) -> PredictionPosition:
+    return PredictionPosition(
+        venue=Venue(
+            venue_id="polymarket",
+            name="Polymarket",
+            kind=VenueKind.PREDICTION_MARKET,
+            chain="polygon",
+        ),
+        condition_id="0x" + "ab" * 32,
+        question="¿Ocurrirá lo medido?",
+        outcome_label="Sí",
+        # El `noqa` silencia un falso positivo: la regla lee «TOKEN» como si fuera
+        # un secreto, y esto es un identificador público que va en la cadena.
+        token_id="71321045679252212594626385532706912750332728571942532289631379312455583992563",  # noqa: S106
+        shares=Decimal(shares),
+        observed_at=NOW,
+        redeemable=redeemable,
+        neg_risk=False,
+    )
+
+
+def _redeem(shares: str = "12.5") -> PredictionRedeemIntent:
+    colateral = quote_token("polygon")
+    assert colateral is not None
+    posicion = _posicion(shares)
+    return PredictionRedeemIntent(
+        position=posicion,
+        recipient="0x1111111111111111111111111111111111111111",
+        notional=colateral.amount(posicion.payout),
+        engine_id="polymarket",
+    )
+
+
+def _polygon_limits(**overrides: object) -> ExecutionLimits:
+    """Los mismos topes, pero con Polygon y Polymarket en las listas."""
+    base: dict[str, object] = {
+        "allowed_chains": frozenset({"polygon"}),
+        "allowed_engines": frozenset({"polymarket"}),
+    }
+    base.update(overrides)
+    return _limits(**base)
+
+
+def _polygon_policy(tmp_path: Path, **overrides: object) -> tuple[AutonomyPolicy, ExecutionLedger]:
+    clock = FrozenClock(NOW)
+    ledger = ExecutionLedger(tmp_path / "executions.jsonl", clock=clock)
+    policy = AutonomyPolicy(
+        keys=FakeKey(),
+        passphrase=FakePassphrase(),
+        limits=_polygon_limits(**overrides),
+        ledger=ledger,
+        clock=clock,
+    )
+    return policy, ledger
+
+
+def test_cobrar_mas_que_el_tope_por_operacion_no_se_bloquea(tmp_path: Path) -> None:
+    """El tope acota lo que **sale**. Aplicárselo a un cobro lo haría absurdo.
+
+    Con un tope de 5 000 por operación, cobrar 12 500 tiene que poder hacerse: la
+    consecuencia de no hacerlo sería que cuanto más ganada está una posición,
+    más bloqueada queda, y el dinero del usuario se quedaría encerrado en el
+    contrato justo cuando por fin se puede sacar.
+    """
+    policy, _ = _polygon_policy(tmp_path, max_quote_per_trade=Decimal("5000"))
+    policy.check_intent(_redeem("12500"))  # no lanza
+
+
+def test_cobrar_no_consume_el_presupuesto_del_dia(tmp_path: Path) -> None:
+    """Ya con el tope diario agotado, un cobro sigue pudiendo hacerse."""
+    policy, ledger = _polygon_policy(tmp_path)
+    intent = _redeem("12.5")
+    # Se agota el día con un gasto de una unidad de la misma moneda.
+    ledger.append(
+        LedgerEntry(
+            occurred_at=NOW - timedelta(hours=1),
+            chain="polygon",
+            pair="polymarket",
+            engine_id="polymarket",
+            notional="20000",
+            notional_symbol=intent.notional.symbol,
+            tx_hash="0x" + "ab" * 32,
+            status="success",
+            recipient=intent.recipient,
+            description="",
+        )
+    )
+    policy.check_intent(intent)  # no lanza: lo que entra no gasta
+
+
+def test_el_cobro_si_pasa_por_el_interruptor_maestro(tmp_path: Path) -> None:
+    """Que no se le mida el importe no quiere decir que no se le compruebe nada."""
+    policy, _ = _polygon_policy(tmp_path, enabled=False)
+    with pytest.raises(ExecutionLimitExceededError) as excinfo:
+        policy.check_intent(_redeem())
+    assert excinfo.value.limit == "ejecución deshabilitada"
+
+
+def test_el_cobro_comprueba_la_red(tmp_path: Path) -> None:
+    """Cobrar en una red que no está en la lista blanca no se hace."""
+    policy, _ = _polygon_policy(tmp_path, allowed_chains=frozenset({"base"}))
+    with pytest.raises(ExecutionLimitExceededError) as excinfo:
+        policy.check_intent(_redeem())
+    assert excinfo.value.limit == "redes permitidas"
+
+
+def test_el_cobro_comprueba_el_motor(tmp_path: Path) -> None:
+    """El interruptor por recinto vale también para cobrar."""
+    policy, _ = _polygon_policy(tmp_path, allowed_engines=frozenset({"zeroex"}))
+    with pytest.raises(ExecutionLimitExceededError) as excinfo:
+        policy.check_intent(_redeem())
+    assert excinfo.value.limit == "motores permitidos"
+
+
+def test_el_cobro_comprueba_el_colateral(tmp_path: Path) -> None:
+    """El único token que se mueve al cobrar es el colateral, y se comprueba."""
+    policy, _ = _polygon_policy(tmp_path, allowed_tokens=frozenset({"WETH"}))
+    with pytest.raises(ExecutionLimitExceededError) as excinfo:
+        policy.check_intent(_redeem())
+    assert excinfo.value.limit == "tokens permitidos"
+
+
+def test_el_asiento_de_un_cobro_no_cuenta_para_el_tope(tmp_path: Path) -> None:
+    """Y no cuenta por **tipo de asiento**, no por su estado.
+
+    Un `SUCCESS` es un `SUCCESS`, así que un cobro anotado como transacción
+    normal gastaría presupuesto del día por recuperar lo propio. Lo que lo
+    distingue es `kind`, que se escribe al anotarlo y se relee del fichero.
+    """
+    _, ledger = _polygon_policy(tmp_path)
+    intent = _redeem()
+    ledger.record_redeem(
+        BroadcastReceipt(
+            chain="polygon",
+            tx_hash="0x" + "ef" * 32,
+            status=BroadcastStatus.SUCCESS,
+            observed_at=NOW,
+            reason="",
+        ),
+        intent=intent,
+        chain_key="polygon",
+        position=intent.position,
+    )
+
+    # Se relee del disco: el asiento tiene que seguir sin contar tras un reinicio.
+    releido = ExecutionLedger(tmp_path / "executions.jsonl", clock=FrozenClock(NOW))
+    (entrada,) = releido.entries()
+    assert entrada.kind == REDEEM_KIND
+    assert entrada.counts_towards_limits is False
+    assert releido.spent_since(NOW - timedelta(hours=1)) == Decimal("0")
+
+
+def test_el_asiento_de_un_cobro_guarda_el_importe_y_de_que_mercado() -> None:
+    """No contarlo no es esconderlo: el fichero tiene que poder explicar el saldo.
+
+    Un registro que callara el importe de un cobro no podría explicar por qué el
+    saldo de la cartera subió, y el importe tiene que ser el **cobrado**, no lo
+    que se pagó en su día por las participaciones.
+    """
+    intent = _redeem("12.5")
+    entrada = LedgerEntry(
+        occurred_at=NOW,
+        chain="polygon",
+        pair=intent.label,
+        engine_id=intent.engine_id,
+        notional=f"{intent.measured.as_decimal():f}",
+        notional_symbol=intent.measured.symbol,
+        tx_hash="0x" + "ef" * 32,
+        status="success",
+        recipient=intent.recipient,
+        description="",
+        kind=REDEEM_KIND,
+    )
+    assert entrada.notional_value == intent.position.payout == Decimal("12.5")
+    assert "cobro" in intent.label
+
+
+def test_la_etiqueta_de_un_cobro_se_distingue_de_la_de_un_gasto() -> None:
+    """Se distingue por el texto, porque el signo no está en ninguna columna.
+
+    Quien lea el fichero suma la columna del importe; sin la palabra «cobro»
+    delante, contaría como gasto un renglón que es dinero que entró.
+    """
+    assert _redeem("3").label.startswith("cobro ")
+    assert "¿Ocurrirá lo medido?" in _redeem().label
+
+
+def test_un_cobro_declara_que_no_compromete_dinero() -> None:
+    """Es el dato que `check_intent` consulta, y vive en el intento."""
+    assert _redeem().counts_towards_limits is False
+    assert _intent().counts_towards_limits is True
 
 
 # --------------------------------------------------------------------------- #

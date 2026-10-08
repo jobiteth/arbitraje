@@ -1,11 +1,22 @@
-"""Pestaña: Motores (hot-swap)."""
+"""Pestaña: Motores (hot-swap) y credenciales.
+
+Dos cosas que van juntas porque se configuran juntas: qué motores están
+instalados y **con qué credenciales**. Hasta ahora el panel sólo listaba motores,
+y las claves —incluida la privada que firma— no tenían ningún sitio donde
+ponerse: había que saber que se guardan en el llavero del sistema bajo un nombre
+concreto y escribirlas por fuera de la aplicación. Eso convertía «configurar la
+cartera» en un trámite invisible, y lo que no se ve no se hace.
+"""
 
 from __future__ import annotations
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -14,15 +25,48 @@ from PySide6.QtWidgets import (
 )
 
 from amigocompora.app.container import Container
+from amigocompora.domain.errors import KeyCustodyError
 from amigocompora.domain.protocols import EngineKind
-from amigocompora.ui.theme import COLOR_MUTED
-from amigocompora.ui.widgets import spawn
+from amigocompora.infra.secrets import (
+    AUTONOMY_PASSPHRASE_SECRET,
+    PRIVATE_KEY_SECRET,
+    AutonomyPassphraseProvider,
+    SecretStoreError,
+    SpendingKeyProvider,
+    app_env_var_name,
+    app_secret_key,
+    env_var_name,
+    secret_key,
+)
+from amigocompora.ui.theme import COLOR_DANGER, COLOR_MUTED, COLOR_WARNING
+from amigocompora.ui.widgets import Card, spawn
 
 
 class EnginesPage(QWidget):
+    #: Se emite cuando se guarda o se borra una credencial. Lo que cambia no es
+    #: esta pestaña —que se repinta sola— sino las demás: sin cartera no se firma,
+    #: y los botones que firman tienen que enterarse.
+    credentials_changed = Signal()
+
     def __init__(self, container: Container, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._container = container
+        #: Un campo por credencial, y un rótulo de estado por credencial. Se
+        #: guardan por la clave del almacén —`app:execution_private_key`,
+        #: `zeroex:api_key`— y no por el nombre visible, para que lo que se
+        #: escribe sea exactamente lo que se lee después.
+        self._secret_fields: dict[str, QLineEdit] = {}
+        self._secret_states: dict[str, QLabel] = {}
+        self._secret_notes: dict[str, str] = {}
+        #: Quién más puede estar sirviendo una credencial de la aplicación. Las de
+        #: motor sólo viven en el llavero —o en su variable, que resuelve el
+        #: registro al arrancar—, pero estas dos las lee un proveedor en cada
+        #: firma, y ese proveedor sabe si las está sacando del entorno.
+        self._secret_sources: dict[str, SpendingKeyProvider | AutonomyPassphraseProvider] = {
+            app_secret_key(PRIVATE_KEY_SECRET): container.keys,
+            app_secret_key(AUTONOMY_PASSPHRASE_SECRET): container.passphrase,
+        }
+
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
 
@@ -44,6 +88,8 @@ class EnginesPage(QWidget):
         row.addWidget(self._activate_btn)
         lay.addLayout(row)
 
+        lay.addWidget(self._build_credentials())
+
         refresh_btn = QPushButton("Refrescar")
         refresh_btn.setObjectName("secondary")
         refresh_btn.clicked.connect(self._refresh)
@@ -51,6 +97,7 @@ class EnginesPage(QWidget):
 
         self._refresh()
 
+    # -------------------------------------------------------------- motores #
     def _refresh(self) -> None:
         reg = self._container.registry
         catalog = reg.available()
@@ -79,6 +126,7 @@ class EnginesPage(QWidget):
 
         active_map = {k.value: (v.manifest.engine_id if v else "—") for k, v in ((k, reg.active_or_none(k)) for k in EngineKind)}
         self._status.setText("Activos: " + "  ·  ".join(f"{k}={v}" for k, v in active_map.items()))
+        self._refresh_secrets()
 
     def _on_activate(self) -> None:
         engine_id = self._combo.currentData()
@@ -97,3 +145,260 @@ class EnginesPage(QWidget):
         finally:
             self._activate_btn.setEnabled(True)
             self._refresh()
+
+    # --------------------------------------------------------- credenciales #
+    def _build_credentials(self) -> Card:
+        """La tarjeta donde se escriben las credenciales.
+
+        Se construye **una vez** y sólo se repinta el estado: reconstruirla en
+        cada refresco borraría lo que el usuario está escribiendo a medio teclear,
+        que es la forma más rápida de que alguien acabe pegando la clave en el
+        sitio equivocado.
+        """
+        card = Card(
+            "Credenciales",
+            subtitle="van al llavero del sistema, nunca a un fichero del repositorio",
+        )
+        self._secrets_grid = QGridLayout()
+        self._secrets_grid.setHorizontalSpacing(10)
+        self._secrets_grid.setVerticalSpacing(6)
+        card.body().addLayout(self._secrets_grid)
+
+        note = QLabel(
+            "Lo que se escriba aquí se guarda cifrado por el sistema operativo "
+            "—Administrador de credenciales en Windows, Llavero en macOS, Secret "
+            "Service en Linux— y no se muestra nunca más. Ningún valor se escribe "
+            "en config.toml ni en el registro de ejecuciones."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        card.body().addWidget(note)
+
+        self._credentials_rows: dict[str, tuple[QLabel, QPushButton, QPushButton]] = {}
+        self._fill_credentials()
+        return card
+
+    def _fill_credentials(self) -> None:
+        """Crea una fila por credencial: estado, campo, guardar y borrar.
+
+        Las credenciales de la aplicación van primero, y la clave privada la
+        primera de todas: es la que hace falta para poder firmar algo, y la que
+        hasta ahora no tenía dónde ponerse.
+        """
+        rows: tuple[tuple[str, str, str, bool], ...] = (
+            (
+                app_secret_key(PRIVATE_KEY_SECRET),
+                "Clave privada de la cartera",
+                "Con ella se firma. Se lee sólo en el momento de firmar y no se "
+                "guarda en ningún objeto.",
+                True,
+            ),
+            (
+                app_secret_key(AUTONOMY_PASSPHRASE_SECRET),
+                "Frase de la ejecución desatendida",
+                "Sólo hace falta para emitir sin preguntar. Sin ella la autonomía "
+                "no se puede armar.",
+                False,
+            ),
+        )
+
+        for position, (key, label, note, required) in enumerate(rows):
+            self._add_secret_row(self._secrets_grid, position, key, label, note, required=required)
+
+        # Una credencial por opción declarada en el manifiesto de un motor
+        # registrado. Se leen del manifiesto y no de una lista escrita aquí: un
+        # motor nuevo publica sus claves y aparecen solas, que es lo que hace que
+        # añadir un motor no toque la interfaz.
+        position = len(rows)
+        for entry in self._container.registry.available():
+            manifest = entry.manifest
+            for option in manifest.config_options:
+                required = option in manifest.required_config
+                self._add_secret_row(
+                    self._secrets_grid,
+                    position,
+                    secret_key(manifest.engine_id, option),
+                    f"{manifest.name} — {option}",
+                    (
+                        "Obligatoria: sin ella este motor no arranca."
+                        if required
+                        else "Opcional: el motor funciona sin ella."
+                    ),
+                    required=required,
+                )
+                position += 1
+
+    def _add_secret_row(
+        self,
+        grid: QGridLayout,
+        row: int,
+        key: str,
+        label: str,
+        note: str,
+        *,
+        required: bool,
+    ) -> None:
+        title = QLabel(label)
+        title.setToolTip(note)
+        grid.addWidget(title, row, 0)
+
+        state = QLabel("")
+        state.setObjectName("hint")
+        grid.addWidget(state, row, 1)
+
+        field = QLineEdit()
+        # Enmascarado: la clave privada y una API key se parecen en que ninguna
+        # debería quedar legible en una pantalla compartida.
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setPlaceholderText("pegar aquí y pulsar Guardar")
+        grid.addWidget(field, row, 2)
+
+        save = QPushButton("Guardar")
+        save.clicked.connect(lambda _=False, k=key: self._on_save_secret(k))
+        grid.addWidget(save, row, 3)
+
+        erase = QPushButton("Borrar")
+        erase.setObjectName("secondary")
+        erase.clicked.connect(lambda _=False, k=key: self._on_forget_secret(k))
+        grid.addWidget(erase, row, 4)
+
+        self._secret_fields[key] = field
+        self._secret_states[key] = state
+        self._secret_notes[key] = self._where_it_lives(key, note, required=required)
+
+    def _where_it_lives(self, key: str, note: str, *, required: bool) -> str:
+        """Dónde vive esta credencial, en las palabras que el usuario necesita.
+
+        Se nombra el **llavero** y también la variable de entorno equivalente
+        porque las dos vías existen y sólo una se puede usar desde aquí: quien
+        despliegue en un contenedor sin llavero necesita saber el nombre exacto de
+        la variable, y quien abra la aplicación en su portátil necesita saber que
+        no tiene que tocar el entorno.
+
+        Y se dice **qué hace falta** para que esa variable sirva, porque para las
+        dos credenciales de la aplicación no basta con ponerla: el proveedor que
+        las lee sólo mira el entorno si `[execution] allow_env_key` está encendido.
+        """
+        if key.startswith("app:"):
+            env = app_env_var_name(key.removeprefix("app:"))
+            # Estas dos credenciales las lee un proveedor —el que firma, el que
+            # arma la autonomía— que **sólo** mira la variable si la configuración
+            # lo autoriza; las de motor las resuelve el registro, que mira el
+            # entorno siempre. Nombrarla sin decir la condición mandaría a un
+            # servidor sin llavero a poner una variable que nadie va a leer, que es
+            # justo lo que el `require()` de al lado se cuida de no hacer.
+            via = (
+                f"variable equivalente {env}"
+                if self._container.settings.execution.allow_env_key
+                else (
+                    f"variable equivalente {env}, que sólo se lee si se enciende "
+                    f"[execution] allow_env_key"
+                )
+            )
+        else:
+            engine_id, _, option = key.partition(":")
+            via = f"variable equivalente {env_var_name(engine_id, option)}"
+        kind = "obligatoria" if required else "opcional"
+        return f"{note} Es {kind}. Credencial «{key}»; {via}."
+
+    def _servida_por_el_entorno(self, key: str) -> str | None:
+        """La variable de entorno que sirve esta credencial, si es que la hay.
+
+        Se pregunta al **proveedor de verdad** —el mismo que usará el caso de uso
+        al firmar— y no al entorno por nuestra cuenta: mirar `os.environ` diría
+        que hay una clave ahí aunque el respaldo estuviera apagado y el proveedor
+        fuera a negarse, que es prometer una firma que no va a ocurrir.
+
+        Sólo devuelve algo cuando el almacén ya ha fallado —es donde se llama—,
+        así que un valor aquí significa necesariamente que vino del entorno.
+        """
+        proveedor = self._secret_sources.get(key)
+        if proveedor is None:
+            return None
+        try:
+            return proveedor.env_var if proveedor.get() else None
+        except KeyCustodyError:
+            # El respaldo está apagado: no hay nada por otra vía, y nombrar una
+            # variable que el proveedor no va a leer sería mentir.
+            return None
+
+    def _refresh_secrets(self) -> None:
+        """Repinta el estado de cada credencial. **Nunca el valor.**
+
+        Del valor guardado sólo se publica si existe: ni su longitud, ni sus
+        primeros caracteres, ni una pista. Lo que se puede afirmar sin riesgo es
+        que está, y eso es lo que se dice.
+        """
+        for key, state in self._secret_states.items():
+            try:
+                present = bool(self._container.secrets.get(key))
+            except SecretStoreError as error:
+                variable = self._servida_por_el_entorno(key)
+                if variable is not None:
+                    # El llavero no responde, pero la credencial **está** y se
+                    # sirve por otra vía. Decir sólo «el llavero no responde»
+                    # dejaría al usuario creyendo que no puede firmar cuando sí
+                    # puede: la frase es cierta y la conclusión que saca, falsa.
+                    state.setText("configurada por el entorno")
+                    state.setStyleSheet(f"color: {COLOR_WARNING};")
+                    state.setToolTip(
+                        f"El llavero del sistema no responde, así que esta credencial "
+                        f"se está leyendo de {variable}. Sirve —con ella se firma— y "
+                        f"es menos segura que el llavero: cualquiera con acceso al "
+                        f"entorno del proceso la ve, y una clave privada no se puede "
+                        f"rotar sin cambiar de cartera.\n\n{self._secret_notes[key]}"
+                    )
+                    continue
+                # Un llavero que no responde no es «sin configurar»: es un fallo
+                # del sistema, y decir lo primero culparía al usuario.
+                #
+                # El fallo **se suma** a la descripción en vez de sustituirla.
+                # Sustituirla parecía razonable —el error es lo que acaba de
+                # pasar— pero deja al usuario sin la única salida que le queda:
+                # este es justo el caso en el que el llavero no sirve, así que la
+                # variable de entorno que nombra la descripción es lo que hay que
+                # usar, y el propio botón de guardar le manda a leerla («usa la
+                # variable de entorno que se indica en su descripción»). Con el
+                # error encima, esa frase señalaba a un texto que ya no estaba.
+                state.setText("el llavero no responde")
+                state.setStyleSheet(f"color: {COLOR_DANGER};")
+                state.setToolTip(f"{error}\n\n{self._secret_notes[key]}")
+                continue
+            state.setText("configurada" if present else "sin configurar")
+            state.setStyleSheet("" if present else f"color: {COLOR_MUTED};")
+            state.setToolTip(self._secret_notes[key])
+
+    def _on_save_secret(self, key: str) -> None:
+        value = self._secret_fields[key].text()
+        if not value.strip():
+            self._status.setText("No hay nada que guardar: el campo está vacío.")
+            return
+        try:
+            self._container.secrets.set(key, value.strip())
+        except SecretStoreError as error:
+            self._status.setText(
+                f"No se pudo guardar «{key}»: {error}. En un equipo sin llavero, "
+                f"usa la variable de entorno que se indica en su descripción."
+            )
+            return
+        finally:
+            # El campo se vacía **siempre**, incluso si falló: dejar la clave
+            # escrita en un widget es dejarla en una pantalla.
+            self._secret_fields[key].clear()
+        self._status.setText(f"«{key}» guardada en el llavero. No se volverá a mostrar.")
+        self._refresh_secrets()
+        # Guardar la clave privada cambia si se puede firmar, y eso lo deciden
+        # los botones de otras pestañas. Se avisa con una señal en vez de dejar
+        # que lo descubran: un «Ejecutar» que sigue apagado después de configurar
+        # la cartera enseña a desconfiar del botón.
+        self.credentials_changed.emit()
+
+    def _on_forget_secret(self, key: str) -> None:
+        try:
+            self._container.secrets.delete(key)
+        except SecretStoreError as error:
+            self._status.setText(f"No se pudo borrar «{key}»: {error}")
+            return
+        self._status.setText(f"«{key}» borrada del llavero.")
+        self._refresh_secrets()
+        self.credentials_changed.emit()

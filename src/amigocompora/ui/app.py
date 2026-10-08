@@ -27,6 +27,7 @@ from amigocompora.app.container import Container, build_container
 from amigocompora.app.scheduler import DEFAULT_SCAN_INTERVAL, ScheduledTask
 from amigocompora.domain.modes import Capability
 from amigocompora.ui.main_window import MainWindow
+from amigocompora.ui.theme import STYLESHEET
 
 _log = structlog.get_logger(__name__)
 
@@ -69,6 +70,13 @@ def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Amigocompora")
     app.setApplicationVersion(__version__)
+    # El tema se instala en la **aplicación** y no sólo en la ventana. En la
+    # ventana funcionaba para todo lo que cuelga de ella, y dejaba fuera
+    # exactamente lo que no cuelga de nada: los diálogos construidos sin padre,
+    # que salían con el fondo claro del estilo nativo en medio de una interfaz
+    # oscura. Un diálogo de confirmación que no se parece al resto es el peor
+    # sitio donde perder la confianza en que se está mirando la aplicación de uno.
+    app.setStyleSheet(STYLESHEET)
 
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)

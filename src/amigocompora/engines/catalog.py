@@ -101,6 +101,24 @@ def quote_token(chain_key: str) -> Token | None:
     return _token(symbol, decimals, chain_key, address)
 
 
+def native_token(chain_key: str) -> Token:
+    """La moneda nativa de una red: ETH, POL, BNB, SOL. `address=None` la marca.
+
+    Existe porque el motor de cartera la necesita para **todas** las redes, y sin
+    este helper cada sitio la reconstruía a mano desde `ChainSpec` con la
+    posibilidad de equivocar los decimales —que no da error, da un saldo mil
+    veces mayor o menor—. Aquí los decimales salen del registro, que es donde
+    están medidos.
+    """
+    spec = chain(chain_key)
+    return Token(
+        symbol=spec.native_symbol,
+        decimals=spec.native_decimals,
+        chain=chain_key,
+        address=None,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Tokens adicionales con liquidez medida
 # --------------------------------------------------------------------------- #
@@ -138,6 +156,20 @@ _EXTRA_SPECS: Final[Mapping[str, Sequence[tuple[str, int, str]]]] = {
         ("WETH.e", 18, "0x49d5c2bdffac6ce2bfdb6640f4f80f226bc10bab"),
     ),
     "arc": (("cirBTC", 8, "0x171a4217b86a807a64eb94757db6849fb4bdbaa0"),),
+    # En Solana el catálogo se queda corto a propósito. Medido el 2026-10-07
+    # contra GeckoTerminal: la primera página de piscinas por volumen de la red
+    # es casi toda memecoin de pump.fun —«Sand Witch Kitten», «Baby Baton»—, y
+    # meterlas aquí las convertiría en parte de la lista de tradeables de la
+    # aplicación. Eso no es liquidez que cotizar: es un token que puede irse a
+    # cero entre la cotización y la firma. Se añaden sólo los tres medidos que
+    # llevan años en la red, y lo demás se resuelve al leer: en Solana una
+    # dirección **sí** enumera sus tokens, así que la cartera los descubre sin
+    # necesidad de tenerlos en una lista escrita de antemano.
+    "solana": (
+        ("USDT", 6, "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
+        ("ORCA", 6, "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE"),
+        ("RAY", 6, "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"),
+    ),
 }
 
 

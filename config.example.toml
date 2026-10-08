@@ -132,9 +132,23 @@ allow_env_key = false
 # catálogo también se declara aquí: en la pestaña de precios se añade por su
 # dirección de contrato —el símbolo y los decimales los lee de la cadena— y lo
 # que hay que escribir en esta lista es el símbolo que devuelva ese contrato.
-# allowed_chains = ["base", "ethereum"]
-# allowed_tokens = ["WETH", "USDC"]
-# allowed_engines = ["zeroex", "uniswap"]
+#
+# Retirar fondos tiene dos exigencias que no se ven en la pantalla, porque
+# `check_engine` es una lista de **inclusión**:
+#
+#   - `allowed_engines` tiene que nombrar `wallet`. Una retirada no pasa por
+#     ningún motor —no hay par, no hay ruta—, pero se anota con ese nombre, así
+#     que sin él la operación se rechaza.
+#   - El **símbolo de la moneda nativa** de la red tiene que estar en
+#     `allowed_tokens` para poder retirarla: `POL`, `ETH`, `BNB`, `AVAX`… No se
+#     puede operar con lo que no está declarado, ni siquiera lo que la cartera ya
+#     tiene.
+#
+# Ninguna de las dos es un obstáculo, y las dos son deliberadas: sacar dinero es
+# la operación que más caro sale por error.
+# allowed_chains = ["base", "ethereum", "polygon"]
+# allowed_tokens = ["WETH", "USDC", "ETH", "POL"]
+# allowed_engines = ["zeroex", "uniswap", "wallet"]
 
 # Topes de gasto, en unidades de la stablecoin con la que se cotiza el par
 # (USDC, USDT…), **entre comillas**. Sin comillas TOML los leería como coma

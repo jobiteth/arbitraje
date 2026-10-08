@@ -31,19 +31,27 @@ from amigocompora.app.registry import EngineRegistry, sole_engine_for
 from amigocompora.app.scheduler import Scheduler
 from amigocompora.app.usecases.analyze_prediction_market import AnalyzePredictionMarkets
 from amigocompora.app.usecases.analyze_with_ai import AnalyzeWithAi
+from amigocompora.app.usecases.compare_bridges import CompareBridges
 from amigocompora.app.usecases.compare_prices import ComparePrices
+from amigocompora.app.usecases.execute_bridge import ExecuteBridge
 from amigocompora.app.usecases.execute_swap import ExecuteSwap
 from amigocompora.app.usecases.find_prediction_opportunities import (
     FindPredictionOpportunities,
 )
+from amigocompora.app.usecases.place_prediction_order import PlacePredictionOrder
+from amigocompora.app.usecases.prepare_bridge import PrepareBridge
 from amigocompora.app.usecases.prepare_swap import PrepareSwap
+from amigocompora.app.usecases.redeem_prediction import RedeemPrediction
 from amigocompora.app.usecases.scan_opportunities import ScanOpportunities
 from amigocompora.app.usecases.value_in_reference import ValueInReference
+from amigocompora.app.usecases.wallet import ReadWallet, ValueWallet
 from amigocompora.app.usecases.watch_scan import WatchedPair, WatchScan
+from amigocompora.app.usecases.withdraw import WithdrawFunds
 from amigocompora.domain.clock import Clock, SystemClock
 from amigocompora.domain.models import Opportunity, TradingPair
 from amigocompora.domain.protocols import EngineKind
 from amigocompora.engines.token_lookup import TokenLookup
+from amigocompora.engines.token_store import UserTokenStore
 from amigocompora.infra import config as config_module
 from amigocompora.infra.config import Settings, load_settings
 from amigocompora.infra.evm.broadcast import broadcasters_by_chain
@@ -92,20 +100,48 @@ class Container:
     gateway: ConfirmationGateway
     registry: EngineRegistry
     compare_prices: ComparePrices
+    #: Cotiza el mismo cruce en **todos** los motores de puentes activos y ordena
+    #: las rutas por lo que entregan. Es a los puentes lo que `compare_prices` es a
+    #: los swaps, y no tiene efectos: sólo pregunta.
+    compare_bridges: CompareBridges
     scan_opportunities: ScanOpportunities
     analyze_markets: AnalyzePredictionMarkets
     find_prediction_opportunities: FindPredictionOpportunities
     prepare_swap: PrepareSwap
-    #: Firma y emite. Es el único camino que mueve dinero, y está detrás de dos
-    #: puertas: el modo `EJECUCIÓN` y `execution.enabled`. Sin él la aplicación
-    #: sólo prepara payloads.
+    #: Construye el payload sin firmar de un puente. Es al camino de puentes lo
+    #: que `prepare_swap` es al de swaps, y por la misma razón: poder mirar qué se
+    #: haría sin que nada ocurra.
+    prepare_bridge: PrepareBridge
+    #: Firma y emite un swap. Está detrás de dos puertas: el modo `EJECUCIÓN` y
+    #: `execution.enabled`. Sin él la aplicación sólo prepara payloads.
     execute_swap: ExecuteSwap
+    #: Firma y emite un **puente**: saca el dinero de una red y lo hace aparecer
+    #: en otra. Está detrás de las mismas dos puertas que `execute_swap` —el modo
+    #: `EJECUCIÓN` y `execution.enabled`— y por eso comparte emisores y política.
+    #: Se separa del swap porque lo que se comprueba no es lo mismo: aquí la lista
+    #: blanca de redes tiene que cubrir **las dos** redes, no sólo la de origen.
+    execute_bridge: ExecuteBridge
+    #: Construye, firma y **publica** una orden en un mercado de predicción. Es,
+    #: junto con `execute_swap`, el otro camino por el que sale dinero: mismo
+    #: modo y mismo interruptor, y por eso comparten emisores y política.
+    place_prediction_order: PlacePredictionOrder
+    #: Cobra posiciones de un mercado de predicción ya resuelto. Mismo modo y
+    #: mismo interruptor que los otros dos, y el único de los tres por el que el
+    #: dinero **entra**: por eso no le aplica el tope de gasto, sólo el resto de
+    #: la comprobación.
+    redeem_prediction: RedeemPrediction
     #: La política de autonomía, con sus límites y su registro. La interfaz la lee
     #: para saber si puede ofrecer el botón, y para poder explicar por qué no.
     policy: AutonomyPolicy
     #: De dónde sale la clave privada. Se expone para que la interfaz pueda pedir
     #: la **dirección** derivada —que es pública— sin tocar la clave.
     keys: SpendingKeyProvider
+    #: De dónde sale la frase que habilita la ejecución desatendida. Se expone por
+    #: el mismo motivo que `keys` y con el mismo límite —el valor no se pide
+    #: nunca—: la pantalla de credenciales tiene que poder decir si está puesta y
+    #: **de dónde**. Sin esto, una frase servida por el entorno se anunciaba como
+    #: «el llavero no responde»: cierto, y llevaba a la conclusión contraria.
+    passphrase: AutonomyPassphraseProvider
     analyze_with_ai: AnalyzeWithAi
     alert_center: AlertCenter
     scheduler: Scheduler
@@ -118,6 +154,30 @@ class Container:
     #: esto, la lista de tokens sería el límite de lo que la aplicación sabe
     #: nombrar, y un token nuevo no tendría forma de entrar.
     token_lookup: TokenLookup
+    #: Los tokens que el usuario añadió a mano, guardados entre sesiones. El
+    #: catálogo del código no crece solo, y pegar una dirección en cada arranque
+    #: es justo lo que hacía que un token nuevo no llegara a ser tradeable.
+    token_store: UserTokenStore
+    #: Lee los saldos de una cartera, red por red y sin valorarlos. Es una
+    #: lectura pura: ni firma ni emite, y el motor que la sirve declara
+    #: `READ_CHAIN` como única capacidad. Se separa de `value_wallet` porque leer
+    #: cuesta una llamada por red y valorar una cotización por token con fondos.
+    read_wallet: ReadWallet
+    #: Pone precio a una foto ya leída, sin volver a tocar los nodos. Recibe el
+    #: `WalletSnapshot` y no la cartera justamente para eso: releyendo, la
+    #: interfaz que pinta saldos y luego importes haría el doble de peticiones, y
+    #: en Solana —un solo nodo público, racionado por ventana— eso no se puede.
+    value_wallet: ValueWallet
+    #: Saca fondos de la cartera: construye la transferencia, la firma y la emite.
+    #: Tercer camino por el que sale dinero, junto a `execute_swap` y
+    #: `execute_bridge`, y el único que no pasa por ningún motor. Está detrás de
+    #: las mismas dos puertas —el modo `EJECUCIÓN` y `execution.enabled`— y de la
+    #: lista blanca de motores, que tiene que nombrar `wallet`.
+    withdraw_funds: WithdrawFunds
+    #: El almacén de credenciales del sistema. Se expone para que la interfaz
+    #: pueda **escribir** en él: hasta ahora sólo se leía, y eso dejaba la clave
+    #: privada y las API keys sin ningún sitio donde ponerlas.
+    secrets: SecretStore
     #: El cliente HTTP compartido por todos los pools. Se guarda para poder
     #: cerrarlo: `RpcPool` no es dueño de su transporte.
     _rpc_client: httpx.AsyncClient | None = None
@@ -179,6 +239,7 @@ async def build_container(
         await _activate_configured_engines(registry, effective_settings)
 
     compare_prices = ComparePrices(registry=registry, gateway=gateway)
+    compare_bridges = CompareBridges(registry=registry, gateway=gateway)
     scan_opportunities = ScanOpportunities(
         compare_prices=compare_prices,
         gateway=gateway,
@@ -192,18 +253,31 @@ async def build_container(
     watch_scan.subscribe(lambda opps: _publish_opportunities(alert_center, opps))
     analyze_markets = AnalyzePredictionMarkets(registry=registry, gateway=gateway)
 
+    # La cartera. Se construye **siempre**, aunque no haya motor de cartera
+    # activo: lo que falta entonces lo dice el propio caso de uso con un mensaje
+    # accionable, y construirlo bajo condición dejaría a la interfaz sin nada a
+    # lo que preguntar para poder explicar que falta un motor.
+    #
+    # Los dos pasos van separados —leer saldos y valorarlos— porque cuestan cosas
+    # muy distintas: leer es una llamada por red, valorar es una cotización por
+    # token con fondos. Ver `usecases.wallet`.
+    read_wallet = ReadWallet(registry=registry, guard=guard, clock=effective_clock)
+    value_wallet = ValueWallet(valuation=ValueInReference(registry=registry))
+
     # El camino que firma y emite. Se construye **siempre**, incluso con la
     # ejecución apagada: lo que impide operar son las puertas —el modo y
     # `execution.enabled`—, no que falte el objeto. Construirlo bajo condición
     # haría que encenderlo exigiera reiniciar, y que un fallo de cableado sólo
     # apareciera el día que alguien se decide a operar, que es el peor día.
     prepare_swap = PrepareSwap(registry=registry, gateway=gateway)
+    prepare_bridge = PrepareBridge(registry=registry, gateway=gateway)
     execution = _build_execution(
         settings=effective_settings,
         store=effective_store,
         clock=effective_clock,
         gateway=gateway,
         prepare=prepare_swap,
+        prepare_bridge=prepare_bridge,
         rpc=rpc_registry,
         registry=registry,
     )
@@ -215,6 +289,7 @@ async def build_container(
         gateway=gateway,
         registry=registry,
         compare_prices=compare_prices,
+        compare_bridges=compare_bridges,
         scan_opportunities=scan_opportunities,
         analyze_markets=analyze_markets,
         find_prediction_opportunities=FindPredictionOpportunities(
@@ -223,15 +298,30 @@ async def build_container(
             clock=effective_clock,
         ),
         prepare_swap=prepare_swap,
+        prepare_bridge=prepare_bridge,
         execute_swap=execution.execute_swap,
+        execute_bridge=execution.execute_bridge,
+        place_prediction_order=execution.place_prediction_order,
+        redeem_prediction=execution.redeem_prediction,
         policy=execution.policy,
         keys=execution.keys,
+        passphrase=execution.passphrase,
         analyze_with_ai=AnalyzeWithAi(registry=registry, gateway=gateway),
         alert_center=alert_center,
         scheduler=scheduler,
         watch_scan=watch_scan,
         rpc=rpc_registry,
         token_lookup=TokenLookup(rpc=rpc_registry),
+        # La misma casa que `executions.jsonl`, y por el mismo motivo: el
+        # directorio de configuración es el único sitio que existe cuando la
+        # aplicación se lanza desde el menú de inicio y el directorio de trabajo
+        # es cualquiera. Se lee por el **módulo** —ver la nota del registro de
+        # ejecuciones— para que el aislamiento de la suite lo pueda desviar.
+        token_store=UserTokenStore(config_module.config_dir() / "tokens.json"),
+        secrets=effective_store,
+        read_wallet=read_wallet,
+        value_wallet=value_wallet,
+        withdraw_funds=execution.withdraw_funds,
         _rpc_client=rpc_client,
     )
 
@@ -342,8 +432,20 @@ class _Execution:
     """
 
     execute_swap: ExecuteSwap
+    execute_bridge: ExecuteBridge
+    #: La retirada. Va con los otros dos porque comparte lo que de verdad
+    #: importa: los **mismos** emisores, la misma política y el mismo almacén de
+    #: claves. Un mapa de emisores propio sería un segundo sitio donde el pool de
+    #: una red puede quedar distinto del otro sin que nada lo diga.
+    withdraw_funds: WithdrawFunds
+    place_prediction_order: PlacePredictionOrder
+    redeem_prediction: RedeemPrediction
     policy: AutonomyPolicy
     keys: SpendingKeyProvider
+    #: Va con las dos anteriores y por el mismo motivo: la pantalla de credenciales
+    #: necesita poder decir si una frase servida por el entorno está puesta, y eso
+    #: sólo lo sabe el proveedor.
+    passphrase: AutonomyPassphraseProvider
 
 
 def _build_execution(
@@ -352,6 +454,7 @@ def _build_execution(
     clock: Clock,
     gateway: ConfirmationGateway,
     prepare: PrepareSwap,
+    prepare_bridge: PrepareBridge,
     rpc: RpcRegistry,
     registry: EngineRegistry,
 ) -> _Execution:
@@ -415,17 +518,23 @@ def _build_execution(
     # de ninguna seguridad.
     gateway.set_bypass(PolicyBypass(policy))
 
+    # Los emisores se construyen **una vez** y se comparten: el camino de swaps y
+    # el de órdenes de predicción firman en las mismas redes, y dos mapas con el
+    # mismo contenido serían dos sitios donde el pool de una red puede quedar
+    # distinto del otro sin que nada lo diga.
+    broadcasters = broadcasters_by_chain(
+        rpc.pools,
+        gas_policy=cfg.gas.to_policy(),
+        clock=clock,
+    )
+
     return _Execution(
         execute_swap=ExecuteSwap(
             prepare=prepare,
             gateway=gateway,
             keys=keys,
             policy=policy,
-            broadcasters=broadcasters_by_chain(
-                rpc.pools,
-                gas_policy=cfg.gas.to_policy(),
-                clock=clock,
-            ),
+            broadcasters=broadcasters,
             clock=clock,
             # Con esto, un par que no toque la stablecoin de referencia —ETH
             # contra un token, o dos tokens entre sí— sigue midiéndose contra los
@@ -433,8 +542,53 @@ def _build_execution(
             # el par. Sin esto habría que rechazarlo, que es lo que se hacía.
             valuation=ValueInReference(registry=registry),
         ),
+        execute_bridge=ExecuteBridge(
+            prepare=prepare_bridge,
+            gateway=gateway,
+            # Los **mismos** emisores que el swap: el puente emite en la red de
+            # origen, que es una de las que un swap ya usa, y dos mapas con el
+            # mismo contenido serían dos sitios donde el pool de una red puede
+            # quedar distinto del otro sin que nada lo diga.
+            keys=keys,
+            policy=policy,
+            broadcasters=broadcasters,
+            clock=clock,
+            # Igual que en los swaps: un puente que sale en la stablecoin de su
+            # red —el caso normal— ya está en la unidad del tope y no necesita
+            # valoración. Esto cubre el otro caso, salir en ETH o en un token.
+            valuation=ValueInReference(registry=registry),
+        ),
+        place_prediction_order=PlacePredictionOrder(
+            registry=registry,
+            gateway=gateway,
+            keys=keys,
+            policy=policy,
+            broadcasters=broadcasters,
+            clock=clock,
+        ),        redeem_prediction=RedeemPrediction(
+            registry=registry,
+            gateway=gateway,
+            keys=keys,
+            policy=policy,
+            broadcasters=broadcasters,
+            clock=clock,
+        ),
+        # La retirada no cotiza nada —se manda lo que se manda—, así que no tiene
+        # `prepare` del que tirar: construye su propia transferencia. Lo que sí
+        # comparte con los otros dos caminos es la valoración, y por eso la
+        # recibe: con el token nativo o con un token cualquiera, el importe hay
+        # que traducirlo a la moneda del tope antes de compararlo, o el tope no
+        # se está aplicando.
+        withdraw_funds=WithdrawFunds(
+            gateway=gateway,
+            keys=keys,
+            policy=policy,
+            broadcasters=broadcasters,
+            valuation=ValueInReference(registry=registry),
+        ),
         policy=policy,
         keys=keys,
+        passphrase=passphrase,
     )
 
 

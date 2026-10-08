@@ -16,12 +16,13 @@ from PySide6.QtWidgets import (
 
 from amigocompora.app.alerts import AlertCenter, Severity
 from amigocompora.app.container import Container
-from amigocompora.domain.modes import OperationMode
+from amigocompora.domain.modes import Capability, OperationMode
 from amigocompora.ui.pages.ai import AiPage
 from amigocompora.ui.pages.alerts import AlertsPage
 from amigocompora.ui.pages.engines import EnginesPage
 from amigocompora.ui.pages.prediction import PredictionPage
 from amigocompora.ui.pages.prices import PricesPage
+from amigocompora.ui.pages.wallet import WalletPage
 from amigocompora.ui.theme import (
     APP_SUBTITLE,
     APP_TITLE,
@@ -49,22 +50,38 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(10)
 
-        # Barra superior: modo + estado
+        # Barra superior: título, modo y estado.
+        #
+        # El modo va aquí arriba y no dentro de una pestaña porque no pertenece a
+        # ninguna: decide lo que pueden hacer **todas** a la vez. Y lleva debajo
+        # su descripción y sus capacidades porque un desplegable que dice
+        # «ASISTIDO» no explica qué se puede y qué no, y esa es exactamente la
+        # pregunta que alguien se hace antes de intentar operar.
         top = QHBoxLayout()
-        title = QLabel(f"<b style='font-size:15px'>{APP_TITLE}</b>  <span style='color:#8b95a5'>{APP_SUBTITLE}</span>")
+        title = QLabel(f"<b style='font-size:16px'>{APP_TITLE}</b>")
         title.setTextFormat(Qt.RichText)
         top.addWidget(title)
+        subtitle = QLabel(APP_SUBTITLE)
+        subtitle.setObjectName("hint")
+        top.addWidget(subtitle)
         top.addStretch()
         top.addWidget(QLabel("Modo:"))
         self._mode_combo = QComboBox()
         for mode in OperationMode:
             self._mode_combo.addItem(mode.label, mode)
+            self._mode_combo.setItemData(
+                self._mode_combo.count() - 1, mode.description, Qt.ItemDataRole.ToolTipRole
+            )
         # Seleccionar el modo activo del guard.
-        idx = next((i for i in range(self._mode_combo.count()) if self._mode_combo.itemData(i) == container.guard.mode), 0)
-        self._mode_combo.setCurrentIndex(idx)
+        self._mode_combo.setCurrentIndex(self._mode_index(container.guard.mode))
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         top.addWidget(self._mode_combo)
         lay.addLayout(top)
+
+        self._mode_hint = QLabel("")
+        self._mode_hint.setObjectName("hint")
+        self._mode_hint.setWordWrap(True)
+        lay.addWidget(self._mode_hint)
 
         # Banner de alertas
         self._banner = AlertBanner()
@@ -73,13 +90,42 @@ class MainWindow(QMainWindow):
 
         # Pestañas
         self._prices = PricesPage(container)
+        self._prediction = PredictionPage(container)
+        self._engines = EnginesPage(container)
+        # La cartera va **al lado** del swap, y no al final con las demás, porque
+        # es donde se contesta la pregunta que se hace justo antes de convertir:
+        # cuánto tengo de esto y en qué red. Separarlas por dos pestañas obliga a
+        # ir y volver para leer un saldo que se está a punto de firmar.
+        self._wallet = WalletPage(container)
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._prices, "Cotizaciones")
-        self._tabs.addTab(PredictionPage(container), "Predicción")
+        self._tabs.addTab(self._prices, "Swap")
+        self._tabs.addTab(self._wallet, "Cartera")
+        self._tabs.addTab(self._prediction, "Predicción")
         self._tabs.addTab(AiPage(container), "Copiloto IA")
-        self._tabs.addTab(EnginesPage(container), "Motores")
+        self._tabs.addTab(self._engines, "Motores")
         self._tabs.addTab(AlertsPage(alert_center), "Alertas")
         lay.addWidget(self._tabs, stretch=1)
+
+        # «Intercambiar este token» en la cartera: se prepara el par en la
+        # pestaña de swap y se cambia a ella. Se cambia **después** de prepararlo
+        # para que el usuario no vea la tarjeta moverse sola: cuando llega, ya
+        # está donde tiene que estar.
+        self._wallet.swap_requested.connect(self._on_swap_requested)
+        # Y al revés: un token añadido por su dirección en la pestaña de swap
+        # entra en la lista de la cartera sin esperar a que se relea la red.
+        self._prices.token_added.connect(self._wallet.set_token_in_store)
+
+        # Configurar la cartera en la pestaña de motores cambia si se puede
+        # firmar, y los botones que firman viven en otras dos pestañas. Sin esto,
+        # el usuario guardaría su clave y encontraría los botones todavía
+        # apagados, que es exactamente lo que enseña a desconfiar de un botón.
+        self._engines.credentials_changed.connect(self._prices.refresh_execution_state)
+        self._engines.credentials_changed.connect(self._prediction.refresh_execution_state)
+        # Y la cartera: la dirección que se lee **es** la que abre esa clave, así
+        # que guardarla o borrarla cambia lo que hay que enseñar. Sin esto, la
+        # pestaña seguiría mostrando la cartera anterior —o ninguna— con la
+        # misma seguridad que si fuera la correcta.
+        self._engines.credentials_changed.connect(self._wallet.refresh)
 
         # Status bar
         status = QStatusBar()
@@ -98,14 +144,51 @@ class MainWindow(QMainWindow):
         alert_center.subscribe(lambda _a: self._refresh_status())
         container.guard.subscribe(lambda _m: self._refresh_status())
         container.policy.subscribe(lambda _armed: self._refresh_autonomy())
-        # El modo decide si se puede firmar y emitir, así que la pestaña de
-        # cotizaciones tiene que enterarse de que ha cambiado. Sin esto, «Ejecutar»
-        # se queda como estaba y el usuario descubre el cambio al pulsarlo —que es
-        # justo lo que enseña a desconfiar de los botones—.
+        # El modo decide si se puede firmar y emitir, así que la pestaña de swap
+        # tiene que enterarse de que ha cambiado. Sin esto, «Ejecutar» se queda
+        # como estaba y el usuario descubre el cambio al pulsarlo —que es justo
+        # lo que enseña a desconfiar de los botones—.
+        #
+        # Y el desplegable también tiene que enterarse, porque el modo lo puede
+        # cambiar la propia pestaña —el atajo «Cambiar a EJECUCIÓN»— y un
+        # desplegable que sigue diciendo «OBSERVACIÓN» mientras la aplicación ya
+        # firma es una pantalla que miente sobre lo que está pasando.
+        container.guard.subscribe(lambda mode: self._sync_mode_combo(mode))
         container.guard.subscribe(lambda _m: self._prices.refresh_execution_state())
+        # La de predicción tiene **dos** botones que firman —publicar una orden y
+        # cobrar una posición ya resuelta— y los dos dependen del modo por la
+        # misma razón que «Ejecutar». Se apunta aquí y no dentro de la pestaña
+        # porque `subscribe` es de quien construye, no de quien se apunta.
+        container.guard.subscribe(lambda _m: self._prediction.refresh_execution_state())
 
         # Cerrar: detener scheduler y motores.
         self._closing = False
+
+    def _on_swap_requested(self, token) -> None:  # type: ignore[no-untyped-def]
+        """Prepara el par con el token de la cartera y se va a la pestaña de swap."""
+        self._prices.prepare_with_token(token)
+        self._tabs.setCurrentWidget(self._prices)
+
+    def _mode_index(self, mode: OperationMode) -> int:
+        """Índice del modo en el desplegable, o 0 si no estuviera.
+
+        `findData` compara con `==`, y `OperationMode` es un `StrEnum`, así que
+        buscar por el valor sería encontrar el primero que coincida por texto.
+        Se compara por identidad para que el índice sea el del modo de verdad.
+        """
+        for index in range(self._mode_combo.count()):
+            if self._mode_combo.itemData(index) == mode:
+                return index
+        return 0
+
+    def _sync_mode_combo(self, mode: OperationMode) -> None:
+        """Pone el desplegable donde dice el guard. Sin volver a avisar al guard.
+
+        `setCurrentIndex` emite `currentIndexChanged` y `_on_mode_changed` sale
+        sin hacer nada cuando el modo elegido ya es el del guard, así que no hay
+        bucle; lo que sí hay es un desplegable que deja de mentir.
+        """
+        self._mode_combo.setCurrentIndex(self._mode_index(mode))
 
     def _on_mode_changed(self) -> None:
         mode: OperationMode = self._mode_combo.currentData()
@@ -126,8 +209,35 @@ class MainWindow(QMainWindow):
     def _refresh_status(self) -> None:
         pending = self._alerts.unacknowledged_count
         self._alert_label.setText(f"● {pending} alerta(s)" if pending else "Sin alertas")
-        caps = ", ".join(sorted(c.value for c in self._container.guard))
-        self._status_label.setText(f"Modo {self._container.guard.mode.label} · capacidades: {caps or 'ninguna'}")
+        mode = self._container.guard.mode
+        caps = ", ".join(sorted(c.label for c in self._container.guard))
+        self._status_label.setText(f"Modo {mode.label} · capacidades: {caps or 'ninguna'}")
+        # La línea de debajo de la barra: qué permite el modo, en las palabras
+        # del propio dominio. Se lee del guard y no se escribe aquí, para que la
+        # pantalla no pueda describir un modo distinto del que el guard aplica.
+        #
+        # Una línea, y sólo una. La versión anterior encadenaba la descripción
+        # entera del modo más el aviso, y en rojo: dos renglones de texto de
+        # alarma permanente encima de todo, que es la forma más rápida de que
+        # nadie lea ninguno de los dos. La descripción completa sigue estando,
+        # en el tooltip y en el del desplegable; aquí va lo que decide si se
+        # puede operar o no.
+        permite_firmar = self._container.guard.allows(Capability.BROADCAST_TX)
+        if permite_firmar:
+            texto = (
+                f"<b>{mode.label}</b> — puede firmar y emitir; los topes y el "
+                "interruptor siguen mandando."
+            )
+        else:
+            texto = (
+                f"<b>{mode.label}</b> — no firma ni emite: lee, calcula y prepara."
+            )
+        self._mode_hint.setText(texto)
+        self._mode_hint.setTextFormat(Qt.RichText)
+        self._mode_hint.setToolTip(f"{mode.label}: {mode.description}")
+        self._mode_hint.setStyleSheet(
+            f"color: {COLOR_DANGER};" if permite_firmar else ""
+        )
         self._refresh_autonomy()
 
     def _refresh_autonomy(self) -> None:

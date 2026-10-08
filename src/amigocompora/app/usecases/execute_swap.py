@@ -73,7 +73,8 @@ from amigocompora.infra.evm.broadcast import (
     build_permit2_approve_calldata,
     require_evm,
 )
-from amigocompora.infra.evm.signer import address_from_key, sign_eip1559
+from amigocompora.infra.evm.dispatch import sign_and_send
+from amigocompora.infra.evm.signer import address_from_key
 
 _log = structlog.get_logger(__name__)
 
@@ -89,6 +90,35 @@ _EMPTY_CALLDATA = frozenset({"", "0x"})
 #: firmarse. Treinta días es lo que usa el propio frontend de Uniswap, y aquí el
 #: importe ya es lo que de verdad limita.
 PERMIT2_EXPIRATION_SECONDS = 30 * 24 * 60 * 60
+
+
+def reference_notional(quote: Quote) -> TokenAmount | None:
+    """La pata del par que está en la moneda de referencia, si alguna lo está.
+
+    Es la decisión que `_intent` toma en su caso 1 —«el par toca la stablecoin,
+    así que el importe del tope **es** esa pata, y se elige en vez de calcularse»—
+    extraída aquí para que haya **una sola** regla.
+
+    Existe porque la interfaz necesita aplicar los topes antes de encender el
+    botón que firma, y no puede hacerlo copiando esta cuenta: una copia que se
+    desviara dejaría el botón prometiendo una operación que la política rechaza,
+    que es exactamente lo que ese botón no puede hacer. Con la regla compartida,
+    lo que la interfaz dice y lo que el caso de uso hace no pueden separarse.
+
+    Devuelve `None` cuando el par **no** toca la referencia. Ahí el importe hay
+    que valorarlo contra los motores, y eso es una petición de red: el botón no
+    puede permitírsela en cada repintado, así que se calla. Callar es lo correcto
+    en ese caso —la valoración puede cambiar entre el repintado y la firma, así
+    que un «sí» del botón tampoco sería una promesa— pero conviene saber que para
+    esos pares el botón sólo dice lo que sabe sin red.
+    """
+    reference = quote_token(quote.pair.chain)
+    if reference is None:
+        return None
+    for amount in (quote.amount_in, quote.amount_out):
+        if amount.symbol == reference.symbol:
+            return amount
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,14 +214,17 @@ class ExecuteSwap:
         delivered = quote.amount_in
         reference = quote_token(quote.pair.chain)
         if reference is not None:
-            for amount in (quote.amount_in, quote.amount_out):
-                if amount.symbol == reference.symbol:
-                    return ExecutionIntent(
-                        quote=quote,
-                        recipient=recipient,
-                        notional=amount,
-                        engine_id=quote.engine_id,
-                    )
+            # La misma función que usa la interfaz para saber si el botón puede
+            # encenderse. Si aquí se decidiera de otra forma, el botón diría una
+            # cosa y esto otra.
+            measured = reference_notional(quote)
+            if measured is not None:
+                return ExecutionIntent(
+                    quote=quote,
+                    recipient=recipient,
+                    notional=measured,
+                    engine_id=quote.engine_id,
+                )
             return await self._valued_intent(quote, recipient, delivered, reference)
 
         # Sin stablecoin de referencia elegida para esa red no hay unidad en la
@@ -621,40 +654,16 @@ class ExecuteSwap:
 
         La clave se pide aquí, que es el último momento posible, y se suelta al
         salir de la función: no se guarda en el objeto ni se pasa a nadie más.
+        La secuencia de red y firma vive en `infra.evm.dispatch`, compartida con
+        los otros dos caminos que emiten: era la misma en los tres y tenerla
+        copiada es lo que permite que una copia se desvíe sin que se note.
         """
-        key = self.keys.require()
-        owner = address_from_key(key)
-
-        await broadcaster.require_chain(unsigned.chain_id)
-        nonce = await broadcaster.pending_nonce(owner)
-        gas_limit, gas_source = await broadcaster.resolve_gas_limit(
-            unsigned, from_address=owner
-        )
-        fees = await broadcaster.read_fees()
-
-        signed = sign_eip1559(
+        return await sign_and_send(
             unsigned,
-            private_key=key,
-            nonce=nonce,
-            gas_limit=gas_limit,
-            max_fee_per_gas=fees.max_fee_per_gas,
-            max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
+            broadcaster,
+            private_key=self.keys.require(),
+            expected_to=expected_to,
         )
-        # Se anota el hash y el gas, nunca la clave. `structlog` ya enmascara
-        # `private_key`/`passphrase` por si algún día alguien la pasa, pero aquí
-        # no se pasa.
-        _log.info(
-            "execution.signing",
-            chain=broadcaster.chain_key,
-            to=unsigned.to_address,
-            nonce=nonce,
-            gas_limit=gas_limit,
-            gas_source=gas_source,
-            max_fee_per_gas=fees.max_fee_per_gas,
-            tip=fees.max_priority_fee_per_gas,
-            tx_hash=signed.tx_hash,
-        )
-        return await broadcaster.send(signed, expected_to=expected_to)
 
     # --------------------------------------------------------------- apoyo  #
     def address(self) -> str | None:

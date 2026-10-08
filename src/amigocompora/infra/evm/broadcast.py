@@ -87,6 +87,19 @@ def selector(signature: str) -> str:
 
 SELECTOR_ALLOWANCE: Final = selector("allowance(address,address)")
 SELECTOR_APPROVE: Final = selector("approve(address,uint256)")
+#: El de sacar un ERC-20 de la cartera. Se calcula con keccak como los demás: un
+#: selector escrito de memoria llama a otra función del mismo contrato, y en el
+#: caso de una retirada eso es dinero que sale hacia donde no toca.
+SELECTOR_TRANSFER: Final = selector("transfer(address,uint256)")
+#: El de consultar un saldo ERC-20 antes de retirarlo.
+SELECTOR_BALANCE_OF: Final = selector("balanceOf(address)")
+
+#: Los dos del ERC-1155, que es el estándar de las participaciones de un mercado
+#: de predicción. `isApprovedForAll` es de sólo lectura y `setApprovalForAll`
+#: escribe un booleano, no un importe: el estándar no tiene permiso por
+#: cantidad, y por eso el camino que lo concede tiene que decirlo al usuario.
+SELECTOR_IS_APPROVED_FOR_ALL: Final = selector("isApprovedForAll(address,address)")
+SELECTOR_SET_APPROVAL_FOR_ALL: Final = selector("setApprovalForAll(address,bool)")
 
 #: `Permit2.approve(token, spender, amount, expiration)`. Permit2 no es un router:
 #: es el contrato por el que pasan los routers modernos, y tiene su propio
@@ -258,6 +271,46 @@ def build_approve_calldata(spender: str, amount_raw: int) -> str:
     return SELECTOR_APPROVE + word_address(spender) + word_uint(amount_raw)
 
 
+def build_transfer_calldata(recipient: str, amount_raw: int) -> str:
+    """`transfer(to, amount)` codificado: sacar un ERC-20 de la cartera.
+
+    Es la llamada con la que se retira un token, y por eso **no** lleva el
+    `from`: en ERC-20 el origen es siempre `msg.sender`, así que la única forma
+    de mover el saldo de otro es `transferFrom` con un permiso previo. Eso es
+    exactamente lo que aquí no se quiere —una retirada no debe necesitar que
+    nadie haya aprobado nada— y por eso se emite desde la propia cartera.
+    """
+    return SELECTOR_TRANSFER + word_address(recipient) + word_uint(amount_raw)
+
+
+def build_balance_of_calldata(owner: str) -> str:
+    """`balanceOf(owner)` codificado, para un `eth_call` de sólo lectura."""
+    return SELECTOR_BALANCE_OF + word_address(owner)
+
+
+def build_is_approved_for_all_calldata(owner: str, operator: str) -> str:
+    """`isApprovedForAll(owner, operator)` codificado, para un `eth_call`."""
+    return SELECTOR_IS_APPROVED_FOR_ALL + word_address(owner) + word_address(operator)
+
+
+def build_set_approval_for_all_calldata(operator: str, *, approved: bool) -> str:
+    """`setApprovalForAll(operator, approved)` codificado, para una transacción.
+
+    **No tiene variante con importe**, y eso no es un olvido de esta función: el
+    estándar ERC-1155 no la tiene. Un ERC-20 se puede autorizar por la cantidad
+    exacta que se va a mover —y así se hace aquí—, pero el permiso sobre un
+    ERC-1155 es un booleano por colección y operador: o se tiene o no se tiene, y
+    con él se pueden mover **todas** las participaciones de esa colección, no
+    sólo las de esta operación.
+
+    Por eso el camino que la usa lo dice en el diálogo con esas palabras. Un
+    permiso sin límite presentado como si lo tuviera sería peor que el permiso:
+    sería una decisión tomada sobre una descripción falsa.
+    """
+    bandera = word_uint(1 if approved else 0)
+    return SELECTOR_SET_APPROVAL_FOR_ALL + word_address(operator) + bandera
+
+
 def build_permit2_approve_calldata(
     token: str,
     spender: str,
@@ -426,6 +479,28 @@ class EvmBroadcaster:
         raw = await self._pool.call("eth_getTransactionCount", [address, "pending"])
         return _parse_quantity(raw, field="el nonce pendiente")
 
+    async def native_balance(self, address: str) -> int:
+        """El saldo nativo en la unidad mínima (wei, gwei…), no en unidades humanas.
+
+        Entero y no `Decimal`: es el mismo tipo que usa `UnsignedTransaction.value`,
+        así que compararlos no pasa por coma flotante en ningún punto.
+        """
+        raw = await self._pool.call("eth_getBalance", [address, "latest"])
+        return _parse_quantity(raw, field="el saldo nativo")
+
+    async def token_balance(self, token: str, owner: str) -> int:
+        """El saldo de un ERC-20, en su unidad mínima.
+
+        Se lee del contrato del token y no de un índice: el índice puede ir por
+        detrás, y un saldo por detrás haría rechazar una retirada que sí cabe —o
+        aceptar una que no—. La cadena es la única fuente que no llega tarde.
+        """
+        raw = await self._pool.call(
+            "eth_call",
+            [{"to": token, "data": build_balance_of_calldata(owner)}, "latest"],
+        )
+        return _return_word(raw, 0, field="el saldo del token")
+
     async def read_fees(self) -> NetworkFees:
         """Base fee y propina de la red, y el techo que sale de la política.
 
@@ -492,6 +567,30 @@ class EvmBroadcaster:
             [{"to": token, "data": build_allowance_calldata(owner, spender)}, "latest"],
         )
         return _parse_quantity(raw, field="el allowance")
+
+    async def read_operator_approval(
+        self, collection: str, owner: str, operator: str
+    ) -> bool:
+        """Si `operator` puede mover **toda** la colección ERC-1155 de `owner`.
+
+        Es la pregunta equivalente a `read_allowance` para un token que no es
+        ERC-20, y la diferencia no es de forma: no hay importe que leer. El
+        estándar contesta sí o no, y ese «sí» alcanza a todas las participaciones
+        de esa colección. Se comprueba de verdad, en vez de suponer que no está
+        concedido, porque quien ya lo concedió no tiene por qué volver a pagar el
+        gas de concederlo.
+        """
+        raw = await self._pool.call(
+            "eth_call",
+            [
+                {
+                    "to": collection,
+                    "data": build_is_approved_for_all_calldata(owner, operator),
+                },
+                "latest",
+            ],
+        )
+        return _parse_quantity(raw, field="el permiso de operador") != 0
 
     async def read_permit2_allowance(
         self, permit2: str, token: str, owner: str, spender: str

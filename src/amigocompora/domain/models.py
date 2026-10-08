@@ -8,6 +8,7 @@ nunca `float` (ver `money`).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -378,6 +379,240 @@ class Quote:
         return f"{self.venue.name}: {self.amount_in} → {self.amount_out} ({self.price})"
 
 
+# --------------------------------------------------------------------------- #
+# Puentes entre redes
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class BridgeRequest:
+    """Mover un token de una red a otra, con el mismo token o con otro distinto.
+
+    ### Por qué esto **no** es un `TradingPair`
+
+    `TradingPair.__post_init__` rechaza que las dos patas estén en redes
+    distintas, y hace bien: un par es una pregunta sobre un mercado, y un mercado
+    vive en una sola red. Un puente es lo contrario —su razón de ser es cruzar—,
+    así que expresarlo como par obligaría a relajar la invariante que protege todo
+    lo demás. De ahí un modelo propio en vez de un `Quote`.
+
+    Las dos patas llevan su red cada una, y por eso no hace falta un campo
+    `from_chain`/`to_chain` aparte: el token ya la lleva, y dos sitios donde
+    decir lo mismo es un sitio donde pueden discrepar.
+    """
+
+    origin: Token
+    destination: Token
+    amount_in: TokenAmount
+
+    def __post_init__(self) -> None:
+        if self.origin.chain == self.destination.chain:
+            raise CurrencyMismatchError(
+                f"las dos patas de un puente están en «{self.origin.chain}»: para "
+                f"cambiar dos tokens de la misma red se usa un swap, no un puente. "
+                f"Un puente que no cruza no tiene ruta que buscar."
+            )
+        if self.amount_in.raw <= 0:
+            raise InvalidAmountError(
+                f"el importe a mover debe ser positivo, llegó {self.amount_in}"
+            )
+        # El importe tiene que ser del token de origen: si no, se estaría pidiendo
+        # mover una cantidad de un token distinto al que se entrega, y la cifra
+        # que se compara contra los topes no sería la que sale de la cartera.
+        if (
+            self.amount_in.symbol != self.origin.symbol
+            or self.amount_in.decimals != self.origin.decimals
+        ):
+            raise CurrencyMismatchError(
+                f"el importe {self.amount_in} no es del token de origen "
+                f"({self.origin.symbol}): no se puede mover una cantidad que no es "
+                f"la que se entrega."
+            )
+
+    @property
+    def symbol(self) -> str:
+        """Cómo se nombra este puente: `USDC@base → USDC@polygon`."""
+        return (
+            f"{self.origin.symbol}@{self.origin.chain} → "
+            f"{self.destination.symbol}@{self.destination.chain}"
+        )
+
+    @property
+    def chains(self) -> tuple[str, str]:
+        """Las dos redes que toca, origen primero."""
+        return (self.origin.chain, self.destination.chain)
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeQuote:
+    """Una ruta concreta para un `BridgeRequest`, con lo que cuesta y lo que tarda.
+
+    ### Lo que se ordena
+
+    `amount_out` es la cifra con la que se comparan dos rutas, y por eso es la
+    única que **tiene** que existir. Las dos patas del destino son el mismo token
+    —la petición lo fija—, así que dos importes de salida son directamente
+    comparables y la mejor ruta es la que más entrega.
+
+    `amount_out_min` es el suelo garantizado, y no es un adorno: en un puente la
+    diferencia entre lo estimado y lo mínimo es lo que absorbe el movimiento del
+    mercado mientras la transacción viaja, y un puente tarda minutos, no bloques.
+    Enseñar sólo la estimación sería prometer una cifra que nadie garantiza.
+
+    ### Lo que puede faltar, y por qué se dice
+
+    `fee` es `None` cuando la fuente no desglosa la comisión —el mismo criterio
+    que `Quote.fee_bps`: una comisión publicada de cero no se acepta nunca, y una
+    inventada es peor que un hueco—. `duration_seconds` es `None` cuando la
+    fuente no lo publica. Ninguno de los dos impide comparar, porque la
+    comparación la decide `amount_out`.
+    """
+
+    engine_id: str
+    #: El puente que de verdad se usó por debajo (Across, Stargate, Relay…). Un
+    #: agregado reparte entre varios, y saber cuál eligió es la mitad de entender
+    #: por qué el precio es el que es.
+    provider: str
+    request: BridgeRequest
+    amount_out: TokenAmount
+    amount_out_min: TokenAmount
+    fee: TokenAmount | None = None
+    fee_basis: Measurement | None = None
+    duration_seconds: int | None = None
+    observed_at: datetime | None = None
+    #: Por dónde pasa la ruta, en texto, tal como lo publica la fuente.
+    route: str = ""
+    source_note: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.engine_id:
+            raise InvalidAmountError("una ruta de puente necesita el motor que la produjo")
+        if self.amount_out.raw <= 0:
+            raise InvalidAmountError(
+                f"una ruta de puente sin importe de salida no describe nada, llegó "
+                f"{self.amount_out}"
+            )
+        if self.amount_out_min.raw < 0 or self.amount_out_min.raw > self.amount_out.raw:
+            # Un mínimo por encima del estimado es una respuesta que se
+            # contradice: no se puede garantizar más de lo que se espera recibir.
+            raise InvalidAmountError(
+                f"el mínimo garantizado ({self.amount_out_min}) no puede superar lo "
+                f"estimado ({self.amount_out})"
+            )
+        if self.amount_out.decimals != self.request.destination.decimals:
+            raise CurrencyMismatchError(
+                f"el importe de salida {self.amount_out} no está en la escala del "
+                f"token de destino ({self.request.destination.symbol}, "
+                f"{self.request.destination.decimals} decimales): compararlo con otra "
+                f"ruta daría una cifra falsa."
+            )
+        for campo, importe in (
+            ("amount_out", self.amount_out),
+            ("amount_out_min", self.amount_out_min),
+        ):
+            if importe.symbol != self.request.destination.symbol:
+                raise CurrencyMismatchError(
+                    f"{campo} es {importe.symbol} pero la pata de destino del puente "
+                    f"{self.pair_label} es {self.request.destination.symbol}"
+                )
+        # Los dos van juntos o no va ninguno, igual que en `Quote`: una comisión
+        # sin decir de dónde salió no describe nada.
+        if (self.fee is None) != (self.fee_basis is None):
+            raise InvalidAmountError(
+                "la comisión y su procedencia van juntas: una comisión sin decir "
+                "cómo se obtuvo es una cifra que nadie puede comprobar."
+            )
+
+    @property
+    def pair_label(self) -> str:
+        return self.request.symbol
+
+    @property
+    def fee_bps(self) -> BasisPoints | None:
+        """La comisión sobre lo **entregado**, o `None` si no se desglosa.
+
+        Sobre lo entregado y no sobre lo recibido porque es lo que sale de la
+        cartera, que es lo que el usuario reconoce. Mezclar bases —una ruta que
+        la publica sobre la entrada y otra sobre la salida— haría que la
+        comparación de comisiones significara dos cosas distintas.
+        """
+        if self.fee is None:
+            return None
+        delivered = self.request.amount_in
+        if self.fee.symbol != delivered.symbol or self.fee.decimals != delivered.decimals:
+            return None
+        base = delivered.as_decimal()
+        if base <= 0:
+            return None
+        return BasisPoints.from_ratio(EXACT.divide(self.fee.as_decimal(), base))
+
+    @property
+    def duration_label(self) -> str:
+        """La duración en palabras, o que no se sabe."""
+        if self.duration_seconds is None:
+            return "sin dato"
+        seconds = self.duration_seconds
+        if seconds < 60:
+            return f"{seconds} s"
+        if seconds < 3_600:
+            return f"{seconds // 60} min"
+        return f"{seconds / 3_600:.1f} h"
+
+    @property
+    def is_cross_chain(self) -> bool:
+        """Siempre sí, por construcción: lo garantiza `BridgeRequest`."""
+        return self.request.origin.chain != self.request.destination.chain
+
+    def __str__(self) -> str:
+        return (
+            f"{self.provider} ({self.engine_id}): {self.request.amount_in} → "
+            f"{self.amount_out} en {self.pair_label}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeRoute:
+    """Una ruta de puente, con su cotización y quién la firma.
+
+    No añade nada que no esté en `BridgeQuote` salvo el orden, y el orden existe
+    para que la interfaz no lo recalcule: si la pantalla ordenara por su cuenta y
+    el caso de uso por la suya, la ruta que se enseña como mejor podría no ser la
+    que se ejecuta. Se ordena **una vez**, aquí.
+    """
+
+    quote: BridgeQuote
+    #: Posición en la lista ordenada, empezando en 1. Es lo que se enseña.
+    position: int
+
+    @property
+    def is_best(self) -> bool:
+        return self.position == 1
+
+
+def rank_bridges(quotes: Sequence[BridgeQuote]) -> tuple[BridgeRoute, ...]:
+    """Ordena las rutas de mejor a peor por lo que entregan.
+
+    El desempate importa y es deliberado: a igualdad de importe recibido gana el
+    que **garantiza** más (`amount_out_min`), y si también empatan, el que tarda
+    menos. Nunca se desempata por el orden en que llegaron las respuestas, porque
+    eso haría que la mejor ruta dependiera de qué servidor contestó antes — un
+    dato que no dice nada sobre el precio y que cambiaría de una consulta a la
+    siguiente.
+
+    Y no se descarta ninguna por tener peor precio: enseñar sólo la mejor
+    escondería que la segunda está a un 0,1 %, que es justo lo que permite
+    decidir si merece la pena esperar a que la primera se recupere.
+    """
+    ordered = sorted(
+        quotes,
+        key=lambda q: (
+            -q.amount_out.raw,
+            -q.amount_out_min.raw,
+            q.duration_seconds if q.duration_seconds is not None else 2**31,
+            q.engine_id,
+        ),
+    )
+    return tuple(BridgeRoute(quote=quote, position=i) for i, quote in enumerate(ordered, start=1))
+
+
 @dataclass(frozen=True, slots=True)
 class PriceComparison:
     """Las cotizaciones de un mismo `amount_in` en varios venues.
@@ -476,6 +711,88 @@ class PriceComparison:
 
 
 @dataclass(frozen=True, slots=True)
+class BridgeComparison:
+    """Las rutas que devolvieron todos los motores de puentes activos, ordenadas.
+
+    Guarda `BridgeRoute` y no `BridgeQuote` porque el orden se decide **una vez**
+    —en `rank_bridges`, al construir esto— y la interfaz sólo lo lee. Si la
+    pantalla ordenara por su cuenta, la ruta que se enseña como mejor podría no
+    ser la que se ejecuta cuando alguien pulse el botón, y esa diferencia se paga
+    con dinero.
+
+    `failed_engines` existe por la misma razón que en `PriceComparison`: una tabla
+    con las rutas de dos motores donde había tres no puede parecer completa. Aquí
+    pesa más todavía, porque el motor que no respondió puede ser justo el que
+    cruzaba en menos tiempo o con menos comisión.
+    """
+
+    request: BridgeRequest
+    routes: tuple[BridgeRoute, ...]
+    failed_engines: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.routes:
+            raise InvalidAmountError("una comparación de puentes necesita una ruta")
+        for position, route in enumerate(self.routes, start=1):
+            # El orden viene impuesto y la posición se enseña, así que una lista
+            # desordenada —o con posiciones repetidas— no sería un detalle de
+            # presentación: sería una tabla que numera mal la mejor ruta.
+            if route.position != position:
+                raise InvalidAmountError(
+                    f"las rutas de un puente vienen ordenadas y numeradas: la "
+                    f"{position}ª trae la posición {route.position}."
+                )
+            if route.quote.request != self.request:
+                raise CurrencyMismatchError(
+                    f"la ruta de {route.quote.provider} cruza "
+                    f"{route.quote.pair_label}, no {self.request.symbol}"
+                )
+
+    @property
+    def best(self) -> BridgeRoute:
+        """La mejor ruta: la primera, que es la que se ofrece ejecutar."""
+        return self.routes[0]
+
+    @property
+    def has_unknown_fees(self) -> bool:
+        """Si alguna ruta no desglosa su comisión.
+
+        Distinto de que sea cara: aquí lo que falta es el dato. Se enseña aparte
+        porque una ruta sin comisión declarada parece gratis, y elegir la que
+        parece gratis es exactamente el error que este aviso evita.
+
+        Se mira `fee_bps` y no `fee`: un importe de comisión en una moneda que no
+        es la entregada tampoco se puede comparar con los demás, así que cuenta
+        como no desglosada — que es justo lo que `fee_bps` devuelve en ese caso.
+        """
+        return any(route.quote.fee_bps is None for route in self.routes)
+
+    @property
+    def has_partial_sources(self) -> bool:
+        """Si algún motor consultado no llegó a responder."""
+        return bool(self.failed_engines)
+
+    @property
+    def observed_at(self) -> datetime:
+        """La observación más antigua: la frescura es la del dato más viejo.
+
+        Exige que **todas** las rutas traigan su hora. Si a una le falta, la edad
+        del conjunto no se sabe —y devolver la más antigua de las que sí la traen
+        afirmaría una frescura sobre una ruta de la que no consta nada—. Los dos
+        motores de puentes la publican siempre, así que esto no es un caso que
+        ocurra: es lo que impide que ocurra sin que nadie se entere.
+        """
+        moments = [route.quote.observed_at for route in self.routes]
+        if any(moment is None for moment in moments):
+            raise InvalidAmountError(
+                "no se puede fechar la comparación: alguna ruta no declara cuándo "
+                "se observó, y la frescura de una comparación es la de su dato más "
+                "viejo."
+            )
+        return min(moment for moment in moments if moment is not None)
+
+
+@dataclass(frozen=True, slots=True)
 class Opportunity:
     """Discrepancia observada entre dos venues para el mismo tamaño de orden.
 
@@ -515,10 +832,18 @@ class Opportunity:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
 class MarketOutcome:
-    """Un resultado posible y su precio en [0, 1], que es su probabilidad."""
+    """Un resultado posible y su precio en [0, 1], que es su probabilidad.
+
+    `token_id` es el nombre **operable** del resultado: en Polymarket es el
+    `tokenId` del ERC-1155 condicional, el número que hay que firmar dentro de
+    una orden. Es `None` en un mercado que sólo se leyó para mirarlo, y eso no lo
+    invalida: el mercado sigue sirviendo para calcular probabilidades y deja de
+    servir para operar. Quien quiera distinguirlo tiene `is_tradeable`.
+    """
 
     label: str
     price: Decimal
+    token_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.label:
@@ -527,6 +852,21 @@ class MarketOutcome:
             raise InvalidAmountError(
                 f"el precio de «{self.label}» debe estar en [0, 1], llegó {self.price}"
             )
+        if self.token_id is not None and not self.token_id.isdigit():
+            # Se exige que sea una cadena de dígitos y no cualquier texto: el
+            # `tokenId` de un ERC-1155 es un `uint256`, y en JSON viaja como
+            # cadena precisamente porque no cabe en un número de coma flotante
+            # sin perder dígitos. Aceptar aquí algo que no sea eso trasladaría el
+            # fallo a la firma, que es donde ya cuesta dinero.
+            raise InvalidAmountError(
+                f"el identificador del resultado «{self.label}» debe ser el "
+                f"uint256 en decimal, llegó {self.token_id!r}"
+            )
+
+    @property
+    def is_tradeable(self) -> bool:
+        """Si este resultado se puede nombrar dentro de una orden."""
+        return self.token_id is not None
 
     @property
     def implied_probability(self) -> Decimal:
@@ -539,7 +879,14 @@ class MarketOutcome:
 
 @dataclass(frozen=True, slots=True)
 class PredictionMarket:
-    """Un mercado de predicción con sus resultados mutuamente excluyentes."""
+    """Un mercado de predicción con sus resultados mutuamente excluyentes.
+
+    Los cuatro campos que siguen a `closes_at` son los que convierten un mercado
+    **legible** en uno **operable**, y todos valen `None` por omisión para que un
+    mercado leído sin ellos siga siendo un mercado válido. Lo que no se puede es
+    firmar una orden contra un mercado del que no constan: `is_tradeable` lo dice
+    y `tradeability_blockers` explica cuál falta.
+    """
 
     market_id: str
     venue: Venue
@@ -547,6 +894,26 @@ class PredictionMarket:
     outcomes: tuple[MarketOutcome, ...]
     observed_at: datetime
     closes_at: datetime | None = None
+    #: Identificador del mercado en la cadena: en Polymarket, el `conditionId`
+    #: del contrato de tokens condicionales. Es el «mercado» que el CLOB pide al
+    #: publicar una orden, distinto del `market_id` con el que la fuente lo
+    #: nombra en sus listados.
+    condition_id: str | None = None
+    #: Si el mercado pertenece a un conjunto de resultados excluyentes que
+    #: comparten colateral. No es cosmético: decide **contra qué contrato** se
+    #: firma la orden, porque Polymarket tiene un contrato de intercambio general
+    #: y otro para estos mercados.
+    #:
+    #: Es `bool | None` y no `bool` a propósito: `False` afirma «este mercado no
+    #: es de ese tipo», y esa es una afirmación que sólo se puede hacer cuando la
+    #: fuente lo ha dicho. Con `None` no se puede firmar, que es lo correcto.
+    neg_risk: bool | None = None
+    #: Salto mínimo de precio admitido. Fuera de él la orden se rechaza, así que
+    #: es la tabla con la que hay que redondear antes de firmar.
+    tick_size: Decimal | None = None
+    #: Participaciones mínimas por orden. Medido: en Polymarket son 5, y no es un
+    #: detalle de la interfaz —una orden por debajo se rechaza entera—.
+    min_order_size: Decimal | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
@@ -559,6 +926,20 @@ class PredictionMarket:
         labels = [outcome.label for outcome in self.outcomes]
         if len(set(labels)) != len(labels):
             raise InvalidAmountError(f"resultados duplicados en «{self.question}»")
+        if self.tick_size is not None and not (
+            self.tick_size.is_finite() and Decimal(0) < self.tick_size < Decimal(1)
+        ):
+            raise InvalidAmountError(
+                f"el salto de precio de «{self.question}» debe estar en (0, 1), "
+                f"llegó {self.tick_size}"
+            )
+        if self.min_order_size is not None and not (
+            self.min_order_size.is_finite() and self.min_order_size > 0
+        ):
+            raise InvalidAmountError(
+                f"el mínimo por orden de «{self.question}» debe ser positivo, "
+                f"llegó {self.min_order_size}"
+            )
 
     @property
     def total_implied_probability(self) -> Decimal:
@@ -599,6 +980,524 @@ class PredictionMarket:
         if self.closes_at is None or self.closes_at <= now:
             return None
         return self.closes_at - now
+
+    def outcome(self, label: str) -> MarketOutcome | None:
+        """El resultado con esa etiqueta, o `None`. La comparación es exacta.
+
+        Exacta y no «que contenga»: «Up» está contenido en «Up or Down», y
+        elegir el resultado equivocado por una coincidencia parcial es la forma
+        más silenciosa de comprar lo contrario de lo que se quería.
+        """
+        return next((item for item in self.outcomes if item.label == label), None)
+
+    @property
+    def is_tradeable(self) -> bool:
+        """Si se puede construir y firmar una orden contra este mercado."""
+        return not self.tradeability_blockers()
+
+    def tradeability_blockers(self) -> tuple[str, ...]:
+        """Por qué **no** se puede operar, en castellano y en orden de lectura.
+
+        Devuelve una lista y no un booleano porque la interfaz tiene que poder
+        apagar el botón **diciendo el motivo**: «no se puede» sin decir qué falta
+        obliga al usuario a adivinar si el problema es su saldo, su configuración
+        o el mercado. Un mercado leído sin estos datos sigue siendo un mercado
+        perfectamente válido para mirar; lo único que no es es operable.
+        """
+        faltas: list[str] = []
+        if self.condition_id is None:
+            faltas.append("la fuente no publicó el identificador del mercado")
+        if self.neg_risk is None:
+            faltas.append("no consta si el mercado comparte colateral con otros")
+        if self.tick_size is None:
+            faltas.append("no consta el salto mínimo de precio")
+        if self.min_order_size is None:
+            faltas.append("no consta el mínimo de participaciones por orden")
+        without_id = [o.label for o in self.outcomes if o.token_id is None]
+        if without_id:
+            faltas.append(
+                "la fuente no publicó el identificador de "
+                + ("los resultados " if len(without_id) > 1 else "del resultado ")
+                + ", ".join(without_id)
+            )
+        return tuple(faltas)
+
+
+# --------------------------------------------------------------------------- #
+# Posiciones: lo que ya se tiene
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class PredictionPosition:
+    """Participaciones que una cartera tiene en un resultado, según el recinto.
+
+    Es la mitad que faltaba entre «mercado» y «cartera». Un mercado dice lo que
+    **se puede** comprar; una posición dice lo que **se tiene**, y sólo lo
+    segundo se puede cobrar. Se lee del recinto por cartera y no se deduce de las
+    órdenes publicadas: entre publicar y tener hay un cruce que ocurre en el
+    libro de otro, así que la única fuente de «cuánto tengo» es quien lo custodía.
+
+    **`redeemable` es del recinto, no una cuenta nuestra.** Que un mercado haya
+    resuelto y que la posición se pueda cobrar ya son lo mismo en el dato que
+    publica Polymarket, y recalcularlo aquí a partir de la fecha de cierre sería
+    inventar una segunda verdad que puede discrepar de la primera —el mercado
+    puede resolver antes o después de la fecha, y una posición perdedora no se
+    cobra nunca—. Se copia el hecho y se enseña.
+
+    `shares` es el número de participaciones, y cada una paga 1 unidad de
+    colateral si acierta. Por eso `payout` es `shares` y no `shares x precio`: al
+    cobrar no se vende a un precio, se cambia la participación por su valor
+    nominal. El precio actual (`cur_price`) sólo sirve para valorar lo que
+    todavía **no** se puede cobrar.
+    """
+
+    venue: Venue
+    #: El `conditionId` del contrato de tokens condicionales. Es a la vez el
+    #: mercado y la clave con la que se cobra: `redeemPositions` lo pide.
+    condition_id: str
+    question: str
+    outcome_label: str
+    #: El `tokenId` del ERC-1155, que identifica el resultado dentro del mercado.
+    token_id: str
+    shares: Decimal
+    observed_at: datetime
+    redeemable: bool = False
+    #: Si el mercado comparte colateral con otros. Decide **contra qué contrato**
+    #: se cobra, y cobrar contra el que no es revierte. `None` significa que el
+    #: recinto no lo dijo, y con `None` no se construye nada.
+    neg_risk: bool | None = None
+    #: Precio actual de la participación, para poder valorar lo que aún no se
+    #: puede cobrar. Puede faltar: no todas las fuentes lo publican.
+    cur_price: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        _require_aware(self.observed_at, "observed_at")
+        if not self.condition_id:
+            raise InvalidAmountError(
+                f"la posición en «{self.question}» llegó sin el identificador del "
+                f"mercado, y sin él no se puede cobrar"
+            )
+        if not self.token_id:
+            raise InvalidAmountError(
+                f"la posición en «{self.question}» llegó sin el identificador del "
+                f"resultado"
+            )
+        if self.shares <= 0:
+            raise InvalidAmountError(
+                f"una posición de cero participaciones no es una posición, llegó "
+                f"{self.shares} en «{self.question}»"
+            )
+        if self.cur_price is not None and not (
+            Decimal(0) <= self.cur_price <= Decimal(1)
+        ):
+            raise InvalidAmountError(
+                f"el precio de una participación está en [0, 1], llegó "
+                f"{self.cur_price} en «{self.question}»"
+            )
+
+    @property
+    def payout(self) -> Decimal:
+        """Lo que se cobra al redimir: una participación ganadora paga 1.
+
+        Sin restar comisión, porque redimir no la tiene: la comisión ya se pagó
+        al entrar. Lo que devuelve esto es el importe **bruto** que el contrato
+        transferirá, que es exactamente lo que hay que enseñar antes de firmar.
+        """
+        return self.shares
+
+    @property
+    def redeemability_blockers(self) -> tuple[str, ...]:
+        """Por qué **no** se puede cobrar esta posición, en orden de lectura.
+
+        Gemelo de `PredictionMarket.tradeability_blockers`, y por la misma razón:
+        un botón apagado sin motivo se lee como «esto no funciona» y empuja a
+        buscar la forma de saltárselo. Aquí, además, el motivo más común —«este
+        mercado todavía no ha resuelto»— no es un fallo de nadie, y decirlo así
+        evita que parezca uno.
+        """
+        faltas: list[str] = []
+        if not self.redeemable:
+            faltas.append(
+                "el mercado todavía no ha resuelto, así que estas participaciones "
+                "todavía no se pueden cambiar por colateral"
+            )
+        if self.neg_risk is None:
+            faltas.append(
+                "no consta si el mercado comparte colateral con otros, y eso "
+                "decide contra qué contrato se cobra"
+            )
+        elif self.neg_risk:
+            # Los mercados de resultados excluyentes no se cobran contra el
+            # contrato condicional como los demás: sus participaciones pasan por
+            # un adaptador que las convierte, y ese camino **no está medido** en
+            # este programa. Se dice así y no se construye nada. Rellenar el
+            # hueco con una dirección copiada de la documentación sería firmar
+            # contra una suposición, y un cobro contra el contrato equivocado
+            # quema gas y no devuelve nada — o peor, si el contrato tiene una
+            # función con el mismo nombre y otra semántica.
+            faltas.append(
+                "este mercado comparte colateral con otros y se cobra por un "
+                "adaptador distinto del contrato condicional; ese camino no está "
+                "medido todavía, así que no se firma"
+            )
+        return tuple(faltas)
+
+    @property
+    def is_redeemable(self) -> bool:
+        return not self.redeemability_blockers
+
+
+# --------------------------------------------------------------------------- #
+# Profundidad de libro
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class DepthLevel:
+    """Un precio del libro y cuántas participaciones hay a ese precio."""
+
+    price: Decimal
+    size: Decimal
+
+    def __post_init__(self) -> None:
+        if not (Decimal(0) < self.price < Decimal(1)):
+            raise InvalidAmountError(
+                f"un nivel de libro debe estar en (0, 1), llegó {self.price}"
+            )
+        if self.size <= 0:
+            raise InvalidAmountError(
+                f"un nivel de libro necesita tamaño positivo, llegó {self.size}"
+            )
+
+    @property
+    def notional(self) -> Decimal:
+        return EXACT.multiply(self.price, self.size)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDepth:
+    """Lo que de verdad hay en el libro de un resultado, ordenado de mejor a peor.
+
+    Existe porque un precio publicado es una **opinión** y el libro es un hecho.
+    La probabilidad implícita de un resultado es el último precio cruzado; lo que
+    costaría comprar cinco participaciones **ahora** es otra cosa, y para un
+    tamaño dado la diferencia puede ser el margen entero de una operación.
+
+    Los dos lados vienen ordenados de mejor a peor desde el punto de vista de
+    quien **cruza**: la mejor compra (el `bid` más alto) primero, y la mejor
+    venta (el `ask` más bajo) primero. Así, recorrer una lista para calcular el
+    coste de un tamaño es recorrerla en el orden en que se consumiría.
+
+    `bids` y `asks` pueden estar vacíos: un libro de un solo lado es normal en un
+    mercado que acaba de abrir o que está a punto de cerrar.
+    """
+
+    token_id: str
+    bids: tuple[DepthLevel, ...] = ()
+    asks: tuple[DepthLevel, ...] = ()
+    tick_size: Decimal | None = None
+    min_order_size: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.token_id.isdigit():
+            raise InvalidAmountError(
+                f"el libro necesita el uint256 del resultado, llegó {self.token_id!r}"
+            )
+        for nombre, niveles, mejor_primero in (
+            ("las compras", self.bids, True),
+            ("las ventas", self.asks, False),
+        ):
+            precios = [nivel.price for nivel in niveles]
+            esperado = sorted(precios, reverse=mejor_primero)
+            if precios != esperado:
+                # Se comprueba el orden porque de él depende todo lo que se
+                # calcula después: un libro ordenado al revés produciría un coste
+                # más caro que el real, y un cálculo que se equivoca siempre en
+                # la misma dirección se acaba dando por bueno.
+                raise InvalidAmountError(
+                    f"{nombre} del libro no vienen de mejor a peor: {precios}"
+                )
+
+    @property
+    def best_bid(self) -> Decimal | None:
+        """Lo máximo que ofrecen por una participación. `None` si no hay compras."""
+        return self.bids[0].price if self.bids else None
+
+    @property
+    def best_ask(self) -> Decimal | None:
+        """Lo mínimo que cuesta una participación. `None` si no hay ventas."""
+        return self.asks[0].price if self.asks else None
+
+    @property
+    def spread(self) -> Decimal | None:
+        """El hueco entre lo que piden y lo que ofrecen, o `None` sin los dos lados."""
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return self.best_ask - self.best_bid
+
+    @property
+    def available_to_buy(self) -> Decimal:
+        """Cuántas participaciones se podrían comprar cruzando todo el libro."""
+        return sum((nivel.size for nivel in self.asks), Decimal(0))
+
+    @property
+    def available_to_sell(self) -> Decimal:
+        """Cuántas participaciones se podrían vender cruzando todo el libro."""
+        return sum((nivel.size for nivel in self.bids), Decimal(0))
+
+    def cost_to_buy(self, shares: Decimal) -> Decimal | None:
+        """Lo que costaría comprar exactamente esas participaciones, o `None`.
+
+        Devuelve `None` cuando el libro **no llega**: pedir un tamaño que el
+        libro no tiene y devolver el coste de la parte que sí cabe daría un
+        número con pinta de precio y sin serlo. Distinguir «no cabe» de «cuesta
+        esto» es lo que permite decidir en vez de adivinar.
+        """
+        return _walk(self.asks, shares, consume=_cost)
+
+    def proceeds_to_sell(self, shares: Decimal) -> Decimal | None:
+        """Lo que darían por exactamente esas participaciones, o `None` si no llega."""
+        return _walk(self.bids, shares, consume=_cost)
+
+    def average_price_to_buy(self, shares: Decimal) -> Decimal | None:
+        """El precio medio que resulta de cruzar el libro, o `None` si no llega."""
+        cost = self.cost_to_buy(shares)
+        return None if cost is None else EXACT.divide(cost, shares)
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (
+            ("Mejor compra", str(self.best_bid) if self.best_bid is not None else "sin compras"),
+            ("Mejor venta", str(self.best_ask) if self.best_ask is not None else "sin ventas"),
+            ("Hueco", str(self.spread) if self.spread is not None else "—"),
+            ("Participaciones en venta", f"{self.available_to_buy:f}"),
+            ("Participaciones en compra", f"{self.available_to_sell:f}"),
+        )
+
+
+def _cost(price: Decimal, size: Decimal) -> Decimal:
+    return EXACT.multiply(price, size)
+
+
+def _walk(
+    levels: tuple[DepthLevel, ...],
+    shares: Decimal,
+    *,
+    consume: Callable[[Decimal, Decimal], Decimal],
+) -> Decimal | None:
+    """Recorre los niveles gastando `shares` y suma lo que cuesta.
+
+    `consume` decide qué se acumula —el coste en colateral— para que la misma
+    marcha sirva a los dos lados: comprar gasta `ask x tamaño` y vender ingresa
+    `bid x tamaño`, y la diferencia entre las dos es cuál de las dos listas se
+    recorre, no cómo se suma.
+    """
+    if shares <= 0:
+        return Decimal(0)
+    restante = shares
+    total = Decimal(0)
+    for nivel in levels:
+        if restante <= 0:
+            break
+        tomado = min(restante, nivel.size)
+        total += consume(nivel.price, tomado)
+        restante -= tomado
+    if restante > 0:
+        return None
+    return total
+
+
+# --------------------------------------------------------------------------- #
+# Órdenes de mercado de predicción
+# --------------------------------------------------------------------------- #
+class PredictionSide(StrEnum):
+    """De qué lado va una orden.
+
+    Se llaman `BUY`/`SELL` y no «sí»/«no» porque describen la **operación**, no
+    el resultado: se puede comprar «No» y eso es un `BUY`. Confundir las dos
+    cosas es comprar lo contrario de lo que se quería.
+    """
+
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionOrder:
+    """Una orden de predicción construida y **todavía sin firmar**.
+
+    Describe el intercambio completo: cuántas participaciones, a qué precio como
+    mucho, y qué se paga o se cobra por ellas. `price` y `size` ya vienen
+    redondeados por el motor a las reglas del mercado —el salto de precio y el
+    mínimo de participaciones—, porque redondear es responsabilidad de quien
+    conoce la tabla del recinto, y aquí se **comprueba** que se cumplen en vez de
+    darlas por buenas: un precio fuera del salto hace que el recinto rechace la
+    orden entera, y descubrirlo al firmar es descubrirlo tarde.
+
+    El lado del colateral —lo que de verdad se mueve— es `cost`: en una compra
+    son dólares que salen, en una venta son dólares que entran, y en los dos
+    casos es `precio x participaciones`. Es el número que se mide contra los
+    topes y el que el usuario necesita ver antes de firmar.
+    """
+
+    venue_id: str
+    chain: str
+    market_id: str
+    condition_id: str
+    question: str
+    outcome_label: str
+    token_id: str
+    side: PredictionSide
+    price: Decimal
+    size: Decimal
+    tick_size: Decimal
+    neg_risk: bool
+    #: Tipo de orden del recinto. `GTC` —válida hasta que se cancele— es la
+    #: única que se construye: las de ejecución inmediata no dejan nada que el
+    #: usuario pueda revisar después, y esta entrega existe para poder revisar.
+    order_type: str = "GTC"
+    fee_rate_bps: int = 0
+    nonce: int = 0
+    expiration: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.token_id.isdigit():
+            raise InvalidAmountError(
+                f"el identificador del resultado en «{self.question}» debe ser el "
+                f"uint256 en decimal, llegó {self.token_id!r}"
+            )
+        if not self.tick_size.is_finite() or self.tick_size <= 0:
+            raise InvalidAmountError(
+                f"el salto de precio debe ser positivo, llegó {self.tick_size}"
+            )
+        if not (self.tick_size <= self.price <= Decimal(1) - self.tick_size):
+            # El recinto no admite precios pegados a 0 ni a 1: un precio de 0 es
+            # una orden que nadie puede cruzar y uno de 1 deja al comprador sin
+            # margen. El límite es el propio salto, que es lo que publica la
+            # fuente como rango válido.
+            raise InvalidAmountError(
+                f"el precio {self.price} queda fuera del rango que admite el "
+                f"mercado [{self.tick_size}, {Decimal(1) - self.tick_size}]: la "
+                f"orden se rechazaría."
+            )
+        if self.price % self.tick_size != 0:
+            raise InvalidAmountError(
+                f"el precio {self.price} no es múltiplo del salto {self.tick_size}: "
+                f"el recinto rechaza la orden entera."
+            )
+        if self.size <= 0:
+            raise InvalidAmountError(
+                f"la orden necesita participaciones positivas, llegó {self.size}"
+            )
+
+    @property
+    def cost(self) -> Decimal:
+        """El lado del colateral: lo que se paga al comprar o se cobra al vender."""
+        return EXACT.multiply(self.price, self.size)
+
+    @property
+    def shares(self) -> Decimal:
+        """El lado de participaciones."""
+        return self.size
+
+    @property
+    def is_buy(self) -> bool:
+        return self.side is PredictionSide.BUY
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        """Los campos que el usuario tiene que leer **antes** de firmar."""
+        verbo = "Compras" if self.is_buy else "Vendes"
+        dinero = "Pagas" if self.is_buy else "Cobras"
+        return (
+            ("Mercado", self.question),
+            ("Resultado", f"{self.outcome_label} ({self.side.value})"),
+            ("Red", self.chain),
+            ("Recinto", self.venue_id),
+            (verbo, f"{self.shares} participaciones"),
+            ("Precio límite", f"{self.price} (salto {self.tick_size})"),
+            (dinero, f"{self.cost} de colateral"),
+            ("Tipo", self.order_type),
+            (
+                "Si acierta",
+                f"cada participación paga 1: {self.shares} participaciones = "
+                f"{self.shares} de colateral",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SignedPredictionOrder:
+    """Una orden de predicción **firmada**, lista para publicarse en el recinto.
+
+    Es el hermano de `SignedEvmTransaction` para un recinto que no liquida con
+    una transacción propia sino con una firma que el operador ejecuta después.
+    Comparte lo esencial: existe sólo durante la operación, no se guarda, y de la
+    clave que la produjo no queda rastro salvo `signer`, que es la dirección
+    pública y es justo lo que el usuario necesita ver.
+
+    `payload` es el cuerpo exacto que se envía, ya serializado. Se guarda
+    **serializado** y no como diccionario a propósito: la firma del recinto se
+    calcula sobre esos bytes, así que si alguien reconstruyera el diccionario y
+    volviera a serializarlo con otro orden de claves, la firma dejaría de
+    corresponder a lo enviado. Con los bytes fijados aquí, lo que se firma y lo
+    que se envía son lo mismo por construcción.
+    """
+
+    order: PredictionOrder
+    signer: str
+    signature: str
+    #: El resumen EIP-712 que se firmó. **No es el identificador del recinto.**
+    #:
+    #: Se guarda porque es lo que permite comprobar la firma sin red —recuperar
+    #: la dirección desde ella y ver que es la de la clave— y porque es el dato
+    #: que hace reproducible lo firmado. El identificador con el que el recinto
+    #: nombra la orden lo asigna **él** al aceptarla, y suponer que coincide con
+    #: este resumen sería afirmar sin haberlo medido.
+    digest: str
+    #: El cuerpo exacto que se envía al recinto, ya serializado.
+    #:
+    #: Serializado y no como diccionario a propósito: la firma del recinto se
+    #: calcula sobre **estos bytes**, así que reconstruir el diccionario y
+    #: volver a serializarlo con otro orden de claves produciría unos bytes
+    #: distintos con la misma firma. Fijándolos aquí, lo que se firma y lo que se
+    #: envía son lo mismo por construcción.
+    payload: str
+
+    def __post_init__(self) -> None:
+        if not self.signer:
+            raise InvalidAmountError("una orden firmada necesita decir quién la firma")
+        if not self.signature.startswith("0x"):
+            raise InvalidAmountError("la firma de la orden no es hexadecimal")
+        _require_tx_hash(self.digest, "el resumen firmado de la orden")
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (*self.order.describe(), ("Firma", self.signer), ("Resumen", self.digest))
+
+
+@dataclass(frozen=True, slots=True)
+class SubmittedPredictionOrder:
+    """Lo que el recinto contestó al aceptar una orden.
+
+    Existe porque publicar **no** devuelve un recibo: no hay transacción, no hay
+    bloque y no hay gas. Lo que devuelve es un identificador y un estado en el
+    vocabulario del propio recinto —`live` está en el libro, `matched` ya se
+    cruzó—, y las dos cosas son suyas: inventar aquí un estado propio o dar por
+    hecho que el identificador es el resumen que se firmó sería escribir en el
+    registro algo que nadie ha medido.
+
+    `status` se guarda **tal cual lo dijo el recinto**, sin traducir. Un estado
+    traducido a un vocabulario nuestro perdería justo la palabra que hay que
+    buscar en su documentación el día que algo no cuadre.
+    """
+
+    order_id: str
+    status: str
+
+    def __post_init__(self) -> None:
+        if not self.order_id:
+            raise InvalidAmountError(
+                "una orden aceptada necesita el identificador que le dio el recinto"
+            )
+        if not self.status:
+            raise InvalidAmountError(
+                "una orden aceptada necesita el estado en que la dejó el recinto"
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -801,9 +1700,17 @@ class UnsignedSolanaTransaction:
         )
 
 
-#: Lo que un motor de swap puede devolver. La UI la consume a través de
-#: `describe()`, así que añadir una red nueva no toca la vista.
-type PlannedTransaction = UnsignedTransaction | UnsignedSolanaTransaction
+#: Lo que un motor puede devolver **construido y sin firmar**. La UI la consume
+#: a través de `describe()`, así que añadir una red nueva no toca la vista.
+#:
+#: `PredictionOrder` está aquí y no en una unión aparte porque el diálogo de
+#: confirmación tiene que poder enseñar exactamente lo mismo en los dos casos:
+#: qué se va a firmar, campo por campo, antes de que exista una firma. Lo que
+#: cambia es lo que pasa después —una transacción se emite, una orden se
+#: publica—, y eso no lo decide esta unión.
+type PlannedTransaction = (
+    UnsignedTransaction | UnsignedSolanaTransaction | PredictionOrder
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -1029,12 +1936,358 @@ class ExecutionIntent:
         """Los dos símbolos que toca la operación, para la lista blanca."""
         return (self.quote.pair.base.symbol, self.quote.pair.quote.symbol)
 
+    @property
+    def chain(self) -> str:
+        """La red, sin obligar a quien la pregunta a conocer la forma de un `Quote`.
+
+        La política comprueba la red contra su lista blanca y no necesita nada
+        más del par; exponerlo así es lo que permite que la misma comprobación
+        sirva para un swap y para una orden de predicción sin duplicarla.
+        """
+        return self.quote.pair.chain
+
+    @property
+    def label(self) -> str:
+        """Cómo se nombra esta operación en el registro y en la traza."""
+        return self.quote.pair.symbol
+
+    @property
+    def counts_towards_limits(self) -> bool:
+        """Un swap **entrega** `notional`, así que el tope lo acota. Siempre sí."""
+        return True
+
     def describe(self) -> tuple[TransactionField, ...]:
         return (
             ("Par", self.quote.pair.symbol),
             ("Entregas", str(self.quote.amount_in)),
             ("Recibes", str(self.quote.amount_out)),
             ("Importe de referencia", str(self.notional)),
+            ("Motor", self.engine_id),
+            ("Destino", self.recipient),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionOrderIntent:
+    """Lo que se propone publicar en un recinto de predicción, para la política.
+
+    **Hermano de `ExecutionIntent`, no una variante suya.** Un swap tiene dos
+    patas de tokens y un par; una orden tiene un resultado, un precio y unas
+    participaciones, y meterla en `ExecutionIntent` con los campos sobrantes en
+    `None` convertiría invariantes hoy ciertas en campos que cada consumidor
+    tendría que comprobar. Lo que **sí** comparten es lo que la política mira, y
+    eso se dice con un `Protocol` en `app/execution_policy.py`, no copiando el
+    método de comprobación.
+
+    El importe que se mide contra los topes es el lado **en colateral**, tanto al
+    comprar como al vender. Es la unidad en la que están escritos los topes y es
+    un dato exacto —precio por participaciones—, así que no hace falta valorar
+    nada: lo que se paga al comprar y lo que se cobra al vender ya están en
+    dólares, y el tope diario suma así lo de predicción junto con lo de los
+    swaps, que es lo que se quiere.
+    """
+
+    order: PredictionOrder
+    recipient: str
+    #: El importe del lado del colateral, en la stablecoin de la red. `None` en
+    #: `reference_value` significa que **no hace falta** ninguna valoración: ya
+    #: está en la unidad del tope.
+    notional: TokenAmount
+    engine_id: str
+    reference_value: TokenAmount | None = None
+
+    def __post_init__(self) -> None:
+        if not self.recipient:
+            raise InvalidAmountError("una orden necesita destinatario")
+        if self.notional.raw <= 0:
+            raise InvalidAmountError(
+                f"el importe de referencia debe ser positivo, llegó {self.notional}"
+            )
+        if self.notional.as_decimal() < self.order.cost:
+            # El importe que se mide contra los topes **tiene que cubrir** el
+            # coste de la orden. Si no lo cubriera, el tope estaría midiendo un
+            # número más pequeño que el dinero que de verdad se mueve, que es la
+            # forma de que un tope deje de ser un tope.
+            raise CurrencyMismatchError(
+                f"el importe de referencia ({self.notional}) es menor que el coste "
+                f"de la orden ({self.order.cost}): el tope estaría midiendo de menos."
+            )
+
+    @property
+    def chain(self) -> str:
+        return self.order.chain
+
+    @property
+    def label(self) -> str:
+        """Lo que se escribe en el registro: el mercado y el resultado elegido.
+
+        La pregunta sola no basta: un mercado con dos resultados produce dos
+        operaciones opuestas, y un asiento que dijera sólo el mercado no
+        permitiría saber cuál de las dos se hizo.
+        """
+        return f"{self.order.question} — {self.order.outcome_label}"
+
+    @property
+    def tokens(self) -> tuple[str, ...]:
+        """Los símbolos que toca, para la lista blanca.
+
+        Sólo el colateral. Las participaciones son un ERC-1155 que no está en el
+        catálogo de tokens y que cambia con cada mercado: meterlas en la lista
+        blanca obligaría a mantener a mano una lista de resultados que se renueva
+        cada pocos minutos, y una lista blanca que se mantiene a mano deja de
+        estar actualizada el día que más importa.
+        """
+        return (self.notional.symbol,)
+
+    @property
+    def measured(self) -> TokenAmount:
+        return self.reference_value or self.notional
+
+    @property
+    def counts_towards_limits(self) -> bool:
+        """Una orden **compromete** el colateral, tanto al comprar como al vender.
+
+        Al vender el colateral entra y las participaciones salen, así que el
+        signo del dinero depende del lado — pero el tope no acota el saldo, acota
+        lo que se **compromete**: ambos lados de una orden son importes que se
+        ponen en juego y pueden perderse enteros si el mercado se mueve. Por eso
+        los dos cuentan, y por eso esta respuesta no mira `self.order.side`.
+        """
+        return True
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (
+            *self.order.describe(),
+            ("Importe de referencia", str(self.notional)),
+            ("Motor", self.engine_id),
+            ("Destino", self.recipient),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WithdrawIntent:
+    """Sacar fondos de la cartera: la operación más simple y la más irreversible.
+
+    Cuarto hermano de `ExecutionIntent`, `PredictionOrderIntent` y
+    `PredictionRedeemIntent`, y el único que **no pasa por ningún motor**. Un
+    swap lo construye un motor que cotiza; esto es una transferencia y la
+    construye la propia aplicación, porque no hay nada que cotizar: se manda lo
+    que se manda.
+
+    **Cuenta para los topes, y es el caso en el que más claro está.** Los topes
+    existen para acotar lo que **sale** de la cartera, y esto es exactamente eso,
+    sin nada alrededor: no hay un par, ni un contrato de por medio, ni una
+    posición que cambie de forma. Un tope que no acotara una retirada sería un
+    tope que se puede vaciar la cartera sin tocarlo.
+
+    ### Por qué el destinatario no puede ser el que firma
+
+    Mandarse fondos a uno mismo es una transferencia que gasta gas y no mueve
+    nada. No es peligroso, pero sí es siempre un error —una dirección pegada en
+    la casilla equivocada— y el momento de decirlo es antes de firmar, no
+    después. Se rechaza aquí, en el dominio, para que no dependa de que cada
+    caso de uso se acuerde de comprobarlo.
+    """
+
+    chain: str
+    token: Token
+    amount: TokenAmount
+    #: A dónde va el dinero. Es la dirección de destino, no la de la cartera.
+    recipient: str
+    #: Quién firma. Se guarda aparte de `recipient` justamente para poder
+    #: comprobar que no coinciden, y para que el asiento del registro diga de
+    #: dónde salió además de a dónde fue.
+    source: str
+    engine_id: str
+    reference_value: TokenAmount | None = None
+
+    def __post_init__(self) -> None:
+        if not self.recipient:
+            raise InvalidAmountError("una retirada necesita destinatario")
+        if not self.source:
+            raise InvalidAmountError("una retirada necesita saber de qué cartera sale")
+        if self.amount.raw <= 0:
+            raise InvalidAmountError(
+                f"el importe de una retirada debe ser positivo, llegó {self.amount}"
+            )
+        if self.amount.symbol != self.token.symbol or self.amount.decimals != self.token.decimals:
+            # Sin esto, la cantidad y el token del que dice ser podrían divergir:
+            # `TokenAmount` no lleva la red ni la dirección, sólo símbolo y
+            # escala, así que es aquí donde se comprueba que hablan del mismo.
+            raise CurrencyMismatchError(
+                f"el importe ({self.amount}) no corresponde al token {self.token.symbol} "
+                f"de {self.chain} ({self.token.decimals} decimales)."
+            )
+        if self.token.chain != self.chain:
+            raise CurrencyMismatchError(
+                f"el token {self.token.symbol} es de «{self.token.chain}» y la retirada "
+                f"dice «{self.chain}»."
+            )
+        if self.recipient.strip().lower() == self.source.strip().lower():
+            raise InvalidAmountError(
+                "el destinatario de la retirada es la misma cartera que firma: eso "
+                "sólo gasta gas y no mueve nada, así que casi siempre es una "
+                "dirección pegada en la casilla equivocada."
+            )
+        if self.reference_value is not None and self.reference_value.raw <= 0:
+            raise InvalidAmountError(
+                f"la valoración en la moneda de referencia debe ser positiva, llegó "
+                f"{self.reference_value}"
+            )
+
+    @property
+    def label(self) -> str:
+        """Lo que se escribe en el registro: el token y a dónde fue."""
+        return f"Retirada {self.amount.symbol} → {self.recipient}"
+
+    @property
+    def tokens(self) -> tuple[str, ...]:
+        """El símbolo que sale, para la lista blanca.
+
+        Sólo uno, y es el que de verdad se mueve: una retirada no toca ningún
+        otro token, así que pedir permiso por otros sería ampliar la lista blanca
+        sin motivo.
+        """
+        return (self.token.symbol,)
+
+    @property
+    def notional(self) -> TokenAmount:
+        """Lo que sale, en la unidad del propio token.
+
+        Es `amount` sin más, y se declara aparte de `measured` por la razón de
+        siempre: `measured` es esa misma cifra traducida a la moneda del tope, y
+        confundirlas es lo que haría que el registro anotara un importe que no
+        corresponde al token que se movió.
+        """
+        return self.amount
+
+    @property
+    def measured(self) -> TokenAmount:
+        """El importe que se compara contra los topes, en la unidad del tope."""
+        return self.reference_value or self.amount
+
+    @property
+    def counts_towards_limits(self) -> bool:
+        """Siempre. Es, literalmente, dinero saliendo de la cartera."""
+        return True
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        origen = (
+            "la moneda nativa de la red"
+            if self.token.address is None
+            else f"el contrato {self.token.address}"
+        )
+        return (
+            ("Retirada de", str(self.amount)),
+            ("Token", f"{self.token.symbol} ({origen})"),
+            ("Red", self.chain),
+            ("Sale de", self.source),
+            ("Va a", self.recipient),
+            ("Importe de referencia", str(self.measured)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionRedeemIntent:
+    """Lo que se propone **cobrar**, en los términos que la política evalúa.
+
+    Tercer hermano de `ExecutionIntent` y `PredictionOrderIntent`, y el único de
+    los tres que va en la dirección contraria: los otros dos **entregan** dinero,
+    y éste lo **recibe**. Eso no es una diferencia de matiz, porque los topes
+    están escritos para acotar lo que sale:
+
+    - `max_quote_per_trade` y `max_quote_per_day` dicen «no comprometas más de
+      esto». Una redención no compromete nada: cambia participaciones que ya se
+      pagaron por el colateral que valen. Aplicarle el tope tendría la
+      consecuencia absurda de **impedir cobrar** una posición grande —cuanto más
+      ganada, más bloqueada—, y dejaría el dinero del usuario encerrado en el
+      contrato justo cuando por fin se puede sacar.
+    - Por eso `notional` aquí es el **cobro**, y la política lo mira para
+      anotarlo pero **no** lo compara contra los topes. Lo que sí se comprueba
+      entero es todo lo demás —modo, red, colateral y motor—, que es lo que
+      decide si esta operación puede existir.
+
+    El nombre del campo no cambia para que este objeto siga satisfaciendo
+    `ExecutableIntent` —la política, el registro y el diálogo lo leen igual que a
+    los otros dos—, y lo que lo distingue es `counts_towards_limits`, que aquí es
+    falso. Ése es el dato que `AutonomyPolicy.check_intent` consulta para saltarse
+    el importe, y vive en el intento y no en una rama por tipo dentro de la
+    política: así el día que aparezca una cuarta forma de operar, la decisión se
+    toma donde se sabe la respuesta en vez de en una lista que hay que recordar
+    ampliar.
+    """
+
+    position: PredictionPosition
+    recipient: str
+    #: Lo que se cobra, en la stablecoin del recinto. Es `shares` —cada
+    #: participación ganadora paga 1— y ya está en la unidad del tope, así que no
+    #: hay nada que valorar.
+    notional: TokenAmount
+    engine_id: str
+    reference_value: TokenAmount | None = None
+
+    def __post_init__(self) -> None:
+        if not self.recipient:
+            raise InvalidAmountError("una redención necesita destinatario")
+        if self.notional.raw <= 0:
+            raise InvalidAmountError(
+                f"el importe a cobrar debe ser positivo, llegó {self.notional}"
+            )
+        if self.notional.as_decimal() < self.position.payout:
+            # Mismo sentido que en la orden, y por la misma razón: si el importe
+            # anotado no cubriera lo que de verdad se cobra, el asiento del
+            # registro describiría una operación más pequeña que la que pasó.
+            raise CurrencyMismatchError(
+                f"el importe a cobrar ({self.notional}) es menor que lo que paga "
+                f"la posición ({self.position.payout}): el asiento describiría de menos."
+            )
+
+    @property
+    def chain(self) -> str:
+        return self.position.venue.chain
+
+    @property
+    def label(self) -> str:
+        """Lo que se escribe en el registro: el mercado y el resultado cobrado.
+
+        Lleva delante la palabra «cobro» porque este asiento es el único que
+        **entra** dinero, y un renglón con la misma forma que los de gasto se
+        sumaría con ellos al leer el fichero. Se distingue por el texto, ya que
+        el registro es lo que un humano lee para reconstruir qué pasó.
+        """
+        return f"cobro {self.position.question} — {self.position.outcome_label}"
+
+    @property
+    def tokens(self) -> tuple[str, ...]:
+        """Los símbolos que toca, para la lista blanca.
+
+        Sólo el colateral, por la misma razón que en la orden: las
+        participaciones son un ERC-1155 que no está en el catálogo y que cambia
+        con cada mercado.
+        """
+        return (self.notional.symbol,)
+
+    @property
+    def measured(self) -> TokenAmount:
+        return self.reference_value or self.notional
+
+    @property
+    def counts_towards_limits(self) -> bool:
+        """**No.** Es la única operación de las tres que no compromete nada.
+
+        El dinero va en la dirección contraria a la que el tope acota. Ver el
+        porqué entero en el docstring de la clase.
+        """
+        return False
+
+    def describe(self) -> tuple[TransactionField, ...]:
+        return (
+            ("Mercado", self.position.question),
+            ("Resultado", self.position.outcome_label),
+            ("Red", self.chain),
+            ("Recinto", self.position.venue.venue_id),
+            ("Participaciones", f"{self.position.shares:f}"),
+            ("Cobras", str(self.notional)),
             ("Motor", self.engine_id),
             ("Destino", self.recipient),
         )

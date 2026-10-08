@@ -45,7 +45,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from io import SEEK_END
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final, Protocol, runtime_checkable
 
 import structlog
 
@@ -53,8 +53,13 @@ from amigocompora.app.confirmation import PendingAction
 from amigocompora.domain.clock import Clock, SystemClock
 from amigocompora.domain.errors import ExecutionError
 from amigocompora.domain.execution import ExecutionLimits, TriggerKind
-from amigocompora.domain.models import BroadcastReceipt, BroadcastStatus, ExecutionIntent
+from amigocompora.domain.models import (
+    BroadcastReceipt,
+    BroadcastStatus,
+    PredictionPosition,
+)
 from amigocompora.domain.modes import Capability
+from amigocompora.domain.money import TokenAmount
 
 _log = structlog.get_logger(__name__)
 
@@ -67,6 +72,23 @@ WINDOW: Final = timedelta(hours=24)
 #: se gastó, pero el importe de referencia no se intercambió—, y `UNKNOWN`
 #: tampoco porque no hay prueba de que ocurriera.
 _COUNTED_STATUSES: Final = frozenset({BroadcastStatus.SUCCESS, BroadcastStatus.PENDING})
+
+#: Tipo de asiento: una transacción que se emitió a una cadena, o una orden que
+#: se publicó en un recinto que liquida fuera de ella. Se distingue porque lo
+#: que se guarda en la columna del identificador **no es lo mismo** en los dos
+#: casos —un hash de transacción se busca en un explorador de bloques y un
+#: identificador de orden se busca en el recinto—, y un asiento que los
+#: confundiera mandaría a quien lo lea a un sitio donde no hay nada.
+TRANSACTION_KIND: Final = "transaction"
+ORDER_KIND: Final = "order"
+
+#: Tipo de asiento del **cobro** de una posición de predicción ya resuelta. Es el
+#: único que entra dinero en vez de sacarlo, y por eso tiene nombre propio: sin
+#: él, un cobro sería un `transaction` más y `counts_towards_limits` lo daría por
+#: bueno en cuanto el recibo llegara en `SUCCESS` — con lo que cobrar una
+#: posición gastaría presupuesto del día y podría dejar al usuario sin poder
+#: operar por haber recuperado su propio dinero.
+REDEEM_KIND: Final = "redeem"
 
 #: Motivo con el que se anota una ejecución que no pasó por el diálogo. Aparece
 #: tal cual en la traza de auditoría y en el registro.
@@ -87,12 +109,118 @@ class PassphraseSource(Protocol):
     def get(self) -> str | None: ...
 
 
+class ExecutableIntent(Protocol):
+    """Lo que la política necesita saber de una operación, sea cual sea su forma.
+
+    Existe porque la comprobación de límites **no** depende de que la operación
+    sea un swap: mira la red, los símbolos que toca, el motor que la construye y
+    un importe ya expresado en la unidad del tope. Eso es cierto para un swap y
+    para una orden de un mercado de predicción, y las dos cosas no se parecen en
+    nada más.
+
+    Se declara aquí, en la capa que lo consume, y no en el dominio: es la
+    interfaz que **esta** política necesita, no una propiedad de las entidades.
+    Un `ExecutionIntent` y un `PredictionOrderIntent` lo satisfacen sin heredar
+    de nada ni conocerse entre sí.
+
+    `label` es aparte de `tokens` a propósito: lo que se escribe en el registro
+    es lo que un humano lee para reconstruir qué pasó —«ETH/USDC», «¿Invasión de
+    Irán? — Sí»— y eso no siempre coincide con los símbolos que se comprueban
+    contra la lista blanca.
+    """
+
+    @property
+    def chain(self) -> str: ...
+
+    @property
+    def label(self) -> str: ...
+
+    @property
+    def tokens(self) -> tuple[str, ...]: ...
+
+    @property
+    def engine_id(self) -> str: ...
+
+    @property
+    def recipient(self) -> str: ...
+
+    @property
+    def notional(self) -> TokenAmount: ...
+
+    @property
+    def reference_value(self) -> TokenAmount | None: ...
+
+    @property
+    def measured(self) -> TokenAmount: ...
+
+    @property
+    def counts_towards_limits(self) -> bool:
+        """Si esta operación **compromete** dinero, que es lo que el tope acota.
+
+        Se declara en vez de deducirse del tipo porque el tipo no lo dice: un
+        swap y una orden de predicción entregan dinero, y un cobro lo recibe, y
+        los tres exponen los mismos campos. Sin este dato, `check_intent` tendría
+        que aplicar `check_amount` a los tres, y aplicárselo a un cobro es
+        absurdo en los dos sentidos: impediría recuperar una posición grande por
+        serlo, y gastaría presupuesto del día por dinero que **entra**.
+
+        Es obligatorio y sin valor por omisión a propósito. Un intento nuevo
+        tiene que **decidir** esta respuesta y escribirla, y el día que se añada
+        uno que no comprometa nada, el compilador obligará a mirarlo en vez de
+        heredar en silencio un «sí» que estrecharía un tope sin que nadie lo
+        eligiera.
+        """
+        ...
+
+
+@runtime_checkable
+class MultiChainIntent(Protocol):
+    """Un intento que compromete dinero en **más de una red** a la vez.
+
+    Hoy sólo lo satisface un puente, y existe por una razón de fondo: la lista
+    blanca de redes se comprueba sobre `intent.chain`, que es una sola, y un
+    puente toca dos. Sin esto, un puente desde una red permitida hacia una que no
+    lo está pasaría la comprobación entera, porque la única red que se mira es la
+    de origen — y la de destino es precisamente donde el dinero va a acabar.
+
+    ### Por qué no se extiende `ExecutableIntent`
+
+    Sería lo natural y está descartado a conciencia: `ExecutableIntent` es
+    `runtime_checkable`, y esa comprobación mira **qué miembros existen**. Un
+    miembro nuevo obligatorio ahí invalida de golpe a `ExecutionIntent`,
+    `PredictionOrderIntent` y `PredictionRedeemIntent` —los tres tendrían que
+    declarar una lista de redes de un elemento para no dejar de ser lo que ya
+    eran—. Se midió con `SwapPlanner.expected_destination`: añadirlo rompió seis
+    pruebas de dobles que no lo tenían.
+
+    Así que esto es un protocolo **aparte**, y `check_intent` pregunta por él con
+    `isinstance`. Un intento que no lo satisface se sigue comprobando igual que
+    siempre, con su única red.
+
+    `chains` devuelve **todas** las redes que la operación toca, y no sólo la de
+    destino: quien la lea no debería tener que saber que `chain` ya viene
+    incluida. El orden no importa —se comprueban todas— pero se declara
+    determinista para que un mensaje de error sea reproducible.
+    """
+
+    @property
+    def chains(self) -> tuple[str, ...]: ...
+
+
 # --------------------------------------------------------------------------- #
 # Registro de ejecuciones
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
 class LedgerEntry:
-    """Un hecho económico ya ocurrido. Sin secretos, por construcción."""
+    """Un hecho económico ya ocurrido. Sin secretos, por construcción.
+
+    `tx_hash` es **el identificador que dio el recinto**, y no siempre es el hash
+    de una transacción: para una orden de predicción es el identificador con el
+    que el CLOB la nombra. `kind` es lo que permite distinguirlos, y por eso
+    existe en vez de dejar que lo adivine quien lee el fichero: los dos campos
+    son cadenas hexadecimales de la misma forma, así que **no se distinguen
+    mirándolos**.
+    """
 
     occurred_at: datetime
     chain: str
@@ -104,6 +232,11 @@ class LedgerEntry:
     status: str
     recipient: str
     description: str
+    #: `transaction`, `order` o `redeem`. Por omisión `transaction`, que es lo
+    #: que eran todos los renglones escritos antes de que existiera este campo:
+    #: los ficheros de registro que ya hay en disco se siguen leyendo igual, y su
+    #: significado no cambia.
+    kind: str = TRANSACTION_KIND
 
     @property
     def notional_value(self) -> Decimal:
@@ -111,6 +244,26 @@ class LedgerEntry:
 
     @property
     def counts_towards_limits(self) -> bool:
+        """Si este asiento consume tope.
+
+        Una orden cuenta **siempre**, y no por una lista de estados: sólo se
+        anota cuando el recinto ya la aceptó, así que el hecho de que exista el
+        renglón es la prueba. Enumerar sus estados sería la forma de que el día
+        que el recinto estrene uno, ese gasto dejara de contar en silencio —que
+        es justo el lado por el que no interesa equivocarse—.
+
+        Un cobro no cuenta **nunca**, y tampoco por una lista de estados: el
+        dinero va en la dirección contraria a la que el tope acota. Contarlo
+        tendría dos consecuencias, las dos malas: gastaría presupuesto del día
+        por recuperar lo propio, y una posición grande —la que más merece
+        cobrarse— sería la que más acercara al usuario a quedarse sin poder
+        operar. Se dice por tipo y no por estado porque incluso un cobro fallido
+        no ha movido nada hacia fuera: lo único que costó fue el gas.
+        """
+        if self.kind == REDEEM_KIND:
+            return False
+        if self.kind == ORDER_KIND:
+            return True
         return self.status in _COUNTED_STATUSES
 
     def to_json(self) -> str:
@@ -126,6 +279,7 @@ class LedgerEntry:
                 "status": self.status,
                 "recipient": self.recipient,
                 "description": self.description,
+                "kind": self.kind,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -152,6 +306,10 @@ class LedgerEntry:
                 status=str(record["status"]),
                 recipient=str(record["recipient"]),
                 description=str(record.get("description", "")),
+                # Los renglones escritos antes de que existiera este campo son
+                # todos transacciones, así que el valor por omisión no es una
+                # suposición: es lo que eran.
+                kind=str(record.get("kind", TRANSACTION_KIND)),
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -282,7 +440,7 @@ class ExecutionLedger:
     def record_receipt(
         self,
         receipt: BroadcastReceipt,
-        intent: ExecutionIntent,
+        intent: ExecutableIntent,
     ) -> LedgerEntry:
         """Anota el desenlace de una ejecución y devuelve lo anotado.
 
@@ -309,7 +467,7 @@ class ExecutionLedger:
         entry = LedgerEntry(
             occurred_at=receipt.observed_at,
             chain=receipt.chain,
-            pair=intent.quote.pair.symbol,
+            pair=intent.label,
             engine_id=intent.engine_id,
             notional=f"{measured.as_decimal():f}",
             notional_symbol=measured.symbol,
@@ -317,6 +475,108 @@ class ExecutionLedger:
             status=receipt.status.value,
             recipient=intent.recipient,
             description=f"{receipt.reason}{valorado}",
+        )
+        self.append(entry)
+        return entry
+
+    def record_order(
+        self,
+        *,
+        intent: ExecutableIntent,
+        order_id: str,
+        status: str,
+        observed_at: datetime,
+        chain_key: str,
+        reason: str = "",
+    ) -> LedgerEntry:
+        """Anota una orden publicada en un recinto. **No es una transacción.**
+
+        Tiene su propio método en vez de reutilizar `record_receipt` porque un
+        recibo describe algo que una orden no tiene: un bloque, un gas y un
+        estado que sólo puede ser uno de cuatro. Una orden no toca la cadena al
+        publicarse, y meterla en un `BroadcastReceipt` obligaría a inventarle un
+        `tx_hash` y un estado de una lista en la que no encaja.
+
+        `chain_key` entra aparte y no se lee de `intent` porque el intento no la
+        tiene: `ExecutableIntent` expone `chain` para los topes, y aquí hace
+        falta la red que se escribe en el asiento. Se pide explícita en vez de
+        dar por hecho que son lo mismo.
+
+        El importe que se anota es el **medido**, el mismo que se comprobó contra
+        los topes, para que lo que se suma al gasto del día sea exactamente lo
+        que se autorizó.
+        """
+        measured = intent.measured
+        entry = LedgerEntry(
+            occurred_at=observed_at,
+            chain=chain_key,
+            pair=intent.label,
+            engine_id=intent.engine_id,
+            notional=f"{measured.as_decimal():f}",
+            notional_symbol=measured.symbol,
+            tx_hash=order_id,
+            status=status,
+            recipient=intent.recipient,
+            # Se dice en la descripción que el identificador es del recinto y no
+            # de una cadena: es el único sitio donde quien lea el registro se
+            # entera, porque las dos cadenas tienen la misma forma.
+            description=(
+                f"orden publicada, identificador del recinto (no es una "
+                f"transacción): {order_id} — {reason}"
+            ),
+            kind=ORDER_KIND,
+        )
+        self.append(entry)
+        return entry
+
+    def record_redeem(
+        self,
+        receipt: BroadcastReceipt,
+        *,
+        intent: ExecutableIntent,
+        chain_key: str,
+        position: PredictionPosition,
+    ) -> LedgerEntry:
+        """Anota el cobro de una posición ya resuelta. **Es dinero que entra.**
+
+        Tiene su propio método, y su propio `kind`, porque un cobro es el único
+        asiento que va en la dirección contraria a la de todos los demás. Metido
+        como `transaction` contaría para el tope del día —un `SUCCESS` es un
+        `SUCCESS`—, y entonces recuperar lo propio gastaría presupuesto de
+        operación: cobrar una posición grande acercaría al usuario a quedarse sin
+        poder operar. Ver `LedgerEntry.counts_towards_limits`.
+
+        El importe se anota igualmente, y en la misma columna que los gastos, para
+        que el fichero se lea entero y se pueda reconstruir cuánto entró. Que no
+        se sume al tope lo decide el tipo del asiento, no que la cifra falte: un
+        registro que escondiera el importe de un cobro no podría explicar por qué
+        el saldo de la cartera subió.
+
+        `chain_key` se pide explícita por la misma razón que en `record_order`:
+        el intento expone la red para los topes, y aquí se escribe la red que va
+        en el asiento. Son cosas distintas aunque hoy coincidan.
+        """
+        measured = intent.measured
+        entry = LedgerEntry(
+            occurred_at=receipt.observed_at,
+            chain=chain_key,
+            pair=intent.label,
+            engine_id=intent.engine_id,
+            notional=f"{measured.as_decimal():f}",
+            notional_symbol=measured.symbol,
+            tx_hash=receipt.tx_hash,
+            status=receipt.status.value,
+            recipient=intent.recipient,
+            # Se dice que entra, porque el signo no está en ninguna columna: quien
+            # sume la columna del importe sin leer esto contaría un cobro como un
+            # gasto. Y se nombra el mercado por su condición, que es lo que hace
+            # falta para volver a mirarlo en el explorador.
+            description=(
+                f"cobro de {position.shares:f} participaciones al resultado "
+                f"«{position.outcome_label}» — entra colateral, no sale; "
+                f"mercado {position.condition_id}"
+            ),
+            kind=REDEEM_KIND,
         )
         self.append(entry)
         return entry
@@ -552,7 +812,7 @@ class AutonomyPolicy:
         self._note(armed=True, reason=f"armada al arrancar (disparador: {self._trigger})")
         return True
 
-    def check_intent(self, intent: ExecutionIntent) -> None:
+    def check_intent(self, intent: ExecutableIntent) -> None:
         """Aplica los límites al intento. Un solo sitio, un solo orden.
 
         Se comprueban aquí y no repartidos por la UI porque un límite que sólo
@@ -563,14 +823,33 @@ class AutonomyPolicy:
         el intento **es** —red, tokens, motor—, y después el importe, que
         necesita el gasto acumulado y por tanto leer el registro.
 
+        El importe se salta entero cuando la operación no compromete nada, y ahí
+        está el único caso que tiene: el cobro de una posición ya resuelta. Los
+        topes acotan lo que **sale**, y un cobro mete; medirlo contra ellos
+        dejaría el dinero del usuario encerrado en el contrato justo cuando por
+        fin se puede sacar, y encima gastaría presupuesto del día por recuperar
+        lo propio. Lo que sí se le comprueba es todo lo anterior —modo, red,
+        colateral y motor—, que es lo que decide si la operación puede existir.
+        La decisión la toma el intento y no una lista de tipos escrita aquí: ver
+        `ExecutableIntent.counts_towards_limits`.
+
         Y por delante de todo, el interruptor maestro: con la ejecución apagada no
         hay nada que comprobar, y decir «te pasaste del tope» cuando el problema
         es que no se ejecuta sería mandar al usuario a ajustar la cifra que no es.
         """
         self._limits.check_enabled()
-        self._limits.check_chain(intent.quote.pair.chain)
+        # Todas las redes que la operación toca. Para un swap, una; para un
+        # puente, las dos, porque la blanca tiene que cubrir también aquella en
+        # la que el dinero acaba. Se hace aquí y no repartido por los casos de
+        # uso para que siga habiendo **un** sitio donde se comprueban los
+        # límites, y en un orden que se puede leer de arriba abajo.
+        chains = intent.chains if isinstance(intent, MultiChainIntent) else (intent.chain,)
+        for chain_key in chains:
+            self._limits.check_chain(chain_key)
         self._limits.check_token(intent.tokens)
         self._limits.check_engine(intent.engine_id)
+        if not intent.counts_towards_limits:
+            return
         measured = intent.measured
         self._limits.check_amount(
             measured.as_decimal(),

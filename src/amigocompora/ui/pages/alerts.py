@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -15,6 +16,17 @@ from PySide6.QtWidgets import (
 
 from amigocompora.app.alerts import AlertCenter
 from amigocompora.ui.theme import COLOR_MUTED, SEVERITY_COLOR
+from amigocompora.ui.widgets import set_empty
+
+#: Lo que se recoge en esta bandeja y de dónde sale, para que una bandeja vacía
+#: no se lea como una pestaña que no funciona. Nombra las tres fuentes reales de
+#: alerta en lugar de decir «no hay nada»: quien no sabe qué se avisa aquí
+#: tampoco sabe si debería preocuparse por no ver nada.
+_BANDEJA_VACIA = (
+    "Sin alertas. Aquí llegan los avisos que generan la vigilancia de "
+    "diferenciales, las ejecuciones y el estado de los motores. Si algo hubiera "
+    "pasado, estaría en esta lista."
+)
 
 
 class AlertsPage(QWidget):
@@ -51,6 +63,16 @@ class AlertsPage(QWidget):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         lay.addWidget(self._table, stretch=1)
 
+        #: El sitio de la tabla mientras está vacía, con la explicación dentro.
+        #: Una bandeja recién abierta estaba vacía y no decía qué se recoge aquí
+        #: ni qué hay que hacer para que aparezca algo: un rectángulo gris del
+        #: alto entero con siete encabezados encima y ninguna pista.
+        self._empty = QLabel("")
+        self._empty.setObjectName("empty")
+        self._empty.setWordWrap(True)
+        self._empty.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._empty, stretch=1)
+
         center.subscribe(lambda _a: self._refresh())
         self._refresh()
 
@@ -71,6 +93,7 @@ class AlertsPage(QWidget):
             times = f"{alert.last_seen_at.isoformat()} (×{alert.count})" if alert.count > 1 else alert.last_seen_at.isoformat()
             self._table.setItem(row, 4, QTableWidgetItem(times))
             self._table.setItem(row, 5, QTableWidgetItem("✓ leída" if alert.acknowledged else "● nueva"))
+        set_empty(self._table, self._empty, _BANDEJA_VACIA)
 
     def _ack_all(self) -> None:
         self._center.acknowledge_all()

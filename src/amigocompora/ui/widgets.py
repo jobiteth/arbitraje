@@ -1,10 +1,18 @@
-"""Widgets reutilizables de la UI."""
+"""Widgets reutilizables de la UI.
+
+Lo que hay aquí es lo que aparece en más de una pestaña, y sólo eso: una tarjeta,
+una etiqueta de estado, una fila de campo con su nombre, el diálogo de
+confirmación y el banner de alertas. Un widget que sólo usa una pestaña vive en
+esa pestaña, aunque parezca genérico — «genérico» con un solo usuario es una
+carpeta de cajón, no una abstracción.
+"""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Coroutine
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Final
 
 from PySide6.QtCore import Qt, Signal
@@ -14,19 +22,27 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QPushButton,
+    QSizePolicy,
+    QTableWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from amigocompora.app.confirmation import PendingAction
-from amigocompora.domain.models import PlannedTransaction
+from amigocompora.domain.models import PlannedTransaction, Token
 from amigocompora.domain.modes import Capability
+from amigocompora.engines.catalog import native_token, tokens_for
+from amigocompora.engines.token_store import UserTokenStore
 from amigocompora.ui.theme import (
+    COLOR_BG,
     COLOR_BORDER,
-    COLOR_CARD,
+    COLOR_BORDER_STRONG,
     COLOR_DANGER,
+    COLOR_ELEVATED,
     COLOR_MUTED,
+    COLOR_TEXT,
     COLOR_WARNING,
 )
 
@@ -38,6 +54,62 @@ _CLIP_CHARS: Final = 120
 
 def _clip(value: str) -> str:
     return value if len(value) <= _CLIP_CHARS else f"{value[:_CLIP_CHARS]}…"
+
+
+#: Cifras significativas que se enseñan de una cantidad antes de recortarla.
+#: Seis es lo que cabe sin que la columna baile y lo que distingue 0,000001 de
+#: 0,0000012 —que es la diferencia entre un polvo y un polvo con algo dentro—.
+SIGNIFICANT_DIGITS: Final = 6
+
+
+def format_amount(value: Decimal, *, full: bool = False) -> str:
+    """Una cantidad, recortada a lo que se puede leer.
+
+    Vive aquí porque la usan dos pantallas que enseñan los mismos saldos —la
+    cartera y la tarjeta de conversión— y dos recortes distintos para el mismo
+    número serían dos verdades distintas sobre lo que hay en la cuenta.
+
+    Con `full` se devuelve todo, y ése es el otro modo que tiene la cartera: la
+    cifra recortada es la que se mira y la completa es la que se comprueba. Se
+    recorta por **dígitos significativos** y no por decimales porque una cartera
+    tiene las dos cosas: 0,0000012 ETH perdería todo su contenido con dos
+    decimales, y 19,491666140000000 POL no gana nada con dieciocho.
+
+    Lo que no se hace nunca es redondear a cero: un saldo con fondos que se
+    imprime como «0» no es una cifra imprecisa, es una cifra **falsa**, y ésa sí
+    se copia y se decide con ella. Por eso los dos extremos —el polvo y la
+    cantidad larga— se escriben enteros en vez de recortarse.
+
+    El recorte es **sólo de la pantalla**. Lo que se firma sale del `TokenAmount`
+    completo, nunca de este texto: por eso la función devuelve una cadena y no
+    toca el número que recibe.
+    """
+    if full:
+        return f"{value:f}"
+    if value == 0:
+        return "0"
+    texto = f"{value:.{SIGNIFICANT_DIGITS}g}"
+    # `g` decide por su cuenta entre notación normal y científica, y se pasa a la
+    # científica sólo en los dos extremos: la cantidad muy larga («1.23457e+6») y
+    # el polvo («1e-7»). Para un saldo no sirve ninguna de las dos: la primera no
+    # se lee, y la segunda se confunde con un cero justo cuando el número dice
+    # que hay algo. Las dos se escriben enteras.
+    return _plain(value) if ("e" in texto or "E" in texto) else texto
+
+
+def _plain(value: Decimal) -> str:
+    """La cantidad en notación normal, sin perder ninguna cifra por el camino.
+
+    Los decimales se cuentan desde el exponente del propio número y no se eligen a
+    ojo: bajar `1,234e-7` con los seis decimales de la pantalla daría «0.000000»,
+    que es exactamente el cero que se venía a evitar. Con los decimales que hacen
+    falta para sus cifras significativas, el polvo se lee entero y la cantidad
+    larga —que no cabe con decimales— se redondea al entero.
+    """
+    ajustado = value.adjusted()
+    if ajustado >= SIGNIFICANT_DIGITS:
+        return f"{value:.0f}"
+    return f"{value:.{-ajustado + SIGNIFICANT_DIGITS - 1}f}".rstrip("0").rstrip(".")
 
 
 #: El aviso del diálogo, según lo que la acción va a hacer **de verdad**.
@@ -71,6 +143,7 @@ def warning_for(capability: Capability) -> tuple[str, str]:
         return _SIGNING_WARNING, COLOR_DANGER
     return _PREPARE_WARNING, COLOR_WARNING
 
+
 #: Tareas de fondo vivas. Guardar la referencia evita que el recolector de
 #: basura cancele una corrutina recién lanzada desde un handler de Qt.
 _background_tasks: set[asyncio.Task[Any]] = set()
@@ -84,27 +157,213 @@ def spawn(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
     return task
 
 
+def divider() -> QFrame:
+    """Una línea de separación de un píxel, con el color del borde."""
+    line = QFrame()
+    line.setObjectName("divider")
+    line.setFixedHeight(1)
+    line.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    return line
+
+
+def tokens_for_chain(store: UserTokenStore, chain_key: str) -> tuple[Token, ...]:
+    """Los tokens elegibles en una red: el nativo, el catálogo y los añadidos.
+
+    Vive aquí —y no en la pestaña que la estrenó— porque ya la usan tres, y porque
+    las tres tienen que decir lo mismo: un token guardado por su contrato tiene que
+    aparecer igual en la tarjeta de swaps, en la de puentes y en el diálogo de
+    retirada. «Guardarlo para que aparezca en la lista» no dice en cuál de ellas.
+
+    **La moneda de la red va primero**, y no es un detalle de orden: es lo que una
+    cartera tiene casi siempre, lo que paga el gas y lo único que se mueve sin
+    aprobación. Faltaba, y el hueco se notaba en dos sitios a la vez: retirar ETH
+    era imposible desde la interfaz aunque el caso de uso lo soporta entero —con
+    la reserva de gas, que sólo tiene sentido en el nativo—, y «intercambiar este
+    token» desde la cartera no encontraba dónde poner el POL de una cuenta. Los
+    motores ya lo aceptaban: Uniswap lo cotiza por su envoltorio y los puentes
+    distinguen el origen nativo. El único que no lo tenía era esta lista.
+
+    Se quitan los repetidos por `(símbolo, dirección)` y no por símbolo: en Polygon
+    el USDC nativo y el puenteado desde Ethereum publican el mismo símbolo, y son
+    dos tokens distintos —uno de ellos es el colateral que acepta Polymarket—.
+    """
+    nativo = native_token(chain_key)
+    found = [nativo, *tokens_for(chain_key)]
+    conocidos = {(token.symbol, token.address) for token in found}
+    found.extend(
+        token
+        for token in store.load()
+        if token.chain == chain_key and (token.symbol, token.address) not in conocidos
+    )
+    return tuple(found)
+
+
+def token_labels(tokens: tuple[Token, ...]) -> tuple[str, ...]:
+    """Etiquetas de un desplegable de tokens, desempatando los homónimos.
+
+    Dos tokens distintos pueden publicar el mismo símbolo, y repetir la etiqueta
+    deja al usuario eligiendo a ciegas entre dos cosas que no son la misma. Sólo
+    cuando un símbolo aparece más de una vez se le añade el principio de la
+    dirección, que es lo que sí distingue; con símbolos únicos la etiqueta queda
+    limpia, que es el caso normal.
+    """
+    repetidos = {
+        token.symbol
+        for token in tokens
+        if sum(otro.symbol == token.symbol for otro in tokens) > 1
+    }
+    return tuple(
+        token.qualified_symbol if token.symbol in repetidos else token.symbol
+        for token in tokens
+    )
+
+
+def set_empty(table: QTableWidget, placeholder: QLabel, texto: str) -> None:
+    """Enseña la tabla o su rótulo, nunca los dos.
+
+    Vive aquí, y no en la página que lo estrenó, porque lo usan ya dos: una
+    tabla vacía **no es pequeña** —ocupa su `stretch` entero—, así que un
+    rótulo encima del rectángulo gris dejaría las dos cosas a la vez. Lo que se
+    quiere es que el sitio de la tabla lo ocupe la explicación, que es lo que
+    además distingue «todavía no has pedido nada» de «pediste y no hay nada».
+
+    El texto entra por parámetro porque cada tabla tiene su propio «por qué está
+    vacía», y ese es justamente el dato que no se puede generalizar.
+    """
+    vacia = table.rowCount() == 0
+    placeholder.setText(texto)
+    placeholder.setVisible(vacia)
+    table.setVisible(not vacia)
+
+
 class Card(QFrame):
-    """Contenedor con borde y fondo de tarjeta."""
+    """Contenedor con borde y fondo de tarjeta, con cabecera opcional.
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    La cabecera existe para que el título de una sección no sea un `QLabel` en
+    negrita colgado del layout: puesto aquí, todas las tarjetas de la aplicación
+    tienen el mismo alto de cabecera y el mismo color, y la interfaz se lee como
+    una retícula en vez de como una lista de cajas parecidas.
+
+    El cuerpo se pide con `body()` y no se expone el layout: quien añade un
+    widget a una tarjeta no debería poder cambiarle los márgenes a la tarjeta.
+    """
+
+    def __init__(
+        self,
+        title: str | None = None,
+        parent: QWidget | None = None,
+        *,
+        subtitle: str | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet(
-            f"Card {{ background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 8px; }}"
-        )
+        self.setObjectName("card")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        if title is not None:
+            header = QFrame()
+            header.setObjectName("cardHeader")
+            header_lay = QHBoxLayout(header)
+            header_lay.setContentsMargins(14, 9, 14, 9)
+            header_lay.setSpacing(8)
+            label = QLabel(title)
+            label.setObjectName("cardTitle")
+            header_lay.addWidget(label)
+            if subtitle is not None:
+                sub = QLabel(subtitle)
+                sub.setObjectName("hint")
+                header_lay.addWidget(sub)
+            header_lay.addStretch()
+            #: Los widgets que cada página quiera poner a la derecha de la
+            #: cabecera —un estado, un botón— se añaden por aquí.
+            self.header = header_lay
+            outer.addWidget(header)
+
+        self._body = QVBoxLayout()
+        self._body.setContentsMargins(14, 12, 14, 12)
+        self._body.setSpacing(10)
+        outer.addLayout(self._body)
+
+    def body(self) -> QVBoxLayout:
+        """El layout donde va el contenido de la tarjeta."""
+        return self._body
+
+    def add_row(self, layout: QLayout) -> None:
+        """Atajo para añadir una fila horizontal ya montada."""
+        self._body.addLayout(layout)
 
 
-class Badge(QLabel):
-    """Etiqueta pequeña coloreada (severidad, estado)."""
+class Chip(QLabel):
+    """Etiqueta pequeña y redondeada: severidad, modo, estado de la ejecución.
 
-    def __init__(self, text: str, color: str, parent: QWidget | None = None) -> None:
+    Se llama `Chip` y no `Badge` porque describe lo que es —una pastilla de
+    estado— y no lo que parece. El color entra por parámetro y no se elige aquí:
+    quién decide qué color significa qué es quien conoce el dato, no el widget.
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        color: str = COLOR_MUTED,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(text, parent)
-        self.setStyleSheet(
-            f"background: {color}; color: white; border-radius: 4px; padding: 2px 6px; font-size: 11px; font-weight: 600;"
-        )
         self.setAlignment(Qt.AlignCenter)
-        self.setFixedHeight(18)
+        self.setFixedHeight(20)
+        self.set_color(color)
+
+    def set_color(self, color: str) -> None:
+        self.setStyleSheet(
+            f"background: {color}; color: white; border-radius: 10px;"
+            " padding: 1px 10px; font-size: 11px; font-weight: 700;"
+            " letter-spacing: 0.4px;"
+        )
+
+    def set_state(self, text: str, color: str) -> None:
+        self.setText(text)
+        self.set_color(color)
+
+
+class Field(QWidget):
+    """Una etiqueta y su control, con la etiqueta encima.
+
+    En fila —«Cantidad: [ 1.0 ]»— la etiqueta compite con el valor por el mismo
+    ancho y las columnas de una pantalla acaban desalineadas. Encima, el ojo
+    recorre una sola columna de etiquetas y otra de valores, y los campos de
+    sitios distintos se alinean solos.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        hint: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self._label = QLabel(label)
+        self._label.setObjectName("sectionTitle")
+        lay.addWidget(self._label)
+        self._row = QHBoxLayout()
+        self._row.setContentsMargins(0, 0, 0, 0)
+        self._row.setSpacing(8)
+        lay.addLayout(self._row)
+        if hint is not None:
+            self._hint = QLabel(hint)
+            self._hint.setObjectName("hint")
+            self._hint.setWordWrap(True)
+            lay.addWidget(self._hint)
+
+    def add(self, widget: QWidget, stretch: int = 0) -> None:
+        self._row.addWidget(widget, stretch)
+
+    def add_stretch(self) -> None:
+        self._row.addStretch()
 
 
 class ConfirmationDialog(QDialog):
@@ -121,14 +380,16 @@ class ConfirmationDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Confirmar acción — Amigocompora")
         self.setModal(True)
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(560)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
+        layout.setContentsMargins(18, 16, 18, 16)
 
         title = QLabel(f"<b>{action.title}</b>")
         title.setWordWrap(True)
         title.setTextFormat(Qt.RichText)
+        title.setStyleSheet("font-size: 14px;")
         layout.addWidget(title)
 
         if action.details:
@@ -140,17 +401,26 @@ class ConfirmationDialog(QDialog):
         if action.transaction is not None:
             layout.addWidget(self._tx_widget(action.transaction))
 
+        # El aviso va **encima** de los botones y separado por una línea: es lo
+        # último que se lee antes de decidir, que es donde tiene que estar.
+        layout.addWidget(divider())
         warning = QLabel()
         warning.setTextFormat(Qt.RichText)
         warning.setWordWrap(True)
         texto, color = warning_for(action.capability)
         warning.setText(texto)
-        warning.setStyleSheet(f"color: {color}; font-size: 11px;")
+        warning.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
         layout.addWidget(warning)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No)
         buttons.button(QDialogButtonBox.Yes).setText("Confirmar")
         buttons.button(QDialogButtonBox.No).setText("Cancelar")
+        # El «sí» lleva el mismo color que el aviso: en el diálogo que firma, el
+        # botón que confirma es el peligroso y tiene que parecerlo.
+        buttons.button(QDialogButtonBox.Yes).setObjectName(
+            "danger" if action.is_irreversible else "secondary"
+        )
+        buttons.button(QDialogButtonBox.No).setObjectName("secondary")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -158,13 +428,20 @@ class ConfirmationDialog(QDialog):
     @staticmethod
     def _tx_widget(tx: PlannedTransaction) -> QWidget:
         box = QFrame()
-        box.setStyleSheet(f"background: #0f1115; border: 1px solid {COLOR_BORDER}; border-radius: 6px;")
+        box.setStyleSheet(
+            f"background: {COLOR_BG}; border: 1px solid {COLOR_BORDER};"
+            f" border-radius: 6px;"
+        )
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(5)
         # La vista no sabe de qué red es el payload: cada tipo se describe a sí
         # mismo y aquí sólo se pinta. Añadir una red nueva no toca este diálogo.
         for label, value in tx.describe():
-            row = QLabel(f"<span style='color:{COLOR_MUTED}'>{label}:</span> {_clip(value)}")
+            row = QLabel(
+                f"<span style='color:{COLOR_MUTED}'>{label}:</span> "
+                f"<span style='color:{COLOR_TEXT}'>{_clip(value)}</span>"
+            )
             row.setTextFormat(Qt.RichText)
             row.setTextInteractionFlags(Qt.TextSelectableByMouse)
             row.setWordWrap(True)
@@ -197,7 +474,10 @@ class AlertBanner(QWidget):
         super().__init__(parent)
         self.setVisible(False)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+        self._dot = QLabel("●")
+        lay.addWidget(self._dot)
         self._label = QLabel("")
         self._label.setWordWrap(True)
         lay.addWidget(self._label, stretch=1)
@@ -205,11 +485,20 @@ class AlertBanner(QWidget):
         btn.setObjectName("secondary")
         btn.clicked.connect(self._on_dismiss)
         lay.addWidget(btn)
-        self.setStyleSheet("AlertBanner { background: #2a2410; border: 1px solid #665500; border-radius: 6px; }")
+        self.setStyleSheet(
+            f"AlertBanner {{ background: {COLOR_ELEVATED};"
+            f" border: 1px solid {COLOR_BORDER_STRONG}; border-radius: 6px; }}"
+        )
 
     def show_alert(self, title: str, detail: str, severity: str) -> None:
-        color = {"low": "#8b95a5", "medium": "#f5c518", "high": "#ff5a5a"}.get(severity, "#8b95a5")
-        self._label.setText(f"<span style='color:{color}; font-weight:700'>● {severity.upper()}</span>  <b>{title}</b> — {detail}")
+        color = {"low": COLOR_MUTED, "medium": COLOR_WARNING, "high": COLOR_DANGER}.get(
+            severity, COLOR_MUTED
+        )
+        self._dot.setStyleSheet(f"color: {color}; font-weight: 700;")
+        self._label.setText(
+            f"<span style='color:{color}; font-weight:700'>{severity.upper()}</span>"
+            f"  <b>{title}</b> — {detail}"
+        )
         self._label.setTextFormat(Qt.RichText)
         self.setVisible(True)
 

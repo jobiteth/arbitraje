@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from itertools import count
 
 import pytest
 
@@ -32,13 +33,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
 from amigocompora.app.container import build_container
+from amigocompora.app.usecases.analyze_prediction_market import MarketReport
 from amigocompora.domain.clock import FrozenClock
 from amigocompora.domain.models import (
+    DepthLevel,
+    MarketDepth,
     MarketOutcome,
     PredictionMarket,
     Venue,
     VenueKind,
 )
+from amigocompora.domain.money import BasisPoints
 from amigocompora.domain.protocols import EngineKind, EngineManifest
 from amigocompora.infra.config import Settings
 from amigocompora.ui.pages.prediction import PredictionPage
@@ -66,6 +71,10 @@ class MotorFalso:
 
     def __init__(self) -> None:
         self.llamadas: list[dict[str, object]] = []
+        #: Puesto a `True`, la fuente falla. Sirve para comprobar que una
+        #: búsqueda que **no llega a hacerse** no se cuenta igual que una que se
+        #: hizo y no encontró nada.
+        self.falla = False
 
     @property
     def manifest(self) -> EngineManifest:
@@ -84,6 +93,8 @@ class MotorFalso:
         self.llamadas.append(
             {"limit": limit, "search": search, "closing_within": closing_within}
         )
+        if self.falla:
+            raise RuntimeError("la fuente no contesta")
         encontrados = [m for m in _MERCADOS if search is None or search in m.question]
         if closing_within is not None:
             # Como haría el motor de verdad: lo que antes cierra, primero, y sin
@@ -103,6 +114,39 @@ class MotorFalso:
                 return market
         raise AssertionError(market_id)
 
+    async def book(self, token_id: str) -> MarketDepth:
+        """Un libro de un solo nivel por lado, para los resultados que conoce.
+
+        Hace falta porque `PredictionMarketEngine.book` está en el protocolo de
+        lectura: un motor de predicción que no sepa decir el libro de un
+        resultado no se reconoce como motor de predicción. Es el precio que
+        documenta el propio protocolo, y por eso el doble lo implementa en vez
+        de esquivarlo.
+
+        Un nivel por lado es suficiente aquí —el libro no es lo que esta prueba
+        mide— pero es un libro **coherente**: la compra por debajo del precio
+        publicado y la venta por encima.
+        """
+        for market in _MERCADOS:
+            for outcome in market.outcomes:
+                if outcome.token_id == token_id:
+                    return MarketDepth(
+                        token_id=token_id,
+                        bids=(
+                            DepthLevel(
+                                price=outcome.price - _SALTO, size=Decimal("500")
+                            ),
+                        ),
+                        asks=(
+                            DepthLevel(
+                                price=outcome.price + _SALTO, size=Decimal("500")
+                            ),
+                        ),
+                        tick_size=_SALTO,
+                        min_order_size=Decimal("5"),
+                    )
+        raise AssertionError(token_id)
+
 
 def _mercado(market_id: str, *, horas: float | None, pregunta: str) -> PredictionMarket:
     return PredictionMarket(
@@ -110,12 +154,24 @@ def _mercado(market_id: str, *, horas: float | None, pregunta: str) -> Predictio
         venue=VENUE,
         question=pregunta,
         outcomes=(
-            MarketOutcome(label="Sí", price=Decimal("0.6")),
-            MarketOutcome(label="No", price=Decimal("0.4")),
+            MarketOutcome(
+                label="Sí", price=Decimal("0.6"), token_id=str(next(_TOKEN))
+            ),
+            MarketOutcome(
+                label="No", price=Decimal("0.4"), token_id=str(next(_TOKEN))
+            ),
         ),
         observed_at=AHORA,
         closes_at=None if horas is None else AHORA + timedelta(hours=horas),
     )
+
+
+#: Identificadores de resultado, correlativos y únicos: el `tokenId` de un
+#: ERC-1155 es un `uint256` en decimal, y el dominio lo exige así.
+_TOKEN = count(1000)
+
+#: El salto de precio de estos mercados, para que el libro del doble sea válido.
+_SALTO = Decimal("0.01")
 
 
 #: Cuatro mercados que caen uno en cada tramo del selector, más uno sin fecha.
@@ -307,3 +363,126 @@ async def test_the_selection_still_points_at_the_visible_market() -> None:
         pagina._table.selectRow(0)
         # La fila visible y el informe que el detalle va a leer son el mismo.
         assert pagina._reports[0].question == _questions(pagina)[0]
+
+
+# --------------------------------------------------------------------------- #
+# Las cestas: por qué no hay ninguna
+# --------------------------------------------------------------------------- #
+async def test_sin_buscar_las_cestas_dicen_que_falta_buscar() -> None:
+    """Un rectángulo gris no distingue «no has buscado» de «no hay ninguna».
+
+    Son dos cosas distintas y se arreglan de forma distinta: la primera se
+    arregla pulsando Buscar, la segunda bajando el umbral o cambiando de
+    mercado. La tabla vacía no decía cuál de las dos era.
+    """
+    async with _pagina() as (pagina, _):
+        assert pagina._baskets.rowCount() == 0
+        # `isHidden()` y no `isVisible()`: la ventana no se ha enseñado nunca, y
+        # en Qt todo lo que cuelga de una ventana sin enseñar «no es visible».
+        assert pagina._baskets.isHidden() is True
+        assert pagina._baskets_empty.isHidden() is False
+        assert "Busca mercados" in pagina._baskets_empty.text()
+
+
+async def test_una_cesta_que_no_llega_al_umbral_se_explica_con_el_umbral() -> None:
+    """Y el motivo nombra el umbral con su número, que es lo único que se mueve.
+
+    Decir «ninguna llega al umbral» sin decir cuál obliga a adivinar cuánto
+    bajarlo. El número está en la pantalla, al lado, en el selector: el texto
+    lo repite para que las dos cosas se lean juntas.
+    """
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+
+        # Los mercados de prueba suman 1,00 exacto: ninguna cesta tiene margen.
+        assert pagina._baskets.rowCount() == 0
+        assert pagina._baskets.isHidden() is True
+        assert pagina._baskets_empty.isHidden() is False
+        motivo = pagina._baskets_empty.text()
+        assert str(pagina._min_edge.value()) in motivo
+        assert str(len(pagina._reports)) in motivo
+        assert "Baja el umbral" in motivo
+
+
+async def test_con_una_cesta_la_tabla_vuelve_y_el_rotulo_se_va() -> None:
+    """Cuando sí hay margen, manda la tabla: las dos cosas a la vez, nunca."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+
+        # Un mercado que se deja dinero sobre la mesa: 0,50 + 0,40 = 0,90.
+        barato = PredictionMarket(
+            market_id="barato",
+            venue=VENUE,
+            question="¿Se deja dinero sobre la mesa?",
+            outcomes=(
+                MarketOutcome(label="Sí", price=Decimal("0.50"), token_id=str(next(_TOKEN))),
+                MarketOutcome(label="No", price=Decimal("0.40"), token_id=str(next(_TOKEN))),
+            ),
+            observed_at=AHORA,
+            closes_at=None,
+        )
+        pagina._reports = (
+            MarketReport(
+                market=barato,
+                overround_bps=BasisPoints(-1000),
+                is_coherent=False,
+                favourite=barato.outcomes[0],
+            ),
+        )
+        pagina._refresh_baskets()
+
+        assert pagina._baskets.rowCount() == 1
+        assert pagina._baskets.isHidden() is False
+        assert pagina._baskets_empty.isHidden() is True
+        fila = pagina._baskets.item(0, 0)
+        assert fila is not None
+        assert fila.text() == "¿Se deja dinero sobre la mesa?"
+
+
+async def test_al_abrir_la_pestana_la_tabla_dice_que_falta_buscar() -> None:
+    """Sin esto quedaba un rectángulo gris con encabezados y nada dentro.
+
+    Es la primera pantalla que se ve al entrar, y no distinguía «todavía no has
+    pedido nada» de «pediste y no hay»: las dos se veían igual, y una de ellas
+    tiene una acción evidente (pulsar Buscar) que la otra no.
+    """
+    async with _pagina() as (pagina, _):
+        assert pagina._table.rowCount() == 0
+        assert pagina._table.isHidden() is True
+        assert pagina._markets_empty.isHidden() is False
+        assert "Buscar" in pagina._markets_empty.text()
+
+
+async def test_una_busqueda_sin_resultados_no_se_lee_como_un_fallo() -> None:
+    """«No hay mercados para eso» y «la consulta falló» no son lo mismo.
+
+    Las dos dejan la tabla vacía, y la acción que toca es distinta en cada caso:
+    cambiar la palabra, o mirar el error. Compartir un solo texto obligaría a
+    adivinar cuál de las dos ha pasado.
+    """
+    async with _pagina() as (pagina, motor):
+        motor.falla = True
+        await _buscar(pagina)
+
+        assert pagina._status.text().startswith("Error:")
+        motivo = pagina._markets_empty.text()
+        assert "no llegó a completarse" in motivo
+        assert "la línea de arriba" in motivo
+
+        motor.falla = False
+        await _buscar(pagina)
+        assert pagina._markets_empty.isHidden() is True
+
+
+async def test_la_ventana_que_deja_la_lista_vacia_lo_dice_y_ofrece_la_salida() -> None:
+    """Un filtro que esconde todo tiene que decir cuál es, no parecer un fallo."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        # Una ventana en la que no cae ningún mercado de los de prueba.
+        pagina._window.addItem("en nada", timedelta(seconds=1))
+        _select(pagina, "en nada")
+
+        assert pagina._table.rowCount() == 0
+        motivo = pagina._markets_empty.text()
+        assert str(len(pagina._all_reports)) in motivo
+        assert "todas" in motivo

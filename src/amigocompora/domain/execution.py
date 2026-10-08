@@ -226,14 +226,21 @@ class ExecutionLimits:
                 "poder operar.",
             )
 
-    def check_token(self, symbols: tuple[str, str]) -> None:
-        """Corta si el par toca un token fuera de la lista blanca."""
+    def check_token(self, symbols: tuple[str, ...]) -> None:
+        """Corta si lo que se mueve toca un token fuera de la lista blanca.
+
+        Admite cualquier número de símbolos: un swap mueve un par y una orden de
+        predicción mueve sólo el colateral. La comprobación es la misma —ninguno
+        fuera de la lista—, así que la lista blanca se escribe una vez y vale
+        para los dos caminos.
+        """
         outside = sorted(symbol for symbol in symbols if symbol not in self.allowed_tokens)
         if outside:
             raise ExecutionLimitExceededError(
                 "tokens permitidos",
-                f"el par toca {', '.join(outside)}, que no está en la lista blanca "
-                f"({_list(self.allowed_tokens)}). Añádelo si quieres operar con él.",
+                f"la operación toca {', '.join(outside)}, que no está en la lista "
+                f"blanca ({_list(self.allowed_tokens)}). Añádelo si quieres operar "
+                f"con él.",
             )
 
     def check_chain(self, chain_key: str) -> None:

@@ -29,10 +29,13 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
 from amigocompora.app.container import Container, build_container
+from amigocompora.app.execution_policy import LedgerEntry
 from amigocompora.domain.models import (
+    BroadcastStatus,
     PriceComparison,
     Quote,
     Token,
@@ -97,7 +100,42 @@ def _comparison(pair: TradingPair) -> PriceComparison:
                 fee_bps=BasisPoints(5),
                 price_impact_bps=BasisPoints(1),
                 observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                # Con nota, como las de verdad: es la columna que dice de dónde
+                # sale cada cifra, y sin ella la prueba de que se puede leer
+                # entera estaría afirmando sobre una cadena vacía.
+                source_note="Leído del pool falso contra el estado de la cadena.",
             ),
+        ),
+    )
+
+
+def _comparacion_de(filas: int) -> PriceComparison:
+    """Una comparación con tantas rutas como se pidan, para medir la tabla.
+
+    Cada ruta es un venue distinto: dos filas idénticas no dirían nada sobre el
+    alto, y la tabla mide lo que mide su contenido.
+    """
+    pair = _pair()
+    venues = (
+        Venue(venue_id="fake@base", name="fake", kind=VenueKind.DEX, chain="base"),
+        Venue(venue_id="otro@base", name="otro", kind=VenueKind.DEX, chain="base"),
+    )
+    return PriceComparison(
+        pair=pair,
+        amount_in=pair.base.amount("1"),
+        quotes=tuple(
+            Quote(
+                venue=venues[i % len(venues)],
+                engine_id=f"motor_{i}",
+                pair=pair,
+                amount_in=pair.base.amount("1"),
+                amount_out=pair.quote.amount("2000"),
+                fee_bps=BasisPoints(5),
+                price_impact_bps=BasisPoints(1),
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                source_note=f"Ruta {i}: leída del pool falso contra la cadena.",
+            )
+            for i in range(filas)
         ),
     )
 
@@ -114,9 +152,19 @@ def _store(*, con_cartera: bool) -> InMemorySecretStore:
 
 @asynccontextmanager
 async def _pagina(
-    *, modo: OperationMode, con_cartera: bool, con_planificador: bool
+    *,
+    modo: OperationMode,
+    con_cartera: bool,
+    con_planificador: bool,
+    permitidos: list[str] | None = None,
+    topes: dict[str, str] | None = None,
 ) -> AsyncIterator[tuple[Container, PricesPage]]:
-    config: dict[str, object] = {"mode": modo.value, "execution": _TERMINOS}
+    terminos = dict(_TERMINOS)
+    if permitidos is not None:
+        terminos["allowed_tokens"] = permitidos
+    if topes is not None:
+        terminos.update(topes)
+    config: dict[str, object] = {"mode": modo.value, "execution": terminos}
     if con_planificador:
         config["active_engines"] = {"dex_quotes": "uniswap"}
     container = await build_container(
@@ -225,22 +273,217 @@ async def test_the_button_is_off_and_the_screen_says_why() -> None:
         assert page._swap_btn.isEnabled() is True
 
 
-async def test_the_amount_label_follows_the_direction() -> None:
-    """La cantidad se escribe en la unidad de lo que se entrega, y eso cambia.
+# --------------------------------------------------------------------------- #
+# Los topes de importe, que antes no miraba la pestaña
+# --------------------------------------------------------------------------- #
+#: La comparación de estas pruebas da 2 000 USDC por 1 WETH. Es un número
+#: redondo y grande a propósito: deja el tope por operación y el diario en
+#: cualquier cifra intermedia sin tocar la cotización.
+_SALIDA_DE_LA_COMPARACION = "2000"
+
+
+async def test_el_tope_por_operacion_apaga_el_boton_antes_de_pulsarlo() -> None:
+    """El botón que firma no puede prometer una operación que la política rechaza.
+
+    Se midió con la configuración real: el campo de cantidad trae 1,0, la compra
+    de 1 WETH vale unos 2 605 USDC, y el tope por operación era 1. El botón se
+    encendía igual —esta lista miraba el modo, el interruptor, la lista blanca, el
+    planificador y la cartera, pero no el importe— y el rechazo aparecía sólo al
+    pulsarlo. No se firmaba nada, porque `ExecuteSwap` comprueba los topes antes
+    del diálogo, pero el botón estaba mintiendo, y es justo el botón que no puede.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        topes={"max_quote_per_trade": "1"},
+    ) as (_, page):
+        pair = _pair()
+        page._comparison = _comparison(pair)
+        page._fill_table(page._comparison)
+        page._table.selectRow(0)
+
+        assert page._exec_btn.isEnabled() is False
+        nota = page._exec_note.text()
+        assert "importe por operación" in nota
+        assert _SALIDA_DE_LA_COMPARACION in nota
+        # Y el camino que no firma sigue abierto: preparar el payload no gasta.
+        assert page._swap_btn.isEnabled() is True
+
+
+async def test_el_tope_diario_cuenta_lo_que_ya_se_gasto() -> None:
+    """El tope de 24 h no es lo de esta sesión: sale del registro de ejecuciones.
+
+    Es la mitad que un «suma lo que lleves en memoria» no cubriría, y por eso el
+    asiento se escribe en el registro del contenedor y no se pasa por parámetro:
+    lo que se comprueba es que la pestaña **lee el registro**, que es lo único que
+    hace que reiniciar la aplicación no borre el tope.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        topes={"max_quote_per_trade": "2000", "max_quote_per_day": "2500"},
+    ) as (container, page):
+        container.policy.ledger.append(
+            LedgerEntry(
+                occurred_at=datetime.now(UTC),
+                chain="base",
+                pair="WETH/USDC",
+                engine_id="uniswap",
+                notional="1000",
+                notional_symbol="USDC",
+                tx_hash="0x" + "ab" * 32,
+                status=BroadcastStatus.SUCCESS.value,
+                recipient="0x" + "cd" * 20,
+                description="asiento de prueba",
+            )
+        )
+
+        pair = _pair()
+        page._comparison = _comparison(pair)
+        page._fill_table(page._comparison)
+        page._table.selectRow(0)
+
+        assert page._exec_btn.isEnabled() is False
+        nota = page._exec_note.text()
+        assert "24 h" in nota
+        # Los tres números, para que la cuenta se pueda rehacer leyendo: lo que ya
+        # había, lo que sumaría y contra qué máximo.
+        assert "1000" in nota
+        assert _SALIDA_DE_LA_COMPARACION in nota
+        assert "2500" in nota
+
+
+async def test_sin_topes_el_boton_no_se_apaga_por_este_motivo() -> None:
+    """Sin topes declarados no hay nada que decir, y el botón sigue encendido.
+
+    Es la guarda contra el arreglo de más: la comprobación nueva se añade a una
+    lista que, cuando está vacía, es lo único que enciende el botón. Una
+    comprobación que se equivocara hacia «bloqueado» apagaría el botón en toda
+    instalación sin topes, que es la instalación por omisión.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        assert container.policy.limits.max_quote_per_trade is None
+        assert container.policy.limits.max_quote_per_day is None
+
+        pair = _pair()
+        page._comparison = _comparison(pair)
+        page._fill_table(page._comparison)
+        page._table.selectRow(0)
+
+        assert page._exec_btn.isEnabled() is True
+        assert page._exec_note.text() == ""
+
+
+# --------------------------------------------------------------------------- #
+# El modo: decirlo, y dejar cambiarlo a quien puede cambiarlo
+# --------------------------------------------------------------------------- #
+async def test_el_modo_que_bloquea_se_ofrece_con_su_atajo() -> None:
+    """Cuando lo único que falta es el modo, al lado del aviso va el cambio.
+
+    El mensaje decía «cambia a EJECUCIÓN» y dejaba al usuario buscando dónde.
+    El atajo no cambia el modo por su cuenta: lo cambia **cuando alguien lo
+    pulsa**, que es la única forma que `ModeGuard.set_mode` admite.
+
+    Se comprueba sobre `isHidden()` y no sobre `isVisible()` a propósito: en una
+    ventana que nunca se ha mostrado —que es como corre esto— todos los widgets
+    son «invisibles», así que `isVisible()` no distinguiría el botón que se
+    ocultó del que simplemente no se ha pintado todavía.
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        pair = _pair()
+        page._comparison = _comparison(pair)
+        page._fill_table(page._comparison)
+        page._table.selectRow(0)
+
+        assert page._upgrade_btn.isHidden() is False
+        assert "EJECUCIÓN" in page._upgrade_btn.text()
+
+        page._on_upgrade_mode()
+
+        assert container.guard.mode is OperationMode.EXECUTION
+        assert page._exec_btn.isEnabled() is True
+        assert page._exec_note.text() == ""
+        # Y el atajo desaparece en cuanto deja de hacer falta.
+        assert page._upgrade_btn.isHidden() is True
+
+
+async def test_el_atajo_no_aparece_si_el_modo_no_es_lo_que_falta() -> None:
+    """Ofrecer «cambia de modo» cuando el modo ya está bien sería un botón inútil.
+
+    Es peor que no tenerlo: promete desbloquear algo y al pulsarlo no cambia
+    nada, que es exactamente lo que enseña a desconfiar de los botones.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=False, con_planificador=True
+    ) as (_, page):
+        pair = _pair()
+        page._comparison = _comparison(pair)
+        page._fill_table(page._comparison)
+        page._table.selectRow(0)
+
+        # Falta la cartera, no el modo.
+        assert "cartera" in page._exec_note.text()
+        assert page._upgrade_btn.isHidden() is True
+
+
+# --------------------------------------------------------------------------- #
+# La lista blanca, dicha antes de cotizar
+# --------------------------------------------------------------------------- #
+async def test_un_token_fuera_de_la_lista_blanca_se_marca_en_el_desplegable() -> None:
+    """El desplegable sabe qué se puede ejecutar, y lo enseña desde el principio.
+
+    Descubrirlo al final —cotizar, elegir ruta, llegar al diálogo y que entonces
+    digan que ese token no está permitido— es descubrirlo tarde. Se marca el
+    texto en gris y se explica en el tooltip **sin tocar la etiqueta**: la
+    etiqueta identifica el token y hay código que la busca por texto.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        permitidos=["WETH"],
+    ) as (_, page):
+        page._chain.setCurrentIndex(page._chain.findData("base"))
+
+        fuera = page._base.findText("USDC")
+        assert fuera >= 0
+        assert page._base.itemData(fuera, Qt.ItemDataRole.ForegroundRole) is not None
+        assert "allowed_tokens" in page._base.itemData(fuera, Qt.ItemDataRole.ToolTipRole)
+
+        dentro = page._base.findText("WETH")
+        assert dentro >= 0
+        assert page._base.itemData(dentro, Qt.ItemDataRole.ForegroundRole) is None
+
+
+async def test_the_amount_label_follows_what_you_give() -> None:
+    """La cantidad se escribe en la unidad de lo que **entregas**, no en la otra.
 
     Es la corrección que hace posible comprar: antes el par se armaba siempre
     como `token/stable`, o sea vender, y la etiqueta no decía en qué unidad
     estaba el número. Un importe ambiguo, en una pantalla que firma, es un
     importe equivocado.
+
+    Y el botón de invertir tiene que cambiar **la unidad**, no sólo la etiqueta:
+    si diera la vuelta al par sin mover el importe, el mismo número pasaría a
+    significar diez mil veces otra cosa.
     """
     async with _pagina(
         modo=OperationMode.OBSERVATION, con_cartera=False, con_planificador=False
     ) as (_, page):
-        page._direction.setCurrentIndex(0)  # Comprar
+        page._chain.setCurrentIndex(page._chain.findData("base"))
+        page._base.setCurrentIndex(page._base.findText("USDC"))
+        page._contra.setCurrentIndex(page._contra.findText("WETH"))
         assert page._unit.text() == "USDC"
         assert page._pair.text() == "USDC → WETH"
 
-        page._direction.setCurrentIndex(1)  # Vender
+        page._on_invert()
+
         assert page._unit.text() == "WETH"
         assert page._pair.text() == "WETH → USDC"
 
@@ -347,8 +590,8 @@ async def test_anadir_un_token_no_deshace_la_pata_contraria(
         assert page._contra.currentData().symbol == "WETH"
 
 
-async def test_un_par_contra_el_nativo_se_puede_armar() -> None:
-    """La pata contraria se elige, y con eso se arma un par que no toca el USDC.
+async def test_la_pata_contraria_no_esta_clavada_en_la_stablecoin() -> None:
+    """La segunda pata se elige, y con eso se arma un par que no toca el USDC.
 
     Es el caso que bloqueaba la compra de `bankr`: su única piscina es contra
     WETH, así que un par armado siempre contra la stablecoin no tenía por dónde
@@ -357,16 +600,16 @@ async def test_un_par_contra_el_nativo_se_puede_armar() -> None:
     async with _pagina(
         modo=OperationMode.OBSERVATION, con_cartera=False, con_planificador=False
     ) as (_, page):
+        page._chain.setCurrentIndex(page._chain.findData("base"))
+        page._base.setCurrentIndex(page._base.findText("cbBTC"))
         page._contra.setCurrentIndex(page._contra.findText("WETH"))
-        page._base.setCurrentIndex(page._base.findText("USDC"))
-        page._direction.setCurrentIndex(0)  # Comprar
 
         entrega, recibe = page._legs()
         assert entrega is not None
         assert recibe is not None
-        assert (entrega.symbol, recibe.symbol) == ("WETH", "USDC")
-        assert page._pair.text() == "WETH → USDC"
-        assert page._unit.text() == "WETH"
+        assert (entrega.symbol, recibe.symbol) == ("cbBTC", "WETH")
+        assert page._pair.text() == "cbBTC → WETH"
+        assert page._unit.text() == "cbBTC"
 
 
 async def test_el_mismo_token_en_las_dos_patas_se_dice_y_no_se_cotiza() -> None:
@@ -413,3 +656,101 @@ async def test_un_token_fuera_de_la_lista_blanca_se_nombra() -> None:
             TradingPair(base=base, quote=quote_token("base") or base)
         )
         assert permitido == ()
+
+
+# --------------------------------------------------------------------------- #
+# El alto de las tablas y lo que se dice cuando no hay nada
+# --------------------------------------------------------------------------- #
+async def test_la_tabla_de_rutas_no_reserva_alto_de_mas() -> None:
+    """Una tabla con dos filas no puede medir como una de veinte.
+
+    `QTableWidget` publica un alto natural de 192 px que no tiene nada que ver
+    con lo que lleva dentro. Sin corregirlo, la tarjeta de rutas reservaba ese
+    alto entero para dos filas y dejaba un rectángulo gris debajo de los
+    botones, que se lee como un fallo de pintado y no como «aquí cabe más».
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
+    ) as (_, page):
+        # Sin cotizar, el rótulo ocupa el sitio y la tabla no mide nada.
+        assert page._table.maximumHeight() == 0
+
+        page._comparison = _comparacion_de(1)
+        page._fill_table(page._comparison)
+        una = page._table.maximumHeight()
+        assert 0 < una < 192, "el alto tiene que salir de las filas, no de Qt"
+
+        # Y crece con las filas, porque la tabla de verdad las tiene.
+        page._comparison = _comparacion_de(2)
+        page._fill_table(page._comparison)
+        dos = page._table.maximumHeight()
+        assert dos > una
+
+        # Hasta un tope: veinte rutas no pueden empujar los botones fuera de la
+        # pantalla. A partir de ahí la tabla se desplaza, que es su oficio.
+        page._comparison = _comparacion_de(20)
+        page._fill_table(page._comparison)
+        assert page._table.rowCount() == 20
+        # Diez filas y no veinte: el tope aguanta.
+        assert page._table.maximumHeight() == una + 9 * (dos - una)
+
+
+async def test_sin_rutas_la_tarjeta_no_repite_la_instruccion() -> None:
+    """Una sola frase diciendo qué hacer, no dos seguidas diciendo lo mismo.
+
+    El rótulo que ocupa el sitio de la tabla vacía ya explica que falta cotizar.
+    La línea de «selecciona una ruta» sólo hace falta cuando **sí** hay rutas y
+    ninguna está elegida, que es cuando el usuario ha hecho lo que se le pidió y
+    aun así le falta un paso.
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
+    ) as (_, page):
+        assert "Cotizar" in page._routes_empty.text()
+        assert page._chosen.text() == ""
+
+        # Con filas y sin selección, la línea vuelve: ahora sí falta un paso.
+        page._comparison = _comparison(_pair())
+        page._fill_table(page._comparison)
+        page._table.clearSelection()
+        page._on_quote_selected()
+        assert page._chosen.text().startswith("Selecciona una ruta")
+
+
+async def test_la_nota_recortada_se_puede_leer_entera() -> None:
+    """La columna que dice de dónde sale cada cifra no puede ser ilegible.
+
+    La nota se dibuja en una línea y se recorta —una fila por ruta, para poder
+    comparar de un vistazo—, así que el texto completo tiene que estar en algún
+    sitio. Sin el tooltip, la única columna que explica la procedencia del dato
+    sería justo la que no se puede terminar de leer.
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
+    ) as (_, page):
+        page._comparison = _comparison(_pair())
+        page._fill_table(page._comparison)
+        nota = _celda(page, 0, 7)
+        # La cotización de prueba trae nota: de dónde salió la cifra.
+        assert nota.text()
+        assert nota.toolTip() == nota.text()
+
+
+def _celda(pagina: PricesPage, fila: int, columna: int) -> QTableWidgetItem:
+    item = pagina._table.item(fila, columna)
+    assert item is not None, f"celda vacía en fila {fila}, columna {columna}"
+    return item
+
+
+async def test_el_boton_de_invertir_se_lee_sin_depender_de_la_fuente() -> None:
+    """El único control sin texto al lado lleva una palabra, no un pictograma.
+
+    Con el glifo «⇅» el botón se dibujaba con la fuente que hubiera instalada y
+    salía un signo diminuto que se leía como una letra suelta. Una palabra se
+    lee siempre, y aquí es lo único que dice qué hace el botón.
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
+    ) as (_, page):
+        assert page._invert_btn.text().isalpha()
+        assert page._invert_btn.toolTip()
