@@ -8,22 +8,20 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QTextEdit,
-    QVBoxLayout,
     QWidget,
 )
 
 from amigocompora.app.container import Container
 from amigocompora.domain.protocols import AnalysisRequest
 from amigocompora.ui.theme import COLOR_MUTED
-from amigocompora.ui.widgets import spawn
+from amigocompora.ui.widgets import ScrollArea, spawn
 
 
 class AiPage(QWidget):
     def __init__(self, container: Container, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._container = container
-        lay = QVBoxLayout(self)
-        lay.setSpacing(10)
+        lay = ScrollArea.fill(self, spacing=10).body()
 
         lay.addWidget(QLabel("<b>Pregunta al copiloto</b> — el modelo sólo ve el contexto que escribas abajo (cotizaciones, overround, etc.). No sale a buscar datos por su cuenta."))
 
@@ -51,6 +49,10 @@ class AiPage(QWidget):
         self._answer = QTextEdit()
         self._answer.setReadOnly(True)
         self._answer.setPlaceholderText("La respuesta del copiloto aparecerá aquí…")
+        # Un mínimo de verdad, y no lo que Qt le dé: la respuesta es lo que se viene
+        # a leer, y con la ventana baja se quedaba en una franja de dos líneas. Si
+        # no cabe, la página se desplaza, que es lo que ahora sabe hacer.
+        self._answer.setMinimumHeight(200)
         lay.addWidget(self._answer, stretch=1)
 
         self._disclaimer = QLabel("")

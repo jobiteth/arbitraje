@@ -126,7 +126,13 @@ class BridgesSection(QWidget):
         self._amount.setRange(0.000001, 1_000_000)
         self._amount.setDecimals(6)
         self._amount.setValue(1.0)
-        self._amount.setMinimumWidth(140)
+        # El ancho lo fija lo que el campo **necesita** para enseñar lo que
+        # admite, no lo que parece razonable a ojo: con seis decimales y un tope
+        # de un millón, «123456.789012» no cabe en 140 px. Estaba en 140 y el
+        # campo se recortaba —el mismo defecto que la pantalla de predicción—,
+        # que en un campo de importe significa no poder leer lo que se va a
+        # entregar. El número sale de `sizeHint()`, medido, no de una estimación.
+        self._amount.setMinimumWidth(180)
         self._unit = QLabel("")
         self._unit.setStyleSheet(f"color: {COLOR_MUTED}; font-weight: 700;")
 

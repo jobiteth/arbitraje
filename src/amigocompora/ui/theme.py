@@ -130,6 +130,38 @@ QFrame#legBox {{
     border: 1px solid {COLOR_BORDER_STRONG};
     border-radius: {RADIUS}px;
 }}
+/* El importe que se entrega, en grande y sin caja. Dentro del recuadro de la pata
+   el borde sobra: el recuadro ya dice dónde se escribe, y una caja dentro de otra
+   caja es lo que hacía que este campo pareciera un formulario y no un importe. */
+QLineEdit#amountInput {{
+    background: transparent;
+    border: none;
+    font-size: 26px;
+    font-weight: 700;
+    padding: 2px 0;
+}}
+QLineEdit#amountInput:hover, QLineEdit#amountInput:focus {{
+    background: transparent;
+    border: none;
+}}
+/* El galón que pliega una tarjeta. Sin fondo y sin borde: es un mando, no un
+   botón de acción, y con el azul del acento competiría con los que sí lo son. */
+QPushButton#chevron {{
+    background: transparent;
+    border: 1px solid transparent;
+    color: {COLOR_MUTED};
+    padding: 0;
+    font-size: 12px;
+    font-weight: 700;
+}}
+QPushButton#chevron:hover {{ color: {COLOR_TEXT}; border-color: {COLOR_BORDER_STRONG}; }}
+QPushButton#chevron:checked {{ color: {COLOR_ACCENT}; }}
+/* Las páginas se desplazan dentro de una tarjeta del tema, así que el armazón no
+   pinta nada: el fondo lo pone la ventana. */
+QScrollArea#scrollArea, QWidget#scrollContent {{
+    background: transparent;
+    border: none;
+}}
 QLabel#empty {{
     color: {COLOR_MUTED};
     font-style: italic;
@@ -207,6 +239,18 @@ QPushButton#link {{
     text-align: left;
 }}
 QPushButton#link:hover {{ color: {COLOR_ACCENT_HOVER}; text-decoration: underline; }}
+/* El mando de una fila de tabla: el ⇄ de la cartera. Pequeño, sin relleno y sin
+   competir con el botón principal de la pantalla — es un atajo, no la acción. */
+QPushButton#rowAction {{
+    background: transparent;
+    border: 1px solid {COLOR_BORDER_STRONG};
+    color: {COLOR_ACCENT};
+    padding: 1px 0;
+    font-size: 13px;
+    font-weight: 700;
+}}
+QPushButton#rowAction:hover {{ background: {COLOR_ELEVATED}; border-color: {COLOR_ACCENT}; }}
+QPushButton#rowAction:disabled {{ border-color: {COLOR_BORDER}; color: {COLOR_MUTED}; }}
 QPushButton:focus {{ outline: none; border-color: {COLOR_ACCENT_HOVER}; }}
 
 /* ---------------------------------------------------------------- campos -- */

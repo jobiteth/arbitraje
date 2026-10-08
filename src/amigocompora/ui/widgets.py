@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTableWidget,
     QVBoxLayout,
@@ -236,6 +237,79 @@ def set_empty(table: QTableWidget, placeholder: QLabel, texto: str) -> None:
     table.setVisible(not vacia)
 
 
+class ScrollArea(QWidget):
+    """El armazón de una pestaña: contenido que se desplaza en vez de recortarse.
+
+    Existe por el defecto más visible que ha tenido esta interfaz. Ninguna página
+    se desplazaba y la ventana no baja de 1100x720, así que lo que no cabía **se
+    cortaba**: los botones de «Entre redes» aparecían amputados a media altura,
+    tres campos de Predicción se quedaban en 133 px cuando necesitaban 140, la
+    tarjeta de orden salía aplastada contra su ancho máximo y la tabla de motores
+    enseñaba una fila de quince dentro de noventa píxeles. No era un problema de
+    una pantalla concreta: era que ninguna sabía qué hacer cuando el contenido no
+    cabe, y el sitio donde eso se arregla una vez es aquí.
+
+    `body()` devuelve el layout del contenido **de verdad**, no el del armazón, así
+    que las páginas se siguen construyendo igual: sólo cambia dónde ponen las
+    cosas, y ningún widget ni atributo cambia de nombre.
+
+    La barra horizontal va apagada a propósito: el contenido se reparte a lo ancho,
+    y una barra horizontal es la señal de que algo no se está repartiendo bien.
+    """
+
+    def __init__(self, parent: QWidget | None = None, *, spacing: int = 12) -> None:
+        super().__init__(parent)
+        self.setObjectName("scrollArea")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        contenido = QWidget()
+        contenido.setObjectName("scrollContent")
+        self._body = QVBoxLayout(contenido)
+        # Margen derecho para que la barra de desplazamiento no tape nada cuando
+        # aparece, y ninguno a la izquierda: la tarjeta ya lleva el suyo.
+        self._body.setContentsMargins(0, 0, 6, 0)
+        self._body.setSpacing(spacing)
+        self._scroll.setWidget(contenido)
+        outer.addWidget(self._scroll)
+
+    def body(self) -> QVBoxLayout:
+        """El layout donde van las tarjetas de la página."""
+        return self._body
+
+    @classmethod
+    def fill(cls, page: QWidget, *, spacing: int = 12) -> ScrollArea:
+        """Monta el armazón como único contenido de una página, ya estirado.
+
+        Son cuatro líneas de layout exterior idénticas en las seis pestañas, y
+        escribirlas seis veces es la forma segura de que una acabe con márgenes
+        distintos. La página se pasa por parámetro porque es la que manda en el
+        tamaño; el armazón es lo único que va dentro.
+        """
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        armazon = cls(page, spacing=spacing)
+        outer.addWidget(armazon)
+        return armazon
+
+    def scroll_to(self, widget: QWidget) -> None:
+        """Lleva la vista hasta un widget, sin saltar de pestaña.
+
+        Es lo que sustituye al cambio de pestaña que hacía «Intercambiar este
+        token» cuando la cartera vivía en otra pantalla: ahora comparten scroll, y
+        lo que falta no es irse a otro sitio sino llegar al sitio.
+        """
+        self._scroll.ensureWidgetVisible(widget, 0, 12)
+
+
 class Card(QFrame):
     """Contenedor con borde y fondo de tarjeta, con cabecera opcional.
 
@@ -281,10 +355,25 @@ class Card(QFrame):
             self.header = header_lay
             outer.addWidget(header)
 
-        self._body = QVBoxLayout()
+        # El cuerpo vive dentro de **un widget propio**, y no colgado directamente
+        # del layout exterior. No es un detalle de estilo: es lo que permite
+        # plegar la tarjeta escondiendo una sola cosa.
+        #
+        # Esconder el contenido hijo a hijo —lo que se hacía antes— obligaba a
+        # apuntar cuáles estaban visibles para devolverlos a su sitio al abrir,
+        # porque hay contenido que se esconde solo: la tabla de rutas cuando no
+        # hay rutas y el rótulo que la sustituye. Y esa contabilidad se rompía
+        # por el otro lado: si el estado vacío cambiaba **con la tarjeta ya
+        # plegada**, al abrir se restauraba la foto vieja y volvían a verse las
+        # dos cosas a la vez. Con un contenedor, los hijos conservan su propia
+        # visibilidad intacta y sólo se enseña o se esconde la caja que los
+        # envuelve, así que no hay nada que recordar ni que pueda quedar
+        # desincronizado.
+        self._cuerpo = QWidget()
+        self._body = QVBoxLayout(self._cuerpo)
         self._body.setContentsMargins(14, 12, 14, 12)
         self._body.setSpacing(10)
-        outer.addLayout(self._body)
+        outer.addWidget(self._cuerpo)
 
     def body(self) -> QVBoxLayout:
         """El layout donde va el contenido de la tarjeta."""
@@ -293,6 +382,46 @@ class Card(QFrame):
     def add_row(self, layout: QLayout) -> None:
         """Atajo para añadir una fila horizontal ya montada."""
         self._body.addLayout(layout)
+
+    def set_collapsible(self, *, expanded: bool = False) -> QPushButton:
+        """Pone un galón en la cabecera que muestra y esconde el cuerpo.
+
+        Nace **plegada** por omisión, y ése es el cambio de fondo: una tarjeta que
+        no se usa en cada visita ocupaba su alto entero las cien veces que no se
+        usaba, y ese alto es justo el que empujaba a las demás fuera de la
+        pantalla. Plegada sigue enseñando su título y su subtítulo —o sea, sigue
+        diciendo qué hay dentro— y abre de un clic.
+
+        Lo que se pliega es el widget que envuelve el cuerpo, no sus hijos: así el
+        contenido conserva su propia visibilidad —una tabla vacía seguía vacía
+        mientras estaba plegada— y abrir no tiene que reconstruir ningún estado.
+        """
+        if not hasattr(self, "header"):
+            raise ValueError(
+                "Sólo se puede plegar una tarjeta con cabecera: el galón va en ella. "
+                "Esta se construyó sin título."
+            )
+        self._chevron = QPushButton("▸")
+        self._chevron.setObjectName("chevron")
+        self._chevron.setCheckable(True)
+        self._chevron.setChecked(expanded)
+        self._chevron.setFixedWidth(26)
+        self._chevron.setToolTip("Mostrar u ocultar el contenido de esta tarjeta.")
+        self._chevron.toggled.connect(self._set_body_visible)
+        self.header.addWidget(self._chevron)
+        self._set_body_visible(expanded)
+        return self._chevron
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Abre o cierra la tarjeta desde fuera, como haría el galón."""
+        if not hasattr(self, "_chevron"):
+            raise ValueError("Esta tarjeta no es plegable: llámese antes a set_collapsible.")
+        self._chevron.setChecked(expanded)
+
+    def _set_body_visible(self, visible: bool) -> None:
+        if hasattr(self, "_chevron"):
+            self._chevron.setText("▾" if visible else "▸")
+        self._cuerpo.setVisible(visible)
 
 
 class Chip(QLabel):

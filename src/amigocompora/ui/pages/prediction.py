@@ -90,11 +90,12 @@ from amigocompora.domain.models import (
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import BasisPoints
 from amigocompora.ui.theme import (
+    COLOR_ACCENT,
     COLOR_DANGER,
     COLOR_MUTED,
     COLOR_SUCCESS,
 )
-from amigocompora.ui.widgets import Card, Chip, Field, divider, set_empty, spawn
+from amigocompora.ui.widgets import Card, Chip, Field, ScrollArea, divider, set_empty, spawn
 
 #: Ventanas de cierre que ofrece el selector, de la más corta a la más larga.
 #: `None` es «todas», que es la vista por volumen de siempre.
@@ -188,8 +189,7 @@ class PredictionPage(QWidget):
         super().__init__(parent)
         self._container = container
 
-        lay = QVBoxLayout(self)
-        lay.setSpacing(10)
+        lay = ScrollArea.fill(self, spacing=10).body()
         #: La página entera, guardada porque el alto de las cestas se ajusta en
         #: tiempo de ejecución: ver `_refresh_baskets`.
         self._root_layout = lay
@@ -218,6 +218,26 @@ class PredictionPage(QWidget):
         self._status.setStyleSheet(f"color: {COLOR_MUTED};")
         lay.addWidget(self._status)
 
+        # Los tres pasos, a la vista y con el que toca encendido. La pantalla tiene
+        # tres —elegir mercado, decidir lado y precio, publicar— y no enseñaba
+        # ninguno: la tarjeta de orden parecía un formulario suelto que no hacía
+        # nada, y la pregunta «no sé cómo usar esto» se contestaba con la nada. El
+        # paso encendido sale del estado real, no de un contador que alguien tenga
+        # que ir moviendo: ver `_refresh_steps`.
+        self._steps: list[Chip] = []
+        pasos = QHBoxLayout()
+        pasos.setSpacing(6)
+        for texto in ("1 · Elige un mercado", "2 · Lado y precio", "3 · Publica la orden"):
+            chip = Chip(texto, COLOR_MUTED)
+            self._steps.append(chip)
+            pasos.addWidget(chip)
+        pasos.addStretch()
+        self._step_hint = QLabel("")
+        self._step_hint.setObjectName("hint")
+        self._step_hint.setWordWrap(True)
+        pasos.addWidget(self._step_hint, 1)
+        lay.addLayout(pasos)
+
         self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
             ["Pregunta", "Favorito", "Total %", "Overround", "Coherente", "Cierra"]
@@ -227,6 +247,9 @@ class PredictionPage(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setWordWrap(True)
+        # Un mínimo para que la lista se lea: antes la tabla se repartía el alto que
+        # quedara y acababa en una franja de dos filas.
+        self._table.setMinimumHeight(240)
 
         #: El rótulo que ocupa el sitio de la tabla mientras está vacía. Sin él,
         #: al abrir la pestaña queda un rectángulo gris con encabezados y nada
@@ -288,6 +311,7 @@ class PredictionPage(QWidget):
         self._baskets.setAlternatingRowColors(True)
         self._baskets.setEditTriggers(QTableWidget.NoEditTriggers)
         self._baskets.setWordWrap(True)
+        self._baskets.setMinimumHeight(160)
         lay.addWidget(self._baskets, stretch=1)
 
         #: Mismo recurso que en la pestaña de precios: cuando no hay cestas, el
@@ -544,8 +568,12 @@ class PredictionPage(QWidget):
     def _build_order_card(self) -> Card:
         """La tarjeta que convierte un mercado leído en una orden firmable."""
         card = Card("Operar", subtitle="— orden límite")
-        card.setMinimumWidth(380)
-        card.setMaximumWidth(460)
+        # Ancho mínimo de verdad y **sin tope**: el tope de 460 px era el que
+        # aplastaba los campos —el de precio salía con 89 px cuando necesitaba
+        # 140— y el que dejaba la tarjeta ilegible justo donde se escriben las
+        # cifras que se van a firmar. Con el mínimo, la columna de la tabla se
+        # queda con lo demás, que es lo que tiene que ceder.
+        card.setMinimumWidth(400)
 
         self._order_chip = Chip("", COLOR_MUTED)
         card.header.addWidget(self._order_chip)
@@ -558,6 +586,7 @@ class PredictionPage(QWidget):
         # Resultado y lado en la misma fila: son las dos mitades de «qué» se
         # opera, y comprar «No» es una operación distinta de comprar «Sí».
         self._outcome = QComboBox()
+        self._outcome.setMinimumWidth(150)
         self._outcome.setToolTip(
             "Resultado del mercado. Se puede comprar o vender cualquiera de "
             "ellos: vender «Sí» y comprar «No» no son la misma operación."
@@ -582,6 +611,7 @@ class PredictionPage(QWidget):
         self._shares = QDoubleSpinBox()
         self._shares.setDecimals(2)
         self._shares.setRange(1.0, 1_000_000.0)
+        self._shares.setMinimumWidth(130)
         self._shares.setToolTip(
             "Participaciones. Cada una paga 1 del colateral si el resultado "
             "ocurre, y 0 si no."
@@ -593,6 +623,7 @@ class PredictionPage(QWidget):
         self._price = QDoubleSpinBox()
         self._price.setDecimals(2)
         self._price.setRange(0.01, 0.99)
+        self._price.setMinimumWidth(130)
         self._price.setToolTip(
             "Precio máximo al comprar (mínimo al vender) por participación. Se "
             "propone desde el libro real y se ajusta al salto del mercado. La "
@@ -1165,6 +1196,7 @@ class PredictionPage(QWidget):
 
     def _refresh_order_state(self) -> None:
         market = self._market()
+        self._refresh_steps()
         motivos = self._order_blockers()
         self._submit_btn.setEnabled(market is not None and not motivos)
         # El motivo se enseña sólo cuando ya hay un mercado elegido: antes de eso
@@ -1196,6 +1228,31 @@ class PredictionPage(QWidget):
             f"{symbol} si acierta el resultado, y 0 si no."
         )
         self._refresh_book_label()
+
+    def _refresh_steps(self) -> None:
+        """Enciende el paso en el que está el usuario, y dice qué falta para el siguiente.
+
+        Se lee del estado de verdad —¿hay mercado elegido?, ¿hay libro leído?— y no
+        de un contador que alguien tenga que ir moviendo: un contador hay que
+        acordarse de tocarlo en cada camino que cambia de paso, y el día que se
+        olvide uno la pantalla dirá «paso 1» con una orden ya cargada.
+
+        El libro es lo que separa el paso 2 del 3 porque es lo que separa un precio
+        inventado de uno que se puede cruzar: hasta que no llega, el campo de precio
+        lleva la propuesta del panel y no lo que hay en el libro.
+        """
+        if self._market() is None:
+            actual = 0
+            falta = "Empieza por la tabla: elige el mercado que quieras operar."
+        elif self._depth is None:
+            actual = 1
+            falta = "Elige resultado, lado y participaciones; el libro del resultado se está leyendo."
+        else:
+            actual = 2
+            falta = "Revisa el precio contra el libro y publica la orden."
+        for indice, chip in enumerate(self._steps):
+            chip.set_color(COLOR_ACCENT if indice == actual else COLOR_MUTED)
+        self._step_hint.setText(falta)
 
     def _refresh_book_label(self) -> None:
         """El libro real del resultado, y si el tamaño pedido cabe en él."""

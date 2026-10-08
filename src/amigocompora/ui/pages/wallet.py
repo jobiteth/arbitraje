@@ -310,7 +310,14 @@ class WalletPage(QWidget):
         #: suyo y lo que llega tarde se reconoce por no ser el último.
         self._read_id = 0
 
+        # Un layout normal, **sin** armazón que se desplace, y no por descuido:
+        # esta página ya no es una pestaña. La ventana la mete dentro del scroll de
+        # la pestaña de swap, y un `QScrollArea` dentro de otro no desplaza dos
+        # veces —el de dentro mide lo que le da el de fuera y recorta su propio
+        # contenido, que es exactamente el defecto que se venía a arreglar—. Quien
+        # desplaza es el de fuera; aquí sólo se apila.
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
         lay.addWidget(self._build_header())
         lay.addWidget(self._build_tokens())
@@ -482,9 +489,13 @@ class WalletPage(QWidget):
         )
         card.header.addWidget(self._only_positive)
 
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 6)
+        # La última columna no lleva título: es el botón de cambiar, y un
+        # encabezado encima de un botón sólo ocupa sitio. Va la última para que
+        # `columnCount()` siga creciendo por la derecha y las cinco columnas de
+        # dato no se muevan de sitio.
         self._table.setHorizontalHeaderLabels(
-            ["Token", "Saldo", "Valor", "Red", "Contrato"]
+            ["Token", "Saldo", "Valor", "Red", "Contrato", ""]
         )
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -496,7 +507,9 @@ class WalletPage(QWidget):
         cabecera.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         cabecera.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         cabecera.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        cabecera.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self._table.itemSelectionChanged.connect(self._on_row_selected)
+        self._table.setMinimumHeight(200)
         card.body().addWidget(self._table)
 
         self._empty = QLabel("")
@@ -920,6 +933,33 @@ class WalletPage(QWidget):
             # puenteado, que publican el mismo símbolo.
             contrato.setData(Qt.UserRole, token.address)
         self._table.setItem(indice, 4, contrato)
+        self._table.setCellWidget(indice, 5, self._row_swap_button(holding))
+
+    def _row_swap_button(self, holding: TokenHolding) -> QPushButton:
+        """El botón ⇄ de una fila: intercambiar **ese** token.
+
+        Es la diferencia entre una lista que se mira y una lista con la que se
+        opera. Antes había que seleccionar la fila, bajar a la fila de acciones,
+        pulsar «Intercambiar este token» y **cambiar de pestaña**; cuatro gestos
+        para llevar un token a una tarjeta que ahora está dos centímetros más
+        abajo. El botón lleva su token dentro y no lee la selección, porque pulsar
+        un widget dentro de una celda no selecciona la fila: leerla aquí mandaría
+        el token de la última fila que se tocó, y eso se paga firmando lo que no
+        se quería.
+        """
+        token = holding.token
+        btn = QPushButton("⇄")
+        btn.setObjectName("rowAction")
+        btn.setFixedWidth(30)
+        btn.setEnabled(token.chain in CHAINS)
+        btn.setToolTip(
+            f"Llevar {token.symbol} a la tarjeta de conversión, en "
+            f"{CHAINS[token.chain].name}."
+            if token.chain in CHAINS
+            else f"{CHAINS[token.chain].name} no se puede convertir todavía."
+        )
+        btn.clicked.connect(lambda _=False, t=token: self.swap_requested.emit(t))
+        return btn
 
     def _paint_total(self, snapshot: WalletSnapshot) -> None:
         """El total, o la verdad de por qué no hay total.

@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
 
 from amigocompora.app.container import Container
 from amigocompora.app.usecases.execute_swap import reference_notional
+from amigocompora.app.usecases.scan_opportunities import DEFAULT_MIN_NET_BPS
 from amigocompora.domain.addresses import is_evm_address, is_solana_address
 from amigocompora.domain.chains import CHAINS, AddressFormat, chain
 from amigocompora.domain.errors import (
@@ -70,6 +71,7 @@ from amigocompora.domain.models import (
     TradingPair,
 )
 from amigocompora.domain.modes import Capability
+from amigocompora.domain.money import BasisPoints
 from amigocompora.domain.wallet import ChainHoldings, WalletKind, WalletProfile
 from amigocompora.engines.catalog import quote_token, token_by_address, wrapped_native
 from amigocompora.ui.pages.bridges import BridgesSection
@@ -83,6 +85,7 @@ from amigocompora.ui.widgets import (
     Card,
     Chip,
     Field,
+    ScrollArea,
     format_amount,
     set_empty,
     spawn,
@@ -143,10 +146,23 @@ class PricesPage(QWidget):
         #: Solana un nodo público racionado por ventana—.
         self._reading: set[tuple[str, str]] = set()
 
-        lay = QVBoxLayout(self)
-        lay.setSpacing(12)
+        self._scroll = ScrollArea.fill(self, spacing=12)
+        lay = self._scroll.body()
 
-        lay.addWidget(self._build_converter())
+        self._converter = self._build_converter()
+        lay.addWidget(self._converter)
+        #: El hueco que va justo debajo de la tarjeta de conversión.
+        #:
+        #: Existe porque la lista de tokens tiene que estar **ahí**: es lo que se
+        #: mira justo antes de escribir un importe, y en una pestaña aparte obliga
+        #: a ir y volver para leer un saldo que se está a punto de firmar. La
+        #: coloca la ventana —ver `insert_below_converter`—, y mientras nadie la
+        #: use el hueco no ocupa nada: quien monte esta página sola la sigue
+        #: viendo como siempre.
+        self._below = QVBoxLayout()
+        self._below.setContentsMargins(0, 0, 0, 0)
+        self._below.setSpacing(12)
+        lay.addLayout(self._below)
         # Las dos tablas miden lo que miden sus filas, así que las tarjetas se
         # quedan con su alto natural y el hueco sobrante —una ventana de 940 px
         # con dos rutas dentro— cae al final de la página en vez de repartirse
@@ -155,9 +171,10 @@ class PricesPage(QWidget):
         lay.addWidget(self._build_routes())
         lay.addWidget(self._build_opportunities())
         # Y por último cruzar de red, que es la operación más larga de las tres y
-        # la que menos se hace: se elige igual —entregas, recibes, cuánto— así que
-        # vive aquí y no en una pestaña aparte, pero va después de lo que se usa a
-        # diario. Ver `bridges`.
+        # la que menos se hace. La ventana la lleva a su propia pestaña con
+        # `take_bridges`; si nadie la reclama —una `PricesPage` suelta, que es
+        # como la montan las pruebas— se queda aquí, que es donde ha vivido
+        # siempre.
         self._bridges = BridgesSection(container)
         lay.addWidget(self._bridges)
         # Con peso 1 y no 0: `addStretch()` sin argumento crea un espaciador con
@@ -179,6 +196,47 @@ class PricesPage(QWidget):
         # justo lo que hay que ver **antes** de ponerse a cotizar.
         self._on_quote_selected()
         self._clear_results(_SIN_COTIZAR)
+
+    # ------------------------------------------------------------------ #
+    # Lo que la ventana necesita para componer la pantalla
+    # ------------------------------------------------------------------ #
+    def insert_below_converter(self, widget: QWidget) -> None:
+        """Coloca un bloque justo debajo de la tarjeta de conversión.
+
+        Lo usa la ventana para poner la cartera ahí: el saldo y la lista de tokens
+        son lo que se mira antes de escribir un importe, y tenerlos dos centímetros
+        más abajo —en vez de en otra pestaña— es toda la diferencia entre una
+        pantalla de intercambio y un formulario que manda a buscar los datos a otro
+        sitio.
+
+        Un widget vive en un solo padre, así que esto **mueve** lo que se le pase:
+        no se puede tener a la vez aquí y en su pestaña.
+        """
+        self._below.addWidget(widget)
+
+    def take_bridges(self) -> BridgesSection:
+        """Suelta la sección de puentes para que la coloque quien compone las pestañas.
+
+        Un widget vive en un solo sitio, así que no puede estar a la vez dentro del
+        scroll de cotizaciones y en una pestaña propia. La sección sigue siendo de
+        esta página —comparte su modo y su estado de ejecución, y
+        `refresh_execution_state` la repinta—; lo único que cambia es quién la
+        coloca. Si nadie la reclama, se queda donde está.
+        """
+        self._scroll.body().removeWidget(self._bridges)
+        self._bridges.setParent(None)
+        return self._bridges
+
+    def scroll_to_converter(self) -> None:
+        """Sube la vista hasta la tarjeta de conversión y pone el cursor en el importe.
+
+        Es lo que sustituye al cambio de pestaña que hacía «Intercambiar este
+        token»: ahora la cartera está en el mismo scroll, así que lo que falta no
+        es irse a otro sitio, es volver al sitio donde se escribe —y con el cursor
+        ya dentro, que ahorra el clic que sigue a haber elegido un token.
+        """
+        self._scroll.scroll_to(self._converter)
+        self._amount.setFocus()
 
     # ------------------------------------------------------------------ #
     # Zona 1 — la tarjeta de conversión
@@ -225,7 +283,7 @@ class PricesPage(QWidget):
 
     def _build_converter(self) -> QWidget:
         card = Card(
-            "Convertir",
+            "Intercambiar",
             subtitle="— eliges qué entregas y qué recibes; Amigocompora cotiza la ruta",
         )
 
@@ -239,8 +297,7 @@ class PricesPage(QWidget):
         self._chain = QComboBox()
         for key in sorted(CHAINS):
             self._chain.addItem(f"{CHAINS[key].name} ({key})", key)
-        chain_field = Field("RED")
-        chain_field.add(self._chain, 1)
+        self._chain.setMinimumWidth(190)
 
         # Un token que no está en el catálogo entra por su dirección, y el
         # símbolo y los decimales se leen de su contrato. Es lo que hace que la
@@ -266,10 +323,9 @@ class PricesPage(QWidget):
         )
         self._forget_btn.clicked.connect(self._on_forget_token)
 
-        top.addWidget(chain_field)
         top.addStretch(1)
-        top.addWidget(self._lookup_btn, 0, Qt.AlignBottom)
-        top.addWidget(self._forget_btn, 0, Qt.AlignBottom)
+        top.addWidget(self._lookup_btn)
+        top.addWidget(self._forget_btn)
         card.add_row(top)
 
         # Las dos patas, con el botón de invertir en medio. La cantidad va en la
@@ -285,17 +341,26 @@ class PricesPage(QWidget):
         legs.setSpacing(10)
 
         self._base = QComboBox()
+        self._base.setMinimumWidth(150)
         self._amount = QDoubleSpinBox()
         self._amount.setRange(0.000001, 1_000_000)
         self._amount.setDecimals(6)
         self._amount.setValue(1.0)
-        self._amount.setMinimumWidth(150)
+        # El importe que se entrega es **la** cifra de esta pantalla, y salía del
+        # mismo tamaño y el mismo gris que el nombre de un campo. En grande y sin
+        # flechas de subir y bajar: las flechas son de un formulario, y esto es un
+        # importe. Lo que se teclea lo sigue leyendo el mismo `QDoubleSpinBox` de
+        # siempre —el campo no cambia de tipo, cambia de traje—, así que los topes,
+        # los decimales y el redondeo siguen donde estaban.
+        self._amount.setObjectName("amountInput")
+        self._amount.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self._amount.setMinimumWidth(170)
         self._unit = QLabel("")
         self._unit.setStyleSheet(f"color: {COLOR_MUTED}; font-weight: 700;")
 
         give_box, give_lay, give = self._leg_box("ENTREGAS")
-        give.addWidget(self._base, 1)
-        give.addWidget(self._amount)
+        give.addWidget(self._base)
+        give.addWidget(self._amount, 1)
         give.addWidget(self._unit)
 
         # El saldo disponible de lo que se entrega, con su botón de «Máx».
@@ -353,21 +418,34 @@ class PricesPage(QWidget):
         )
 
         receive_box, _, receive = self._leg_box("RECIBES")
-        receive.addWidget(self._contra, 1)
-        receive.addWidget(self._out_estimate)
+        receive.addWidget(self._contra)
+        receive.addWidget(self._out_estimate, 1)
 
         legs.addWidget(give_box, 1)
         legs.addWidget(self._invert_btn, 0, Qt.AlignCenter)
         legs.addWidget(receive_box, 1)
         card.add_row(legs)
 
-        bottom = QHBoxLayout()
-        self._btn = QPushButton("Cotizar rutas")
-        self._btn.clicked.connect(self._on_quote)
-        bottom.addWidget(self._btn)
+        # La red y el par, debajo de las dos patas y en una sola línea: es el
+        # contexto de lo que se acaba de describir arriba, y en la primera fila
+        # competía por el sitio con los botones de añadir token. Es la línea del
+        # tipo de cambio —«1 ETH ≈ 2,51 USDC»— que remata la tarjeta.
+        contexto = QHBoxLayout()
+        contexto.setSpacing(8)
+        chain_field = Field("RED")
+        chain_field.add(self._chain, 1)
+        contexto.addWidget(chain_field)
+        contexto.addStretch(1)
         self._pair = QLabel("—")
         self._pair.setStyleSheet(f"color: {COLOR_MUTED}; font-weight: 600;")
-        bottom.addWidget(self._pair)
+        contexto.addWidget(self._pair, 0, Qt.AlignBottom)
+        card.add_row(contexto)
+
+        bottom = QHBoxLayout()
+        self._btn = QPushButton("Cotizar rutas")
+        self._btn.setMinimumHeight(34)
+        self._btn.clicked.connect(self._on_quote)
+        bottom.addWidget(self._btn)
         bottom.addStretch()
         self._status = QLabel("")
         self._status.setObjectName("hint")
@@ -478,10 +556,19 @@ class PricesPage(QWidget):
         self._upgrade_btn.setVisible(False)
         note_row.addWidget(self._upgrade_btn)
         card.add_row(note_row)
+        # Nace plegada: sin cotización no hay nada que enseñar, y desplegada
+        # empujaba la cartera fuera de la pantalla en la primera visita —que es
+        # justo cuando el usuario viene a intercambiar, no a leer una tabla
+        # vacía—. Se abre sola en cuanto llega una cotización (`_fill_table`).
+        self._routes_card = card
+        card.set_collapsible(expanded=False)
         return self._hugs_content(card)
 
     def _build_opportunities(self) -> QWidget:
-        card = Card("Oportunidades", subtitle="— diferencial neto ≥ 10 bps")
+        # El umbral se interpola desde el motor y no se escribe a mano: el rótulo
+        # y el estado vacío dicen el mismo número, o el que mienta será uno de los
+        # dos el día que el motor lo cambie.
+        card = Card("Oportunidades", subtitle=f"— diferencial neto ≥ {DEFAULT_MIN_NET_BPS} bps")
         self._opps_empty = QLabel("")
         self._opps_empty.setObjectName("empty")
         self._opps_empty.setWordWrap(True)
@@ -498,6 +585,10 @@ class PricesPage(QWidget):
         self._opp_table.verticalHeader().setVisible(False)
         self._opp_table.setWordWrap(False)
         card.body().addWidget(self._opp_table)
+        # Plegada por el mismo motivo que las rutas —informa, no se opera— y se
+        # abre sola cuando hay una cotización cuyo veredicto acompañar.
+        self._opps_card = card
+        card.set_collapsible(expanded=False)
         return self._hugs_content(card)
 
     # ------------------------------------------------------------------ #
@@ -1044,6 +1135,10 @@ class PricesPage(QWidget):
             self._on_quote_selected()
 
     def _fill_table(self, comp: PriceComparison) -> None:
+        # Se despliega **antes** de rellenar, no después: la tarjeta es la que
+        # dice que la cotización llegó, y plegada el botón «Cotizar» parecería no
+        # haber hecho nada.
+        self._routes_card.set_expanded(True)
         self._table.setRowCount(0)
         self._route_count.setText(f"{len(comp.quotes)} ruta(s) de {comp.pair.base.symbol}")
         for quote in comp.ranked:
@@ -1100,6 +1195,7 @@ class PricesPage(QWidget):
         _cap_height(self._table)
 
     def _fill_opps(self, opps: tuple[Opportunity, ...]) -> None:
+        self._opps_card.set_expanded(True)
         self._opp_table.setRowCount(0)
         for opp in opps:
             row = self._opp_table.rowCount()
@@ -1110,13 +1206,53 @@ class PricesPage(QWidget):
             self._opp_table.setItem(row, 3, QTableWidgetItem(str(opp.net_spread_bps)))
             mark = "✓" if opp.is_actionable else "—"
             self._opp_table.setItem(row, 4, QTableWidgetItem(mark))
-        set_empty(
-            self._opp_table,
-            self._opps_empty,
-            "Ningún diferencial supera el umbral para este importe: los venues "
-            "coinciden dentro de lo que cuesta mover el dinero de uno a otro.",
-        )
+        set_empty(self._opp_table, self._opps_empty, self._motivo_sin_oportunidades())
         _cap_height(self._opp_table)
+
+    def _motivo_sin_oportunidades(self) -> str:
+        """Por qué la tabla está vacía, con el número que lo hace creíble.
+
+        Una tabla vacía no distingue «no hay nada» de «está roto», y esta se
+        quedó con la sospecha: el umbral es de 10 bps —una décima de punto, que
+        es donde las comisiones de los dos lados dejan de comerse el hallazgo— y
+        el mejor diferencial medido en vivo fue de 6 bps. Es decir: la pantalla
+        tenía razón y no lo decía.
+
+        Así que dice tres cosas: cuál es el umbral y de dónde sale, **el mejor
+        diferencial que sí se vio** aunque no llegue, y qué se puede hacer al
+        respecto. El umbral no se toca —es una decisión del motor, no de la
+        vista—; lo que se arregla es el silencio.
+        """
+        umbral = DEFAULT_MIN_NET_BPS
+        if self._comparison is None:
+            return (
+                f"Todavía no has cotizado. El umbral es de {umbral} bps —una "
+                f"décima de punto— porque por debajo las comisiones de los dos "
+                f"lados se comen el hallazgo."
+            )
+        # Se vuelve a derivar sin umbral sobre la comparación que ya está en
+        # pantalla: no cuesta red ninguna y es el mismo cálculo, así que el
+        # número que se enseña sale de las cotizaciones que el usuario acaba de
+        # ver y no de una estimación aparte.
+        vistas = self._container.scan_opportunities.from_comparison(
+            self._comparison, min_net_bps=BasisPoints(0)
+        )
+        mejor = vistas[0] if vistas else None
+        if mejor is None:
+            return (
+                f"Ningún par de venues deja un diferencial neto positivo: con "
+                f"las comisiones de los dos lados, cruzar el dinero de uno a "
+                f"otro cuesta más de lo que separa sus precios. El umbral es de "
+                f"{umbral} bps."
+            )
+        return (
+            f"El mejor diferencial visto ahora es de {mejor.net_spread_bps} bps "
+            f"—{mejor.best.venue.name} contra {mejor.reference.venue.name}—, por "
+            f"debajo del umbral de {umbral} bps. Por debajo de esa décima de "
+            f"punto las comisiones de los dos lados se comen el hallazgo, así "
+            f"que no se reporta. Con un importe mayor el impacto pesa más y el "
+            f"diferencial suele estrecharse, no ensancharse."
+        )
 
     def _clear_results(self, motivo: str) -> None:
         """Deja las dos tablas vacías y **diciendo por qué** están vacías."""

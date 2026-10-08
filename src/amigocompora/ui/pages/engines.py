@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -39,7 +38,7 @@ from amigocompora.infra.secrets import (
     secret_key,
 )
 from amigocompora.ui.theme import COLOR_DANGER, COLOR_MUTED, COLOR_WARNING
-from amigocompora.ui.widgets import Card, spawn
+from amigocompora.ui.widgets import Card, ScrollArea, spawn
 
 
 class EnginesPage(QWidget):
@@ -67,8 +66,7 @@ class EnginesPage(QWidget):
             app_secret_key(AUTONOMY_PASSPHRASE_SECRET): container.passphrase,
         }
 
-        lay = QVBoxLayout(self)
-        lay.setSpacing(10)
+        lay = ScrollArea.fill(self, spacing=10).body()
 
         self._status = QLabel("")
         self._status.setStyleSheet(f"color: {COLOR_MUTED};")
@@ -77,6 +75,10 @@ class EnginesPage(QWidget):
         self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(["ID", "Nombre", "Ranura", "Versión", "Origen", "Activo"])
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Quince motores no caben en la franja que quedaba cuando la página no se
+        # desplazaba: se veía uno. Con este mínimo la tabla se lee entera, y si la
+        # ventana es baja la página se desplaza.
+        self._table.setMinimumHeight(240)
         lay.addWidget(self._table, stretch=1)
 
         row = QHBoxLayout()
@@ -176,7 +178,22 @@ class EnginesPage(QWidget):
 
         self._credentials_rows: dict[str, tuple[QLabel, QPushButton, QPushButton]] = {}
         self._fill_credentials()
+        # Plegada o abierta según haga falta, que es lo que decide si esta tarjeta
+        # es la respuesta a una pregunta o un muro de catorce campos.
+        card.set_collapsible(expanded=self._falta_la_clave())
         return card
+
+    def _falta_la_clave(self) -> bool:
+        """Si la cartera está sin configurar, en los términos que hacen falta aquí.
+
+        Un llavero que no responde cuenta como «falta»: con la tarjeta abierta se
+        ve la descripción de cada credencial, y ahí está la variable de entorno que
+        es la única salida cuando no hay llavero. Cerrarla escondería justo eso.
+        """
+        try:
+            return not self._container.secrets.get(app_secret_key(PRIVATE_KEY_SECRET))
+        except SecretStoreError:
+            return True
 
     def _fill_credentials(self) -> None:
         """Crea una fila por credencial: estado, campo, guardar y borrar.

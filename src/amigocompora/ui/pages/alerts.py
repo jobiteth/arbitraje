@@ -10,13 +10,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QVBoxLayout,
     QWidget,
 )
 
 from amigocompora.app.alerts import AlertCenter
 from amigocompora.ui.theme import COLOR_MUTED, SEVERITY_COLOR
-from amigocompora.ui.widgets import set_empty
+from amigocompora.ui.widgets import ScrollArea, set_empty
 
 #: Lo que se recoge en esta bandeja y de dónde sale, para que una bandeja vacía
 #: no se lea como una pestaña que no funciona. Nombra las tres fuentes reales de
@@ -33,8 +32,7 @@ class AlertsPage(QWidget):
     def __init__(self, center: AlertCenter, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._center = center
-        lay = QVBoxLayout(self)
-        lay.setSpacing(10)
+        lay = ScrollArea.fill(self, spacing=10).body()
 
         top = QHBoxLayout()
         self._count = QLabel("")
@@ -61,6 +59,9 @@ class AlertsPage(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Un mínimo razonable para que la bandeja se lea aunque la ventana sea
+        # baja: si no cabe, la página se desplaza en vez de aplastar la tabla.
+        self._table.setMinimumHeight(260)
         lay.addWidget(self._table, stretch=1)
 
         #: El sitio de la tabla mientras está vacía, con la explicación dentro.

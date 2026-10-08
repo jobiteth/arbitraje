@@ -29,7 +29,7 @@ from amigocompora.ui.theme import (
     COLOR_DANGER,
     STYLESHEET,
 )
-from amigocompora.ui.widgets import AlertBanner, QtConfirmationPrompt, spawn
+from amigocompora.ui.widgets import AlertBanner, QtConfirmationPrompt, ScrollArea, spawn
 
 
 class MainWindow(QMainWindow):
@@ -92,24 +92,41 @@ class MainWindow(QMainWindow):
         self._prices = PricesPage(container)
         self._prediction = PredictionPage(container)
         self._engines = EnginesPage(container)
-        # La cartera va **al lado** del swap, y no al final con las demás, porque
-        # es donde se contesta la pregunta que se hace justo antes de convertir:
-        # cuánto tengo de esto y en qué red. Separarlas por dos pestañas obliga a
-        # ir y volver para leer un saldo que se está a punto de firmar.
         self._wallet = WalletPage(container)
         self._tabs = QTabWidget()
+
+        # La cartera **no** es una pestaña: va dentro de la de swap, justo debajo
+        # de la tarjeta de conversión. Es el orden de una cartera de verdad —lo
+        # que vas a intercambiar arriba, tu cuenta y tus tokens debajo— y es donde
+        # se contesta la pregunta que se hace justo antes de convertir: cuánto
+        # tengo de esto y en qué red. En una pestaña aparte obligaba a ir y volver
+        # para leer un saldo que se está a punto de firmar.
+        self._prices.insert_below_converter(self._wallet)
+
+        # Los puentes sí tienen pestaña propia: cruzar de red es una operación con
+        # sus dos redes, su importe y su ruta, y compartía pantalla con el swap
+        # sin compartir ninguno de sus controles. La sección la sigue construyendo
+        # `PricesPage` —su estado de ejecución es el mismo y su
+        # `refresh_execution_state` la repinta—, y aquí sólo se coloca, dentro de
+        # su propio armazón para que también se desplace cuando no quepa.
+        self._bridges_tab = QWidget()
+        marco = ScrollArea.fill(self._bridges_tab, spacing=12)
+        marco.body().addWidget(self._prices.take_bridges())
+        marco.body().addStretch(1)
+
+        self._alerts_page = AlertsPage(alert_center)
         self._tabs.addTab(self._prices, "Swap")
-        self._tabs.addTab(self._wallet, "Cartera")
+        self._tabs.addTab(self._bridges_tab, "Entre redes")
         self._tabs.addTab(self._prediction, "Predicción")
         self._tabs.addTab(AiPage(container), "Copiloto IA")
         self._tabs.addTab(self._engines, "Motores")
-        self._tabs.addTab(AlertsPage(alert_center), "Alertas")
+        self._tabs.addTab(self._alerts_page, "Alertas")
         lay.addWidget(self._tabs, stretch=1)
 
-        # «Intercambiar este token» en la cartera: se prepara el par en la
-        # pestaña de swap y se cambia a ella. Se cambia **después** de prepararlo
-        # para que el usuario no vea la tarjeta moverse sola: cuando llega, ya
-        # está donde tiene que estar.
+        # «Intercambiar este token» en la cartera: se prepara el par y la vista
+        # vuelve al importe. Ya no hay a dónde cambiarse —la cartera está en esta
+        # misma pestaña—, así que lo que falta no es irse a otro sitio sino subir
+        # al sitio donde se escribe, y con el cursor ya dentro.
         self._wallet.swap_requested.connect(self._on_swap_requested)
         # Y al revés: un token añadido por su dirección en la pestaña de swap
         # entra en la lista de la cartera sin esperar a que se relea la red.
@@ -165,9 +182,15 @@ class MainWindow(QMainWindow):
         self._closing = False
 
     def _on_swap_requested(self, token) -> None:  # type: ignore[no-untyped-def]
-        """Prepara el par con el token de la cartera y se va a la pestaña de swap."""
+        """Prepara el par con el token de la cartera y sube la vista al importe.
+
+        Se prepara **antes** de desplazar: si el scroll se moviese primero, el
+        usuario vería la tarjeta saltar para arriba y cambiar de contenido un
+        instante después. Cuando llega, ya está donde tiene que estar.
+        """
         self._prices.prepare_with_token(token)
         self._tabs.setCurrentWidget(self._prices)
+        self._prices.scroll_to_converter()
 
     def _mode_index(self, mode: OperationMode) -> int:
         """Índice del modo en el desplegable, o 0 si no estuviera.
@@ -217,8 +240,11 @@ class MainWindow(QMainWindow):
         self._banner.show_alert(alert.title, alert.detail, alert.severity.value)
         self._refresh_status()
         # Avisar en la barra de estado de las alertas altas si no se está ya
-        # en la pestaña de alertas.
-        if alert.severity == Severity.HIGH and self._tabs.currentIndex() != 4:
+        # en la pestaña de alertas. Se pregunta por el widget y no por un número
+        # de pestaña: el orden de las pestañas ya cambió una vez, y un índice
+        # escrito a mano hace que este aviso empiece a salir —o a no salir— en la
+        # pestaña equivocada sin que nada falle.
+        if alert.severity == Severity.HIGH and self._tabs.currentWidget() is not self._alerts_page:
             self.statusBar().showMessage(f"⚠ Alerta alta: {alert.title}", 6000)
 
     def _refresh_status(self) -> None:
