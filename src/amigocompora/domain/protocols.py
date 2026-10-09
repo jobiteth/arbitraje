@@ -23,6 +23,7 @@ from typing import Final, Protocol, runtime_checkable
 
 from amigocompora.domain.errors import EngineConfigError
 from amigocompora.domain.models import (
+    BridgeProgress,
     BridgeQuote,
     BridgeRequest,
     MarketDepth,
@@ -522,6 +523,22 @@ class PredictionMarketEngine(Engine, Protocol):
 
     async def market(self, market_id: str) -> PredictionMarket: ...
 
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        """El mercado al que pertenece una posición, por su `conditionId`.
+
+        Es la vuelta atrás para **operar sobre una posición**: la posición
+        publica el contrato (`conditionId`) y su resultado (`tokenId`), no el
+        número del mercado, y la tarjeta de orden necesita el mercado entero
+        —tick, tamaño mínimo, precios—. Se busca por el contrato y no por el
+        nombre: el nombre se repite entre mercados y el `conditionId` es la
+        clave.
+
+        Si el mercado existe pero ya no se puede operar —cerrado, resuelto, sin
+        precios publicados— se lanza un error con el motivo, en vez de devolver
+        algo a medias: quien llama esto necesita operar, no mirar.
+        """
+        ...
+
     async def book(self, token_id: str) -> MarketDepth:
         """El libro real de un resultado: qué hay que pagar por cada participación.
 
@@ -531,6 +548,45 @@ class PredictionMarketEngine(Engine, Protocol):
         participación.
         """
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class WalletChannelCredentials:
+    """Las credenciales del relayer con las que se opera la deposit wallet.
+
+    Son **dos pares que no son lo mismo** y por eso viajan juntos pero
+    separados: la Builder key —clave pública, secreto y frase de paso— firma las
+    peticiones al relayer y es la única que puede desplegar la wallet; la
+    Relayer key, con su dirección, sólo sirve para operaciones de esa misma
+    dirección. La representación no muestra ningún secreto.
+    """
+
+    builder_api_key: str
+    builder_secret: str
+    builder_passphrase: str
+    relayer_api_key: str | None = None
+    relayer_address: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"WalletChannelCredentials(builder_api_key={self.builder_api_key[:6]}…, "
+            f"relayer_address={self.relayer_address or 'ninguna'}, secretos ocultos)"
+        )
+
+
+@runtime_checkable
+class WalletChannelSource(Protocol):
+    """De dónde salen las credenciales del canal de la deposit wallet.
+
+    Se pregunta con `available()` antes de operar —el caso de uso decide con eso
+    si opera por la wallet o por la EOA— y se piden con `require()` sólo en el
+    momento de usarlas, igual que la clave privada: prestadas por llamada y sin
+    cachearlas en ningún objeto de larga vida.
+    """
+
+    def available(self) -> bool: ...
+
+    def require(self) -> WalletChannelCredentials: ...
 
 
 @runtime_checkable
@@ -592,7 +648,11 @@ class PredictionOrderPlanner(PredictionMarketEngine, Protocol):
         ...
 
     def sign_order(
-        self, order: PredictionOrder, *, private_key: str
+        self,
+        order: PredictionOrder,
+        *,
+        private_key: str,
+        wallet: str | None = None,
     ) -> SignedPredictionOrder:
         """Firma la orden y **comprueba su propia firma** antes de devolverla.
 
@@ -600,6 +660,9 @@ class PredictionOrderPlanner(PredictionMarketEngine, Protocol):
         falla si no es la de la clave. Un fallo aquí se detecta sin red y sin
         fondos, mientras que el mismo fallo descubierto al publicar cuesta una
         orden rechazada y una tarde de duda entre «la firma» y «el saldo».
+
+        Con `wallet` la orden sale a nombre de la deposit wallet (tipo de firma 3):
+        la clave firma por dentro y `maker` = `signer` = la wallet.
         """
         ...
 
@@ -648,6 +711,77 @@ class PredictionOrderPlanner(PredictionMarketEngine, Protocol):
         recinto sobre la colección que las contiene, y esa colección es un hecho
         del recinto —una dirección medida— que la capa de aplicación no tiene por
         qué conocer. Escribirla allí ataría el caso de uso a un recinto concreto.
+        """
+        ...
+
+    # ----------------------------------------------------------------- #
+    # Deposit wallet: el canal con el que el recinto admite operar
+    # ----------------------------------------------------------------- #
+    #: Estos cuatro métodos son un canal **aparte**, no una variante del de la
+    #: EOA: el recinto de Polymarket rechaza las órdenes cuyo `maker` es una EOA
+    #: desnuda —«maker address not allowed, please use the deposit wallet
+    #: flow», medido— y ofrece en su lugar una wallet de depósito desplegada por
+    #: su relayer. El canal lo paga el relayer (sin gas para el usuario), lo
+    #: firma la misma clave de la EOA (por dentro, ERC-7739) y la aplicación lo
+    #: usa sólo cuando hay credenciales configuradas. Los declara el motor
+    #: porque son hechos de su recinto; la capa de aplicación no puede
+    #: deducirlos.
+
+    def settlement_wallet(self, owner: str) -> str:
+        """La deposit wallet de `owner`. Pura: se deriva, no se pregunta.
+
+        La dirección sale del dueño, de la factoría y del beacon, así que se
+        conoce **antes** de desplegarla y se puede enseñar sin tocar la red.
+        """
+        ...
+
+    async def deploy_settlement_wallet(
+        self, *, owner: str, credentials: WalletChannelCredentials
+    ) -> str:
+        """Despliega la deposit wallet de `owner` por el relayer y **espera**.
+
+        Devuelve la dirección desplegada, y sólo cuando el relayer la confirma:
+        devolver antes dejaría el paso siguiente apuntando a una dirección sin
+        código. La dirección confirmada se contrasta con la derivada; si no
+        coinciden, manda el relayer y el motor lo dice en vez de seguir.
+        """
+        ...
+
+    async def approve_wallet_collateral(
+        self,
+        *,
+        owner: str,
+        collateral: Token,
+        spender: str,
+        private_key: str,
+        credentials: WalletChannelCredentials,
+    ) -> str:
+        """Concede el permiso del colateral **desde la deposit wallet**.
+
+        La firma del lote la hace la clave de `owner` (ERC-7739 por dentro) y
+        lo ejecuta el relayer. **El importe lo impone el canal**: el relayer de
+        Polymarket exige `MaxUint256` para el permiso del intercambio (medido:
+        una aprobación por el importe exacto se rechaza), así que aquí el
+        permiso queda sin tope, y quien lo enseñe al usuario tiene que decirlo
+        con esas palabras. Devuelve el identificador del relayer, que **no** es
+        un hash de cadena.
+        """
+        ...
+
+    async def approve_wallet_shares(
+        self,
+        *,
+        owner: str,
+        collection: str,
+        spender: str,
+        private_key: str,
+        credentials: WalletChannelCredentials,
+    ) -> str:
+        """Autoriza la colección de participaciones **desde la deposit wallet**.
+
+        Mismo canal que el permiso del colateral, con el permiso sin importe del
+        estándar ERC-1155 (`setApprovalForAll`): alcanza a todas las
+        participaciones de esa colección, no sólo a las de una orden.
         """
         ...
 
@@ -778,3 +912,31 @@ class EngineProvider(Protocol):
     def create(self, config: Mapping[str, str]) -> Engine:
         """Instancia el motor. No debe hacer I/O: eso es trabajo de `aopen()`."""
         ...
+
+
+@runtime_checkable
+class BridgeTracker(Protocol):
+    """Un motor de puente que sabe decir en qué va un cruce ya emitido.
+
+    Es opcional y aparte de `CrossChainPlanner`: no todo motor que planifica
+    puentes puede seguirlos. Quien no implementa esto se muestra como «sin
+    seguimiento» en vez de inventarse pasos.
+    """
+
+    async def track_bridge(
+        self, tx_hash: str, *, origin_chain: str, destination_chain: str
+    ) -> BridgeProgress: ...
+
+
+@runtime_checkable
+class BridgeReceiver(Protocol):
+    """Un motor de puente cuyo destino exige una segunda transacción firmada.
+
+    CCTP mintea en destino con una llamada aparte, que sólo se puede construir
+    cuando el emisor ha atestado la quema. Quien no lo implementa cruza en una sola
+    transacción y no necesita este paso.
+    """
+
+    async def prepare_receive(
+        self, tx_hash: str, *, origin_chain: str, destination_chain: str
+    ) -> UnsignedTransaction | None: ...

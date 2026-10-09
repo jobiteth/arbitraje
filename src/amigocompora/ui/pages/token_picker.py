@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 from amigocompora.app.container import Container
 from amigocompora.domain.chains import CHAINS
 from amigocompora.domain.models import Token
+from amigocompora.ui import icons
 from amigocompora.ui.theme import COLOR_MUTED, COLOR_WARNING
 from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import format_amount, tokens_for_chain
@@ -220,6 +221,7 @@ class TokenPickerDialog(QDialog):
         self._table.insertRow(fila)
 
         nombre = QTableWidgetItem(token.qualified_symbol)
+        nombre.setIcon(icons.token_icon(token.display_symbol))
         nombre.setData(Qt.UserRole, token)
         if token.is_native:
             nombre.setToolTip("Es la moneda de la red: paga el gas y no necesita aprobación.")

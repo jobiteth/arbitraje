@@ -11,13 +11,19 @@ from __future__ import annotations
 import pytest
 
 from amigocompora.domain.errors import KeyCustodyError, NoWalletError
-from amigocompora.domain.protocols import EngineKind, EngineManifest
+from amigocompora.domain.protocols import EngineKind, EngineManifest, WalletChannelCredentials
 from amigocompora.infra.secrets import (
     AUTONOMY_PASSPHRASE_SECRET,
+    POLYMARKET_BUILDER_KEY_SECRET,
+    POLYMARKET_BUILDER_PASSPHRASE_SECRET,
+    POLYMARKET_BUILDER_SECRET_SECRET,
+    POLYMARKET_RELAYER_ADDRESS_SECRET,
+    POLYMARKET_RELAYER_KEY_SECRET,
     PRIVATE_KEY_SECRET,
     AutonomyPassphraseProvider,
     InMemorySecretStore,
     MissingSecretError,
+    PolymarketWalletChannelProvider,
     SecretStoreError,
     SpendingKeyProvider,
     app_env_var_name,
@@ -286,6 +292,162 @@ def test_the_passphrase_is_never_echoed_by_the_provider() -> None:
     provider = AutonomyPassphraseProvider(store)
     assert "no-debe-salir" not in repr(provider)
     assert "no-debe-salir" not in str(provider)
+
+
+# --------------------------------------------------------------------------- #
+# `PolymarketWalletChannelProvider` — las credenciales del canal de la wallet
+# --------------------------------------------------------------------------- #
+#: Las cinco credenciales del canal, por su nombre en el llavero: sirven para
+#: borrarlas del entorno al empezar, y que en estas pruebas lo que responda sea
+#: el almacén y no algo que estaba puesto de antes.
+_BUILDER = (
+    POLYMARKET_BUILDER_KEY_SECRET,
+    POLYMARKET_BUILDER_SECRET_SECRET,
+    POLYMARKET_BUILDER_PASSPHRASE_SECRET,
+)
+_RELAYER = (POLYMARKET_RELAYER_KEY_SECRET, POLYMARKET_RELAYER_ADDRESS_SECRET)
+
+RELAYER_ADDRESS = "0x31f4Cc01976Ace75A5646272352E270Db6f39584"
+
+#: Los valores de la Builder key de prueba, en constantes: un literal con forma
+#: de credencial en la llamada al constructor lo señala el linter —con razón: es
+#: la forma en que una credencial acaba escrita en el código.
+SECRETO_BUILDER = "builder-secreto"
+FRASE_BUILDER = "builder-frase"
+
+
+def _solo_el_llavero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deja el entorno fuera del canal: si algo responde, es el almacén."""
+    for name in _BUILDER + _RELAYER:
+        monkeypatch.delenv(app_env_var_name(name), raising=False)
+
+
+def _builder_en(store: InMemorySecretStore) -> None:
+    store.set(app_secret_key(POLYMARKET_BUILDER_KEY_SECRET), "builder-publica")
+    store.set(app_secret_key(POLYMARKET_BUILDER_SECRET_SECRET), SECRETO_BUILDER)
+    store.set(app_secret_key(POLYMARKET_BUILDER_PASSPHRASE_SECRET), FRASE_BUILDER)
+
+
+def test_el_canal_necesita_las_tres_del_builder_y_admite_la_relayer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Las cinco, y leídas en el momento: el proveedor no se queda con ninguna."""
+    _solo_el_llavero(monkeypatch)
+    store = InMemorySecretStore()
+    _builder_en(store)
+    store.set(app_secret_key(POLYMARKET_RELAYER_KEY_SECRET), "relayer-clave")
+    store.set(app_secret_key(POLYMARKET_RELAYER_ADDRESS_SECRET), RELAYER_ADDRESS)
+    provider = PolymarketWalletChannelProvider(store)
+
+    assert provider.available() is True
+    assert provider.require() == WalletChannelCredentials(
+        builder_api_key="builder-publica",
+        builder_secret=SECRETO_BUILDER,
+        builder_passphrase=FRASE_BUILDER,
+        relayer_api_key="relayer-clave",
+        relayer_address=RELAYER_ADDRESS,
+    )
+
+
+def test_sin_las_tres_del_builder_no_hay_canal_y_se_dice_cual_falta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`available()` es para decidir —no lanza—; `require()` dice **cuál** falta.
+
+    La ausencia más probable es la de la frase de paso, que se copia a mano al
+    configurar la Builder key: el error la nombra para que no haya que adivinar
+    qué de las tres es lo que falta.
+    """
+    _solo_el_llavero(monkeypatch)
+    store = InMemorySecretStore()
+    store.set(app_secret_key(POLYMARKET_BUILDER_KEY_SECRET), "builder-publica")
+    store.set(app_secret_key(POLYMARKET_BUILDER_SECRET_SECRET), "builder-secreto")
+    provider = PolymarketWalletChannelProvider(store)
+
+    assert provider.available() is False
+    with pytest.raises(MissingSecretError) as caught:
+        provider.require()
+    mensaje = str(caught.value)
+    assert POLYMARKET_BUILDER_PASSPHRASE_SECRET in mensaje
+    assert "canal de la deposit wallet" in mensaje
+
+
+def test_la_relayer_key_a_medias_no_se_usa(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Una Relayer key sin su dirección no autentica nada, así que se descarta.
+
+    Y no se descarta el canal entero: la Builder key sola basta para los lotes
+    —medido—, así que quedarse sin la Relayer key es perder una comodidad, no la
+    capacidad de operar por la wallet.
+    """
+    _solo_el_llavero(monkeypatch)
+    store = InMemorySecretStore()
+    _builder_en(store)
+    store.set(app_secret_key(POLYMARKET_RELAYER_KEY_SECRET), "relayer-clave")
+    credenciales = PolymarketWalletChannelProvider(store).require()
+
+    assert credenciales.relayer_api_key is None
+    assert credenciales.relayer_address is None
+
+
+def test_un_llavero_roto_no_es_un_canal_roto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un almacén caído se lee como «no hay canal», y se opera por la EOA.
+
+    La decisión recae del lado seguro —el camino admite las dos formas— y, a
+    diferencia de la clave privada, quedarse sin estas credenciales no impide
+    operar: sólo cambia el canal. Por eso no lanza, sólo contesta que no.
+    """
+    _solo_el_llavero(monkeypatch)
+    provider = PolymarketWalletChannelProvider(BrokenStore())
+    assert provider.available() is False
+
+
+def test_las_credenciales_del_canal_pueden_venir_del_entorno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El respaldo viene encendido, como en el resto de las claves de API.
+
+    No es la clave privada y la asimetría tiene motivo: una API key filtrada se
+    rota en un minuto, y estas dos no pueden mover un céntimo sin una firma de
+    la cartera, que no viaja por el entorno. Se apaga si se pide.
+    """
+    _solo_el_llavero(monkeypatch)
+    for name, valor in (
+        (POLYMARKET_BUILDER_KEY_SECRET, "builder-del-entorno"),
+        (POLYMARKET_BUILDER_SECRET_SECRET, "secreto-del-entorno"),
+        (POLYMARKET_BUILDER_PASSPHRASE_SECRET, "frase-del-entorno"),
+    ):
+        monkeypatch.setenv(app_env_var_name(name), valor)
+
+    assert PolymarketWalletChannelProvider(InMemorySecretStore()).available() is True
+    assert (
+        PolymarketWalletChannelProvider(
+            InMemorySecretStore(), allow_env_fallback=False
+        ).available()
+        is False
+    )
+
+
+def test_las_credenciales_del_canal_no_se_ecoen_al_representarlas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El camino por el que un secreto se filtra sin que nadie lo escriba: un log.
+
+    Se registra el contenedor entero para depurar y el `repr()` acaba dentro. La
+    dirección de la Relayer key sí aparece: es pública y es el dato con el que se
+    comprueba de qué cuenta es la clave.
+    """
+    _solo_el_llavero(monkeypatch)
+    store = InMemorySecretStore()
+    _builder_en(store)
+    store.set(app_secret_key(POLYMARKET_RELAYER_KEY_SECRET), "relayer-clave-no-debe-salir")
+    store.set(app_secret_key(POLYMARKET_RELAYER_ADDRESS_SECRET), RELAYER_ADDRESS)
+    credenciales = PolymarketWalletChannelProvider(store).require()
+
+    texto = repr(credenciales)
+    assert "builder-secreto" not in texto
+    assert "builder-frase" not in texto
+    assert "relayer-clave-no-debe-salir" not in texto
+    assert RELAYER_ADDRESS in texto
 
 
 # --------------------------------------------------------------------------- #

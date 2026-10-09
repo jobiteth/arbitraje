@@ -29,6 +29,22 @@ No se parece en el **desenlace**, y esa diferencia manda en tres sitios:
    exige credenciales que el recinto sólo entrega a quien firma un mensaje de
    nivel 1. Se pide en cada momento y se suelta; no se guarda en ningún objeto.
 
+### El canal: la EOA o la deposit wallet
+
+El recinto decide quién puede operar, y hoy admite dos canales. El de siempre es
+la EOA: el `maker` de la orden es la dirección de la clave. El otro —medido:
+una orden con la EOA de `maker` se rechaza con «maker address not allowed,
+please use the deposit wallet flow»— es la **deposit wallet** que el relayer de
+Polymarket despliega y paga: la clave sigue firmando (por dentro, ERC-7739)
+pero el `maker` es la wallet.
+
+Con credenciales del relayer configuradas se opera por la wallet, y eso cambia
+tres pasos: el permiso del colateral lo concede el relayer —que **exige el
+importe máximo**, no el exacto—, la wallet tiene que estar desplegada y con
+fondos antes de firmar, y el permiso se relee en la cadena después de que el
+relayer confirme. Sin esas credenciales se opera por la EOA, con las reglas de
+siempre. Cuál se usó se ve en el diálogo y en el asiento.
+
 ### El orden de los pasos
 
 1. **El modo, antes que nada**: en `OBSERVACIÓN`, `SIMULACIÓN` o `ASISTIDO` esto
@@ -73,7 +89,11 @@ from amigocompora.domain.models import (
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import TokenAmount
-from amigocompora.domain.protocols import PredictionOrderPlanner
+from amigocompora.domain.protocols import (
+    PredictionOrderPlanner,
+    WalletChannelCredentials,
+    WalletChannelSource,
+)
 from amigocompora.infra.evm.broadcast import (
     EvmBroadcaster,
     build_approve_calldata,
@@ -105,6 +125,11 @@ class PlacePredictionOrder:
     #: Un emisor por red, para los permisos previos. Se recibe como mapa y no
     #: como registro para que este caso de uso no dependa de `infra.rpc`.
     broadcasters: Mapping[str, EvmBroadcaster] = field(default_factory=dict)
+    #: De dónde salen las credenciales del canal de la deposit wallet. `None` —o
+    #: una fuente sin credenciales— hace que se opere por la EOA, el camino de
+    #: siempre; con ellas se opera por la wallet, que es el canal que el recinto
+    #: admite. Es una capacidad, no un requisito.
+    wallets: WalletChannelSource | None = None
     clock: Clock | None = None
 
     async def __call__(
@@ -141,20 +166,49 @@ class PlacePredictionOrder:
 
         broadcaster = self._broadcaster(market.venue.chain)
 
-        # 4. El permiso previo. Cambia con el lado de la orden, y por eso lo
-        #    decide `_ensure_approval`, que es quien sabe qué token se mueve.
-        await self._ensure_approval(
-            planner, order, collateral, exchange, market, broadcaster
-        )
+        # 4. El canal con el que se opera, y el permiso previo que cada uno pide.
+        #    Con credenciales del relayer se opera por la deposit wallet; sin
+        #    ellas, por la EOA, que es el camino de siempre.
+        credentials = self._wallet_credentials()
+        owner = address_from_key(self.keys.require())
+        wallet: str | None = None
+        if credentials is None:
+            await self._ensure_approval(
+                planner, order, collateral, exchange, market, owner, broadcaster
+            )
+        else:
+            wallet = planner.settlement_wallet(owner)
+            await self._ensure_wallet_ready(
+                planner,
+                order,
+                collateral,
+                exchange,
+                market,
+                owner,
+                wallet,
+                credentials,
+                broadcaster,
+            )
 
-        # 5. El permiso del usuario, con la orden entera delante.
-        await self._authorize(order, exchange, recipient, intent)
+        # 5. El permiso del usuario, con la orden entera delante. Y con el
+        #    destinatario que de verdad cobra: cuando se opera por la wallet, el
+        #    `maker` de la orden es ella, así que las participaciones de la
+        #    compra —y el colateral de la venta— quedan ahí, no en la clave.
+        #    Medido con una compra real: las 5 participaciones aparecieron en la
+        #    wallet y ninguna en la EOA. El intento se rehace con ese
+        #    destinatario para que el asiento diga a dónde fue el dinero de
+        #    verdad; los topes no lo miran —`check_intent` comprueba red, tokens,
+        #    motor e importe—, así que la comprobación ya hecha sigue en pie.
+        receiver = wallet or recipient
+        if receiver != recipient:
+            intent = self._intent(order, planner, collateral, receiver)
+        await self._authorize(order, exchange, receiver, intent, wallet=wallet)
 
         # 6 y 7. Firmar, publicar, anotar. Se firma **el mismo objeto** que se
         #        acaba de enseñar: no se reconstruye, para que no pueda haber
         #        dos respuestas que se separen entre lo confirmado y lo firmado.
         key = self.keys.require()
-        signed = planner.sign_order(order, private_key=key)
+        signed = planner.sign_order(order, private_key=key, wallet=wallet)
         submitted = await planner.submit_order(signed, private_key=key)
 
         self.policy.ledger.record_order(
@@ -173,6 +227,7 @@ class PlacePredictionOrder:
             side=order.side.value,
             order_id=submitted.order_id,
             status=submitted.status,
+            wallet=wallet,
         )
         return submitted
 
@@ -221,18 +276,31 @@ class PlacePredictionOrder:
         exchange: str,
         recipient: str,
         intent: PredictionOrderIntent,
+        *,
+        wallet: str | None = None,
     ) -> None:
         """El permiso para publicar, con la orden entera delante.
 
         Se muestran las dos direcciones con nombres distintos, igual que en el
         camino de swaps: el contrato contra el que se firma y la cartera que
-        recibe. Llamar «destino» a las dos sería no decir ninguna de las dos.
+        recibe. Llamar «destino» a las dos sería no decir ninguna de las dos. Y
+        cuando se opera por la deposit wallet se nombran **las dos** —la clave
+        que firma y la wallet que paga—, porque son direcciones distintas y
+        confundirlas es no saber de dónde sale el dinero.
 
         Y se dice explícitamente que esto **no** es una transacción: quien
         confirma tiene que saber si lo que viene después se puede deshacer, y una
         orden en un libro se puede cancelar mientras nadie la haya cruzado,
         mientras que una transacción emitida no se puede tocar.
         """
+        carteras: tuple[str, ...] = (
+            (f"Firma la cartera: {self.address() or 'sin clave configurada'}",)
+            if wallet is None
+            else (
+                f"Firma la clave: {self.address() or 'sin clave configurada'}",
+                f"Opera la wallet de depósito: {shorten(wallet)} (es la que paga y cobra)",
+            )
+        )
         await self.gateway.authorize(
             Capability.BROADCAST_TX,
             f"Publicar orden en {order.venue_id}",
@@ -245,7 +313,7 @@ class PlacePredictionOrder:
                 f"{'Pagas' if order.is_buy else 'Cobras'}: {order.cost}",
                 f"Importe de referencia: {intent.notional}",
                 f"Contrato que valida la firma: {shorten(exchange)}",
-                f"Firma la cartera: {self.address() or 'sin clave configurada'}",
+                *carteras,
                 f"Recibe: {shorten(recipient)}",
                 "Se firma y se envía al libro de órdenes del recinto. No es una "
                 "transacción: no cuesta gas y se puede cancelar mientras nadie "
@@ -254,7 +322,7 @@ class PlacePredictionOrder:
             transaction=order,
         )
 
-    # ------------------------------------------------------------ permisos  #
+    # --------------------------------------------- permisos: camino de la EOA #
     async def _ensure_approval(
         self,
         planner: PredictionOrderPlanner,
@@ -262,6 +330,7 @@ class PlacePredictionOrder:
         collateral: Token,
         exchange: str,
         market: PredictionMarket,
+        owner: str,
         broadcaster: EvmBroadcaster,
     ) -> None:
         """Deja concedido el permiso que el recinto necesita para liquidar.
@@ -277,7 +346,6 @@ class PlacePredictionOrder:
         Se comprueba antes de conceder en los dos casos, porque volver a conceder
         lo ya concedido es gas tirado.
         """
-        owner = address_from_key(self.keys.require())
         if order.is_buy:
             await self._approve_collateral(
                 order, collateral, exchange, owner, broadcaster
@@ -312,9 +380,7 @@ class PlacePredictionOrder:
                 f"el colateral «{collateral.symbol}» del recinto no tiene dirección "
                 f"en «{order.chain}», así que no hay contrato al que concederle nada."
             )
-        need = TokenAmount.from_decimal(
-            order.cost, collateral.decimals, collateral.symbol, rounding=ROUND_UP
-        ).raw
+        need = _raw_cost(order, collateral)
         granted = await broadcaster.read_allowance(collateral.address, owner, exchange)
         if granted >= need:
             return
@@ -428,6 +494,202 @@ class PlacePredictionOrder:
                 f"No se publica la orden: se quedaría sin liquidar."
             )
 
+    # ------------------------------------- permisos: camino de la deposit wallet #
+    def _wallet_credentials(self) -> WalletChannelCredentials | None:
+        """Las credenciales del canal de la deposit wallet, o `None` si no hay.
+
+        Se piden prestadas por llamada, como la clave privada: la fuente se las
+        queda y este caso de uso sólo las usa para que el motor firme los lotes.
+        Si no hay fuente o no hay credenciales, se opera por la EOA — el canal de
+        la wallet es una capacidad, no un requisito.
+        """
+        if self.wallets is None or not self.wallets.available():
+            return None
+        return self.wallets.require()
+
+    async def _ensure_wallet_ready(
+        self,
+        planner: PredictionOrderPlanner,
+        order: PredictionOrder,
+        collateral: Token,
+        exchange: str,
+        market: PredictionMarket,
+        owner: str,
+        wallet: str,
+        credentials: WalletChannelCredentials,
+        broadcaster: EvmBroadcaster,
+    ) -> None:
+        """Deja la deposit wallet desplegada, con fondos y con el permiso que el recinto exige.
+
+        Es el equivalente de `_ensure_approval` en el canal del relayer, y su
+        orden no es casual:
+
+        1. **Desplegada**: sin código en la dirección no hay contrato que pague
+           ni que firme. El despliegue lo ejecuta el relayer y no cuesta gas, así
+           que no pide confirmación aparte; la orden que sí la pide nombra la
+           wallet, y ahí queda dicho con qué dirección se opera.
+        2. **Con fondos** (al comprar): la orden se paga desde la wallet, no
+           desde la clave. Si no le llega se dice **antes** de firmar, con las
+           dos direcciones y las dos cifras delante.
+        3. **Con permiso**: lo concede el relayer, se espera a su confirmación y
+           se relee en la cadena después, igual que en el camino de la EOA —
+           fiarse del «confirmado» del relayer para el dato del que depende el
+           cobro sería cambiar una medición por una promesa.
+        """
+        if not await broadcaster.has_code(wallet):
+            await planner.deploy_settlement_wallet(owner=owner, credentials=credentials)
+
+        if order.is_buy:
+            await self._require_wallet_funds(order, collateral, owner, wallet, broadcaster)
+            await self._approve_wallet_collateral(
+                planner, order, collateral, exchange, owner, wallet, credentials, broadcaster
+            )
+            return
+        await self._approve_wallet_shares(
+            planner,
+            planner.shares_collection_for(market),
+            exchange,
+            owner,
+            wallet,
+            credentials,
+            broadcaster,
+        )
+
+    async def _require_wallet_funds(
+        self,
+        order: PredictionOrder,
+        collateral: Token,
+        owner: str,
+        wallet: str,
+        broadcaster: EvmBroadcaster,
+    ) -> None:
+        """Comprueba que la wallet puede pagar la orden, y si no lo dice.
+
+        No se mueve dinero automáticamente entre la cartera y la wallet: pasar
+        fondos de una a otra es una transferencia real, y se decide aparte. Lo
+        que sí se hace es decir **qué falta y dónde**, con las dos direcciones
+        delante, en vez de dejar que el recinto rechace la orden con un mensaje
+        que habla de saldos.
+        """
+        need = _raw_cost(order, collateral)
+        saldo = await broadcaster.token_balance(_address_of(collateral), wallet)
+        if saldo < need:
+            raise ExecutionError(
+                f"la wallet de depósito «{wallet}» tiene "
+                f"{_human(saldo, collateral)} y esta orden necesita "
+                f"{_human(need, collateral)}. La orden se paga desde la wallet, no "
+                f"desde la clave: envía fondos desde la cartera «{owner}» a "
+                f"«{wallet}» antes de publicarla."
+            )
+
+    async def _approve_wallet_collateral(
+        self,
+        planner: PredictionOrderPlanner,
+        order: PredictionOrder,
+        collateral: Token,
+        exchange: str,
+        owner: str,
+        wallet: str,
+        credentials: WalletChannelCredentials,
+        broadcaster: EvmBroadcaster,
+    ) -> None:
+        """Deja concedido el permiso del colateral desde la wallet, por el relayer.
+
+        Aquí el importe **no lo elige la aplicación**: el relayer exige el máximo
+        (ver el motor), así que el permiso queda sin tope. El diálogo lo dice con
+        esas palabras porque contradice la regla del camino de la EOA —importe
+        exacto, nunca ilimitado—, y una diferencia así no puede aparecer sin
+        explicación.
+        """
+        need = _raw_cost(order, collateral)
+        granted = await broadcaster.read_allowance(_address_of(collateral), wallet, exchange)
+        if granted >= need:
+            return
+
+        await self.gateway.authorize(
+            Capability.BROADCAST_TX,
+            "Aprobar el colateral desde la wallet de depósito",
+            details=(
+                f"Token: {collateral.symbol} ({shorten(_address_of(collateral))})",
+                "Importe autorizado: ilimitado — lo exige el relayer de Polymarket "
+                "para el permiso del intercambio. En este canal no es una elección "
+                "de la aplicación.",
+                f"Autorizado a gastarlo: {shorten(exchange)} (el recinto)",
+                f"Desde la wallet de depósito: {shorten(wallet)}",
+                "No cuesta gas: la transacción la ejecuta el relayer de Polymarket "
+                "por la wallet. Es un permiso real y duradero mientras no se "
+                "revoque.",
+            ),
+        )
+        await planner.approve_wallet_collateral(
+            owner=owner,
+            collateral=collateral,
+            spender=exchange,
+            private_key=self.keys.require(),
+            credentials=credentials,
+        )
+        # Se relee en la cadena en vez de fiarse de la confirmación del relayer:
+        # la confirmación dice que su transacción salió; el permiso es lo que el
+        # recinto va a leer al cobrar.
+        after = await broadcaster.read_allowance(_address_of(collateral), wallet, exchange)
+        if after < need:
+            raise ExecutionError(
+                f"tras confirmar el relayer, el permiso sobre {collateral.symbol} "
+                f"de la wallet «{wallet}» sigue siendo insuficiente ({after} de "
+                f"{need} en unidad mínima). El recinto no podría cobrar la orden y "
+                f"la rechazaría."
+            )
+
+    async def _approve_wallet_shares(
+        self,
+        planner: PredictionOrderPlanner,
+        collection: str,
+        exchange: str,
+        owner: str,
+        wallet: str,
+        credentials: WalletChannelCredentials,
+        broadcaster: EvmBroadcaster,
+    ) -> None:
+        """Autoriza la colección de participaciones desde la wallet, por el relayer.
+
+        Es un permiso **sin importe** —el estándar ERC-1155 no tiene permiso por
+        cantidad— y el diálogo lo dice con esas palabras, igual que en el camino
+        de la EOA: alcanza a todas las participaciones que esa wallet tenga en la
+        colección, no sólo a las de esta orden.
+        """
+        if await broadcaster.read_operator_approval(collection, wallet, exchange):
+            return
+
+        await self.gateway.authorize(
+            Capability.BROADCAST_TX,
+            "Autorizar las participaciones desde la wallet de depósito",
+            details=(
+                f"Colección (ERC-1155): {shorten(collection)}",
+                f"Autorizado a moverlas: {shorten(exchange)} (el recinto)",
+                f"Desde la wallet de depósito: {shorten(wallet)}",
+                "Aviso: este permiso NO tiene importe. El estándar ERC-1155 sólo "
+                "permite autorizar la colección entera, así que alcanza a todas "
+                "las participaciones que tenga la wallet en este contrato "
+                "condicional, no sólo a las de esta orden.",
+                "No cuesta gas: la transacción la ejecuta el relayer de Polymarket "
+                "por la wallet. Es un permiso real y duradero.",
+            ),
+        )
+        await planner.approve_wallet_shares(
+            owner=owner,
+            collection=collection,
+            spender=exchange,
+            private_key=self.keys.require(),
+            credentials=credentials,
+        )
+        if not await broadcaster.read_operator_approval(collection, wallet, exchange):
+            raise ExecutionError(
+                f"tras confirmar el relayer, el recinto sigue sin poder mover las "
+                f"participaciones de la wallet {shorten(wallet)} en "
+                f"{shorten(collection)}. No se publica la orden: se quedaría sin "
+                f"liquidar."
+            )
+
     # ---------------------------------------------------------------- firma  #
     async def _send(
         self,
@@ -481,6 +743,33 @@ def _label(order: PredictionOrder) -> str:
     saber cuál de las dos se hizo.
     """
     return f"{order.question} — {order.outcome_label}"
+
+
+def _address_of(token: Token) -> str:
+    """La dirección del colateral, o un error que dice qué falta."""
+    if token.address is None:
+        raise ExecutionError(
+            f"el colateral «{token.symbol}» del recinto no tiene dirección, así "
+            f"que no hay contrato contra el que leer ni al que concederle nada."
+        )
+    return token.address
+
+
+def _raw_cost(order: PredictionOrder, collateral: Token) -> int:
+    """El coste de la orden en unidad mínima del colateral, redondeado hacia arriba.
+
+    Hacia arriba por la misma razón que el importe que se mide contra los topes:
+    lo que se compara con un saldo o con un permiso tiene que ser el número que
+    de verdad se mueve —o más—, nunca uno que se quedó corto.
+    """
+    return TokenAmount.from_decimal(
+        order.cost, collateral.decimals, collateral.symbol, rounding=ROUND_UP
+    ).raw
+
+
+def _human(raw: int, token: Token) -> str:
+    """Una cantidad en unidad mínima, en unidades del token. Para los mensajes."""
+    return f"{Decimal(raw) / (10 ** token.decimals):f} {token.symbol}"
 
 
 def _require_success(receipt: BroadcastReceipt, what: str) -> None:

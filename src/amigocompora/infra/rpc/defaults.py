@@ -92,6 +92,11 @@ DEFAULT_ENDPOINTS: Final[Mapping[str, tuple[RpcEndpoint, ...]]] = {
         _public("unichain-rpc.publicnode.com", "publicnode"),
         _public("mainnet.unichain.org", "unichain-oficial"),
     ),
+    # Medidos el 2026-10-08 con `eth_chainId`: 0x13b2 (5042) y 0x1237 (4663). Son
+    # los endpoints oficiales de cada red; no hay un proveedor público alternativo
+    # verificado, así que cada una tiene un solo respaldo.
+    "arc": (_public("rpc.mainnet.arc.io", "arc-oficial"),),
+    "robinhood": (_public("rpc.mainnet.chain.robinhood.com", "robinhood-oficial"),),
     # Solana entra con **uno solo**, y no por falta de candidatos: se probaron
     # ocho el 2026-10-07 y los otros siete quedaron fuera por lo que devolvieron.
     #

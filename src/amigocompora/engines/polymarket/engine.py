@@ -24,8 +24,9 @@ Sin API key: la API Gamma es pública y de sólo lectura.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -52,7 +53,11 @@ from amigocompora.domain.models import (
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import TokenAmount
-from amigocompora.domain.protocols import EngineKind, EngineManifest
+from amigocompora.domain.protocols import (
+    EngineKind,
+    EngineManifest,
+    WalletChannelCredentials,
+)
 from amigocompora.engines.catalog import token_by_address
 from amigocompora.engines.http_source import (
     JsonSource,
@@ -61,6 +66,7 @@ from amigocompora.engines.http_source import (
     optional_decimal,
 )
 from amigocompora.engines.polymarket.clob import ClobClient
+from amigocompora.engines.polymarket.deposit_wallet import derive_beacon_deposit_wallet
 from amigocompora.engines.polymarket.orders import (
     CHAIN_ID,
     CHAIN_KEY,
@@ -70,6 +76,19 @@ from amigocompora.engines.polymarket.orders import (
     build_redeem_calldata,
     exchange_for,
     sign_order,
+)
+from amigocompora.engines.polymarket.relayer import (
+    CONFIRMED_STATE,
+    BuilderCredentials,
+    Call,
+    RelayerClient,
+    RelayerKey,
+    RelayerTransaction,
+    sign_batch,
+)
+from amigocompora.infra.evm.broadcast import (
+    build_approve_calldata,
+    build_set_approval_for_all_calldata,
 )
 
 _log = structlog.get_logger(__name__)
@@ -139,6 +158,18 @@ VENUE: Final = Venue(
 #: último precio que alguien puso, y leerlo como probabilidad engaña.
 MIN_LIQUIDITY_USD: Final = Decimal("1000")
 
+#: Importe que el relayer de Polymarket **exige** al aprobar el colateral desde
+#: la deposit wallet: medido contra el relayer, una aprobación por el importe
+#: exacto se rechaza con «approve to exchange 0xE111… must be MaxUint256». Es
+#: una política del canal, no una preferencia de este código, y por eso la capa
+#: de aplicación no decide aquí: cumple, y lo dice al usuario con esas palabras.
+_MAX_UINT256: Final = (1 << 256) - 1
+
+#: Ventana de validez de un lote firmado para el relayer, en segundos. Un lote
+#: caducado se rechaza, y renovarlo cuesta una firma: media hora es margen de
+#: sobra para el viaje de una petición.
+_WALLET_BATCH_DEADLINE_SECONDS: Final = 1800
+
 #: Cuántos mercados pedir de más para compensar los que se descarten por
 #: liquidez o por formato, y seguir devolviendo `limit` filas útiles.
 _OVERFETCH: Final = 3
@@ -148,7 +179,7 @@ _MAX_FETCH: Final = 200
 class PolymarketEngine:
     """Mercados de predicción reales, de sólo lectura."""
 
-    __slots__ = ("_clock", "_source")
+    __slots__ = ("_clock", "_relayer_poll_attempts", "_relayer_poll_seconds", "_source")
 
     def __init__(
         self,
@@ -156,8 +187,12 @@ class PolymarketEngine:
         clock: Clock | None = None,
         ttl_seconds: float = 20.0,
         timeout_seconds: float = 10.0,
+        relayer_poll_seconds: float = 3.0,
+        relayer_poll_attempts: int = 30,
     ) -> None:
         self._clock = clock or SystemClock()
+        self._relayer_poll_seconds = relayer_poll_seconds
+        self._relayer_poll_attempts = relayer_poll_attempts
         self._source = JsonSource(
             name=SOURCE_NAME,
             allowed_hosts=MANIFEST.allowed_hosts,
@@ -255,6 +290,35 @@ class PolymarketEngine:
                 f"sin liquidez o sin precios publicados."
             )
         return market
+
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        """El mercado de una posición, por el `conditionId` de su contrato.
+
+        Es la vuelta atrás para operar sobre una posición: la posición publica
+        el contrato y su resultado, no el número del mercado, y la tarjeta de
+        orden necesita el mercado entero —su tick, su tamaño mínimo—. Gamma
+        filtra por `condition_ids` y devuelve una lista (medido el 2026-10-09
+        contra el mercado 665374: una fila, el mercado correcto).
+
+        Si el mercado existe pero ya no se puede operar —resuelto, cerrado,
+        sin precios—, `_to_market` lo descarta y se lanza el error con el
+        motivo: quien llama esto necesita operar, no mirar.
+        """
+        payload = await self._source.get_json(
+            f"{API_ROOT}/markets",
+            params={"condition_ids": condition_id},
+        )
+        now = self._clock.now()
+        for raw in as_sequence(payload, "markets", SOURCE_NAME):
+            entry = raw if isinstance(raw, dict) else {}
+            market = self._to_market(entry, now)
+            if market is not None:
+                return market
+        raise EngineNotFoundError(
+            f"el mercado con condición «{condition_id}» no está en {SOURCE_NAME} "
+            f"como mercado operativo: puede estar cerrado, resuelto o sin "
+            f"liquidez publicada."
+        )
 
     # ----------------------------------------------------------------- #
     # Traducción
@@ -368,9 +432,13 @@ class PolymarketEngine:
         )
 
     def sign_order(
-        self, order: PredictionOrder, *, private_key: str
+        self,
+        order: PredictionOrder,
+        *,
+        private_key: str,
+        wallet: str | None = None,
     ) -> SignedPredictionOrder:
-        return sign_order(order, private_key=private_key)
+        return sign_order(order, private_key=private_key, wallet=wallet)
 
     async def submit_order(
         self, signed: SignedPredictionOrder, *, private_key: str
@@ -388,6 +456,201 @@ class PolymarketEngine:
             return await cliente.submit_order(signed)
         finally:
             await cliente.aclose()
+
+    # ----------------------------------------------------------------- #
+    # Deposit wallet: el canal con el que el recinto admite operar
+    # ----------------------------------------------------------------- #
+    def settlement_wallet(self, owner: str) -> str:
+        """La deposit wallet de `owner`. Puro: se deriva, no se pregunta.
+
+        La dirección sale del dueño, de la factoría y del beacon, así que se
+        conoce **antes** de desplegarla y se puede enseñar sin tocar la red. El
+        relayer es la fuente de verdad al desplegar: si confirma una dirección
+        distinta de la derivada, `deploy_settlement_wallet` lo dice en vez de
+        seguir con la calculada.
+        """
+        return derive_beacon_deposit_wallet(owner)
+
+    async def deploy_settlement_wallet(
+        self, *, owner: str, credentials: WalletChannelCredentials
+    ) -> str:
+        """Despliega la deposit wallet de `owner` por el relayer y espera a que confirme.
+
+        El despliegue lo paga el relayer —no cuesta gas— y lo autentica la
+        Builder key, que es la única que ese endpoint admite. Se espera a la
+        confirmación en vez de devolver el identificador: la operación siguiente
+        opera **contra esa wallet**, y devolver antes la dejaría apuntando a una
+        dirección sin código. Y se contrasta lo que el relayer confirma con lo
+        derivado: si no coinciden manda el relayer, y seguir con la calculada
+        mandaría fondos a otro sitio.
+        """
+        derivada = self.settlement_wallet(owner)
+        cliente = _relayer_client(credentials)
+        try:
+            envio = await cliente.submit_wallet_create(owner)
+            _log.info("polymarket.wallet_deploying", transaction_id=envio.transaction_id)
+            ficha = await self._wait_for_relayer(
+                lambda: cliente.wallet_create_status(envio.transaction_id, owner=owner),
+                what="el despliegue de la deposit wallet",
+                transaction_id=envio.transaction_id,
+            )
+        finally:
+            await cliente.aclose()
+        proxy = ficha.proxy_address
+        if proxy is None or proxy.lower() != derivada.lower():
+            raise ExecutionError(
+                f"el relayer confirmó la deposit wallet en "
+                f"«{proxy or 'una dirección sin publicar'}» y la derivada para esta "
+                f"cuenta es «{derivada}». El relayer es la fuente de verdad: no se "
+                f"opera con una dirección que no coincide con la suya."
+            )
+        _log.info("polymarket.wallet_deployed", wallet=derivada)
+        return derivada
+
+    async def approve_wallet_collateral(
+        self,
+        *,
+        owner: str,
+        collateral: Token,
+        spender: str,
+        private_key: str,
+        credentials: WalletChannelCredentials,
+    ) -> str:
+        """Aprueba el colateral al recinto desde la deposit wallet, por el relayer.
+
+        El importe es `MaxUint256` porque el relayer lo exige (ver
+        `_MAX_UINT256`): en este canal el permiso queda sin tope, y eso no es
+        una elección de este código sino una condición del recinto. Quien se lo
+        enseñe al usuario tiene que decirlo con esas palabras.
+        """
+        if collateral.address is None:
+            raise ExecutionError(
+                f"el colateral «{collateral.symbol}» no tiene dirección en "
+                f"«{CHAIN_KEY}»: no hay contrato al que concederle el permiso."
+            )
+        return await self._submit_wallet_calls(
+            owner=owner,
+            calls=(
+                Call(
+                    target=collateral.address,
+                    value=0,
+                    data=build_approve_calldata(spender, _MAX_UINT256),
+                ),
+            ),
+            private_key=private_key,
+            credentials=credentials,
+            what=f"el permiso de {collateral.symbol} al recinto",
+        )
+
+    async def approve_wallet_shares(
+        self,
+        *,
+        owner: str,
+        collection: str,
+        spender: str,
+        private_key: str,
+        credentials: WalletChannelCredentials,
+    ) -> str:
+        """Autoriza la colección de participaciones desde la deposit wallet.
+
+        Mismo canal que el permiso del colateral, con el permiso **sin importe**
+        del estándar ERC-1155: `setApprovalForAll` alcanza a todas las
+        participaciones de esa colección, no sólo a las de una orden.
+        """
+        return await self._submit_wallet_calls(
+            owner=owner,
+            calls=(
+                Call(
+                    target=collection,
+                    value=0,
+                    data=build_set_approval_for_all_calldata(spender, approved=True),
+                ),
+            ),
+            private_key=private_key,
+            credentials=credentials,
+            what="la autorización de las participaciones al recinto",
+        )
+
+    async def _submit_wallet_calls(
+        self,
+        *,
+        owner: str,
+        calls: Sequence[Call],
+        private_key: str,
+        credentials: WalletChannelCredentials,
+        what: str,
+    ) -> str:
+        """Firma un lote con la clave del dueño, lo envía y espera su confirmación.
+
+        La clave entra por parámetro, se usa para firmar el lote y se suelta:
+        el motor no la guarda entre llamadas. Devuelve el identificador del
+        relayer, que **no** es un hash de cadena — con él se consulta el estado,
+        y el asiento del registro no lo confunde con una transacción.
+        """
+        wallet = self.settlement_wallet(owner)
+        cliente = _relayer_client(credentials)
+        try:
+            nonce = await cliente.wallet_nonce(owner)
+            deadline = int(self._clock.now().timestamp()) + _WALLET_BATCH_DEADLINE_SECONDS
+            firma = sign_batch(
+                private_key,
+                chain_id=CHAIN_ID,
+                wallet=wallet,
+                nonce=nonce,
+                deadline=deadline,
+                calls=calls,
+            )
+            envio = await cliente.submit_wallet_batch(
+                owner=owner,
+                wallet=wallet,
+                nonce=nonce,
+                deadline=deadline,
+                calls=calls,
+                signature=firma,
+            )
+            _log.info(
+                "polymarket.wallet_batch_submitted",
+                transaction_id=envio.transaction_id,
+                what=what,
+            )
+            await self._wait_for_relayer(
+                lambda: cliente.batch_status(envio.transaction_id, owner=owner),
+                what=what,
+                transaction_id=envio.transaction_id,
+            )
+        finally:
+            await cliente.aclose()
+        return envio.transaction_id
+
+    async def _wait_for_relayer(
+        self,
+        consulta: Callable[[], Awaitable[RelayerTransaction]],
+        *,
+        what: str,
+        transaction_id: str,
+    ) -> RelayerTransaction:
+        """Sondea la transacción del relayer hasta su estado terminal.
+
+        Sólo devuelve cuando el estado es el confirmado. Agotar el tiempo sin
+        confirmación se dice con un error y **no se sigue**: operar contra una
+        wallet a medio desplegar o sin permiso produce una orden que el recinto
+        rechaza, y el rechazo llegaría con un mensaje que habla de saldos.
+        """
+        ficha: RelayerTransaction | None = None
+        for intento in range(self._relayer_poll_attempts):
+            if intento:
+                await asyncio.sleep(self._relayer_poll_seconds)
+            ficha = await consulta()
+            if ficha.is_terminal:
+                break
+        if ficha is None or ficha.state != CONFIRMED_STATE:
+            estado = ficha.state if ficha is not None else "sin respuesta"
+            raise ExecutionError(
+                f"{what} no llegó a confirmar en el relayer ({estado}, "
+                f"{transaction_id}). No se sigue: sin eso el recinto rechazaría "
+                f"la orden."
+            )
+        return ficha
 
     def collateral_for(self, market: PredictionMarket) -> Token:
         """El USDC **puenteado** de Polygon, que es el colateral del recinto.
@@ -606,6 +869,30 @@ class PolymarketEngine:
 
 
 # --------------------------------------------------------------------------- #
+# El cliente del relayer
+# --------------------------------------------------------------------------- #
+def _relayer_client(credentials: WalletChannelCredentials) -> RelayerClient:
+    """El cliente del relayer del canal de la deposit wallet.
+
+    Se construye por llamada, como el del CLOB: las credenciales entran, se
+    usan y se sueltan, y ningún objeto de larga vida se queda con ellas.
+    """
+    relayer = (
+        RelayerKey(api_key=credentials.relayer_api_key, address=credentials.relayer_address)
+        if credentials.relayer_api_key and credentials.relayer_address
+        else None
+    )
+    return RelayerClient(
+        builder=BuilderCredentials(
+            api_key=credentials.builder_api_key,
+            secret=credentials.builder_secret,
+            passphrase=credentials.builder_passphrase,
+        ),
+        relayer=relayer,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Lectura del formato de la fuente
 # --------------------------------------------------------------------------- #
 def _decode_json_array(value: Any) -> list[Any] | None:
@@ -753,6 +1040,15 @@ def _to_position(fila: Mapping[str, Any], ahora: datetime) -> PredictionPosition
         redeemable=bool(_optional_bool(fila.get("redeemable"))),
         neg_risk=_optional_bool(fila.get("negativeRisk")),
         cur_price=optional_decimal(fila.get("curPrice")),
+        # El precio medio y el resultado no hacen falta para cobrar —eso sólo
+        # necesita `redeemable`—, pero sí para poder decir «cuánto se ha ganado»
+        # al operar sobre una posición viva. Se copian tal como los publica la
+        # fuente y se quedan en `None` si no están: no se calculan aquí, porque
+        # recalcularlos exigiría el histórico de compras, que esta lectura no
+        # trae.
+        avg_price=optional_decimal(fila.get("avgPrice")),
+        cash_pnl=optional_decimal(fila.get("cashPnl")),
+        percent_pnl=optional_decimal(fila.get("percentPnl")),
     )
 
 

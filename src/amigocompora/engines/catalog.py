@@ -148,7 +148,10 @@ _EXTRA_SPECS: Final[Mapping[str, Sequence[tuple[str, int, str]]]] = {
     # mano, y su par contra el nativo es una de las piscinas de más volumen de
     # la red. Va después del nativo para que quien busque «USDC» a secas —una
     # configuración, por ejemplo— encuentre el nativo, que es el de referencia.
-    "polygon": (("USDC", 6, "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),),
+    "polygon": (
+        ("USDC", 6, "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
+        ("pUSD", 6, "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"),
+    ),
     "unichain": (("WBTC", 8, "0x0555e30da8f98308edb960aa94c0db47230d2b9c"),),
     "optimism": (("OP", 18, "0x4200000000000000000000000000000000000042"),),
     "avalanche": (

@@ -1,8 +1,9 @@
 """Pestaña: Mercados de predicción — mirarlos **y operarlos**.
 
 Cuatro zonas. Arriba la búsqueda; en medio, a la izquierda la tabla de mercados y a
-la derecha la tarjeta de orden; abajo las cestas con margen y, debajo, lo que ya
-se resolvió y se puede cobrar.
+la derecha la tarjeta de orden; debajo la wallet de depósito, con su saldo y sus
+posiciones; y abajo las cestas con margen y, debajo, lo que ya se resolvió y se
+puede cobrar.
 
 La tarjeta de orden es la razón de que esta pestaña tenga la forma que tiene. La
 versión anterior leía mercados y no ofrecía ninguna forma de comprar ni de
@@ -34,6 +35,21 @@ dentro del contrato. Es la única operación de la aplicación por la que el din
 las participaciones de quien firma. Lo que sí comparte con las otras dos es la
 regla del botón: apagado **con el motivo escrito**.
 
+### Y la wallet por la que pasa todo
+
+Polymarket ya no opera desde una cartera normal: las compras y las ventas van por
+una **deposit wallet**, un contrato que custodia el colateral y las participaciones
+y que controla la misma clave. La tarjeta de la wallet enseña las dos cosas
+—saldo y posiciones con su precio medio y su resultado— y deja añadirle saldo por
+los dos caminos que de verdad hay: la retirada de siempre con el destino ya
+puesto, o un envío externo a su dirección (que se copia o se enseña en QR). Cada
+fila de su tabla vuelve a la tarjeta de orden con «Vender» o «Comprar más»:
+**cargar no firma** —deja el mercado, el resultado, el lado y el tamaño puestos— y
+revisar y publicar sigue siendo lo de arriba, con sus comprobaciones. Lo que
+todavía no se puede es cobrar sus posiciones resueltas —eso pide un lote del
+relayer que la aplicación aún no construye— y la fila lo dice apagando sus botones
+con el motivo, en vez de ofrecer algo que no existe.
+
 ### Sobre los dos umbrales
 
 Los dos umbrales de las cestas son controles de la vista, no de la consulta: ni
@@ -52,14 +68,17 @@ se hacen las dos cosas.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QButtonGroup,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QHBoxLayout,
     QHeaderView,
@@ -79,6 +98,15 @@ from amigocompora.app.usecases.find_prediction_opportunities import (
     DEFAULT_MIN_EDGE_BPS,
     BasketOpportunity,
 )
+from amigocompora.app.usecases.read_settlement_wallet import (
+    CHAIN_KEY as SETTLEMENT_WALLET_CHAIN,
+)
+from amigocompora.app.usecases.read_settlement_wallet import (
+    SettlementWalletView,
+)
+from amigocompora.app.usecases.withdraw import WALLET_ENGINE_ID
+from amigocompora.domain.addresses import shorten
+from amigocompora.domain.execution import ANY_TOKEN
 from amigocompora.domain.models import (
     MarketDepth,
     MarketOutcome,
@@ -88,14 +116,24 @@ from amigocompora.domain.models import (
     Token,
 )
 from amigocompora.domain.modes import Capability
-from amigocompora.domain.money import BasisPoints
+from amigocompora.domain.money import BasisPoints, TokenAmount
+from amigocompora.ui.pages.wallet import DepositDialog, WithdrawDialog
 from amigocompora.ui.theme import (
     COLOR_ACCENT,
     COLOR_DANGER,
     COLOR_MUTED,
     COLOR_SUCCESS,
 )
-from amigocompora.ui.widgets import Card, Chip, Field, ScrollArea, divider, set_empty, spawn
+from amigocompora.ui.widgets import (
+    Card,
+    Chip,
+    Field,
+    ScrollArea,
+    divider,
+    format_amount,
+    set_empty,
+    spawn,
+)
 
 #: Ventanas de cierre que ofrece el selector, de la más corta a la más larga.
 #: `None` es «todas», que es la vista por volumen de siempre.
@@ -120,6 +158,10 @@ _BASKET_CAVEAT = (
 #: bloque no cambie de tamaño al pasar de uno a otro —una tabla vacía no es
 #: pequeña, y sin esto el salto se ve como un parpadeo del diseño—.
 _REDEEM_TABLE_HEIGHT = 150
+
+#: Lo mismo para la tabla de posiciones de la wallet de depósito, que lleva una
+#: columna más de cifras y por eso pide unos píxeles más de alto.
+_WALLET_TABLE_HEIGHT = 170
 
 
 def _motivos(motivos: Sequence[str]) -> str:
@@ -159,6 +201,24 @@ def _round_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     if tick <= 0:
         return price
     return (price / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+
+
+def _pnl_text(posicion: PredictionPosition) -> str:
+    """Lo ganado o perdido de una posición, tal como lo publica la fuente.
+
+    La cifra **no se recalcula** aquí a partir del precio actual y el precio
+    medio: la fuente ya publica el resultado y su porcentaje, y una segunda
+    cuenta que discrepe de la primera serían dos «cuánto llevo ganado» en la
+    misma pantalla. Si la fuente no lo publica, se dice con un guion; lo que no
+    se hace es inventar un cero.
+    """
+    if posicion.cash_pnl is None:
+        return "—"
+    signo = "+" if posicion.cash_pnl > 0 else ""
+    texto = f"{signo}{posicion.cash_pnl:f}"
+    if posicion.percent_pnl is not None:
+        texto += f" ({signo}{posicion.percent_pnl:.1f} %)"
+    return texto
 
 
 def countdown(closes_at: datetime | None, now: datetime) -> str:
@@ -281,6 +341,14 @@ class PredictionPage(QWidget):
 
         self._table.itemSelectionChanged.connect(self._on_select)
 
+        # --- La wallet de depósito ---------------------------------------------
+        # Va entre la tarjeta de orden y las cestas porque su trabajo es
+        # **volver** a la de orden: cada fila de su tabla carga ese mercado
+        # arriba —vender, comprar más— y la de arriba es la que opera. Con la
+        # wallet al final de la pestaña, cada acción sería un viaje de ida y
+        # vuelta por la pantalla.
+        lay.addWidget(self._build_wallet_card())
+
         # --- Cestas con margen -------------------------------------------------
         basket_bar = QHBoxLayout()
         basket_bar.addWidget(QLabel("<b>Cestas con margen</b> (comprar todo cuesta menos de lo que paga)"))
@@ -344,6 +412,11 @@ class PredictionPage(QWidget):
         #: vacía depende de esto: no es lo mismo «no hay mercados» que «la
         #: consulta no llegó a hacerse».
         self._last_error: str | None = None
+        #: El mercado cargado en la tarjeta de orden, o `None`. Es lo que la
+        #: tarjeta está enseñando **y lo que se firmaría**: las filas de la wallet
+        #: también cargan la tarjeta, y para entonces la selección de la tabla de
+        #: mercados puede estar vacía o ser otra. Ver `_market`.
+        self._chosen_market: PredictionMarket | None = None
         #: El libro del resultado elegido, o `None` mientras no se haya leído.
         #: Vive aquí y no se pide en cada repintado: es una lectura de red, y
         #: repintar un campo no es motivo para salir a la red.
@@ -359,6 +432,12 @@ class PredictionPage(QWidget):
         self._positions: tuple[PredictionPosition, ...] = ()
         self._positions_read = False
         self._positions_error: str | None = None
+        #: Lo último leído de la wallet de depósito, o `None` mientras no se haya
+        #: leído. Mismo motivo que `_positions` para vivir aquí: es una lectura de
+        #: red, y repintar no es motivo para salir a la red.
+        self._wallet_view: SettlementWalletView | None = None
+        self._wallet_read = False
+        self._wallet_error: str | None = None
         self._update_edge_hint()
         # Y las cestas se pintan ya, aunque no haya nada que pintar: al abrir la
         # pestaña, sin esto, quedaba un rectángulo gris del alto entero sin una
@@ -371,6 +450,11 @@ class PredictionPage(QWidget):
         # escrito**, no por no haberse pintado todavía.
         self._fill_positions()
         self._refresh_redeem_state()
+        # Y la de la wallet de depósito, por el mismo motivo: su dirección se
+        # deriva sin red y su botón de añadir saldo sale apagado **con el motivo
+        # escrito** si falta modo o configuración.
+        self._fill_wallet_card()
+        self._refresh_wallet_state()
         # Y la tabla de mercados, con su rótulo, desde el primer momento.
         self._fill(())
 
@@ -455,11 +539,13 @@ class PredictionPage(QWidget):
         siguiera elegido. Operar sobre lo que la tabla ya no muestra es la forma
         más silenciosa de firmar lo que no se está mirando.
         """
+        self._chosen_market = None
         self._depth = None
         self._price_auto = True
         self._outcome.blockSignals(True)
         self._outcome.clear()
         self._outcome.blockSignals(False)
+        self._rebuild_outcome_buttons(None)
         self._order_market.setText("Selecciona un mercado de la tabla.")
         self._order_cost.setText("—")
         self._order_payout.setText("")
@@ -542,6 +628,7 @@ class PredictionPage(QWidget):
         self._order_market.setText(f"<b>{market.question}</b>")
         self._order_market.setTextFormat(Qt.RichText)
         self._order_status.setText("")
+        self._chosen_market = market
         self._depth = None
         # Mercado nuevo, propuesta nueva: el precio que hubiera escrito para el
         # mercado anterior no dice nada de éste.
@@ -557,6 +644,7 @@ class PredictionPage(QWidget):
                 f"{outcome.label} — {outcome.implied_percent:.1f} %", outcome.label
             )
         self._outcome.blockSignals(False)
+        self._rebuild_outcome_buttons(market)
 
         self._apply_market_limits()
         self._refresh_order_state()
@@ -566,13 +654,17 @@ class PredictionPage(QWidget):
     # Operar: la tarjeta de orden
     # ------------------------------------------------------------------ #
     def _build_order_card(self) -> Card:
-        """La tarjeta que convierte un mercado leído en una orden firmable."""
+        """La tarjeta que convierte un mercado leído en una orden firmable.
+
+        Tiene el aspecto de un panel de operación: el lado, el resultado, el precio
+        y las participaciones se eligen con botones. Los combos `_outcome` y `_side`
+        siguen siendo la fuente de verdad: los botones sólo los reflejan, así que la
+        lógica de precio, libro y límites no cambia.
+        """
         card = Card("Operar", subtitle="— orden límite")
         # Ancho mínimo de verdad y **sin tope**: el tope de 460 px era el que
-        # aplastaba los campos —el de precio salía con 89 px cuando necesitaba
-        # 140— y el que dejaba la tarjeta ilegible justo donde se escriben las
-        # cifras que se van a firmar. Con el mínimo, la columna de la tabla se
-        # queda con lo demás, que es lo que tiene que ceder.
+        # aplastaba los campos y dejaba la tarjeta ilegible justo donde se escriben
+        # las cifras que se van a firmar.
         card.setMinimumWidth(400)
 
         self._order_chip = Chip("", COLOR_MUTED)
@@ -583,47 +675,48 @@ class PredictionPage(QWidget):
         self._order_market.setWordWrap(True)
         card.body().addWidget(self._order_market)
 
-        # Resultado y lado en la misma fila: son las dos mitades de «qué» se
-        # opera, y comprar «No» es una operación distinta de comprar «Sí».
         self._outcome = QComboBox()
-        self._outcome.setMinimumWidth(150)
-        self._outcome.setToolTip(
-            "Resultado del mercado. Se puede comprar o vender cualquiera de "
-            "ellos: vender «Sí» y comprar «No» no son la misma operación."
-        )
         self._outcome.currentIndexChanged.connect(self._on_outcome_changed)
-        campo_resultado = Field("RESULTADO")
-        campo_resultado.add(self._outcome, 1)
-
         self._side = QComboBox()
         self._side.addItem("Comprar", PredictionSide.BUY)
         self._side.addItem("Vender", PredictionSide.SELL)
         self._side.currentIndexChanged.connect(self._on_side_changed)
-        campo_lado = Field("LADO")
-        campo_lado.add(self._side)
+        card.body().addWidget(self._outcome)
+        card.body().addWidget(self._side)
+        self._outcome.hide()
+        self._side.hide()
 
-        fila = QHBoxLayout()
-        fila.setSpacing(8)
-        fila.addWidget(campo_resultado, 2)
-        fila.addWidget(campo_lado, 1)
-        card.add_row(fila)
+        self._side_buttons = QButtonGroup(card)
+        self._side_buttons.setExclusive(True)
+        fila_lado = QHBoxLayout()
+        fila_lado.setSpacing(6)
+        for indice, texto in enumerate(("Comprar", "Vender")):
+            boton = QPushButton(texto)
+            boton.setObjectName("segment")
+            boton.setCheckable(True)
+            boton.setToolTip(
+                "Comprar o vender el resultado elegido. Son operaciones distintas: "
+                "vender «Sí» y comprar «No» no son lo mismo."
+            )
+            boton.clicked.connect(lambda _c=False, i=indice: self._side.setCurrentIndex(i))
+            self._side_buttons.addButton(boton, indice)
+            fila_lado.addWidget(boton)
+        fila_lado.addStretch(1)
+        limite = QLabel("Límite")
+        limite.setObjectName("hint")
+        fila_lado.addWidget(limite)
+        card.add_row(fila_lado)
+        self._mark_side_buttons()
 
-        self._shares = QDoubleSpinBox()
-        self._shares.setDecimals(2)
-        self._shares.setRange(1.0, 1_000_000.0)
-        self._shares.setMinimumWidth(130)
-        self._shares.setToolTip(
-            "Participaciones. Cada una paga 1 del colateral si el resultado "
-            "ocurre, y 0 si no."
-        )
-        self._shares.valueChanged.connect(self._on_order_edited)
-        campo_participaciones = Field("PARTICIPACIONES")
-        campo_participaciones.add(self._shares, 1)
+        self._outcome_row = QHBoxLayout()
+        self._outcome_row.setSpacing(8)
+        self._outcome_buttons: list[QPushButton] = []
+        card.add_row(self._outcome_row)
 
         self._price = QDoubleSpinBox()
         self._price.setDecimals(2)
         self._price.setRange(0.01, 0.99)
-        self._price.setMinimumWidth(130)
+        self._price.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._price.setToolTip(
             "Precio máximo al comprar (mínimo al vender) por participación. Se "
             "propone desde el libro real y se ajusta al salto del mercado. La "
@@ -631,20 +724,61 @@ class PredictionPage(QWidget):
             "ni caduca."
         )
         self._price.valueChanged.connect(self._on_price_edited)
+        fila_precio = QHBoxLayout()
+        fila_precio.setSpacing(6)
+        fila_precio.addWidget(_boton_paso("−", lambda: self._price.stepDown()))
+        fila_precio.addWidget(self._price, 1)
+        fila_precio.addWidget(_boton_paso("+", lambda: self._price.stepUp()))
         campo_precio = Field("PRECIO LÍMITE")
-        campo_precio.add(self._price, 1)
+        campo_precio.add(_contenedor(fila_precio), 1)
+
+        self._shares = QDoubleSpinBox()
+        self._shares.setDecimals(2)
+        self._shares.setRange(1.0, 1_000_000.0)
+        self._shares.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._shares.setToolTip(
+            "Participaciones. Cada una paga 1 del colateral si el resultado "
+            "ocurre, y 0 si no."
+        )
+        self._shares.valueChanged.connect(self._on_order_edited)
+        fila_acciones = QHBoxLayout()
+        fila_acciones.setSpacing(6)
+        fila_acciones.addWidget(self._shares, 1)
+        fila_chips = QHBoxLayout()
+        fila_chips.setSpacing(6)
+        for delta in (-100, -10, 10, 100, 150):
+            chip = QPushButton(f"{delta:+d}".replace("-", "−"))
+            chip.setObjectName("secondary")
+            chip.clicked.connect(lambda _c=False, d=delta: self._adjust_shares(d))
+            fila_chips.addWidget(chip)
+        campo_acciones = Field("ACCIONES")
+        campo_acciones.add(_contenedor(fila_acciones), 1)
+        campo_acciones.add(_contenedor(fila_chips), 1)
 
         fila2 = QHBoxLayout()
         fila2.setSpacing(8)
-        fila2.addWidget(campo_participaciones, 1)
         fila2.addWidget(campo_precio, 1)
+        fila2.addWidget(campo_acciones, 1)
         card.add_row(fila2)
+
+        fila_vence = QHBoxLayout()
+        vence = QLabel("Vence")
+        vence.setObjectName("hint")
+        fila_vence.addWidget(vence)
+        fila_vence.addStretch(1)
+        nunca = QLabel("Nunca")
+        nunca.setToolTip("La orden queda en el libro hasta que la canceles.")
+        fila_vence.addWidget(nunca)
+        card.add_row(fila_vence)
 
         card.body().addWidget(divider())
 
         # Lo que cuesta y lo que paga, en la misma línea y con las dos cifras
         # juntas: el coste sin el pago potencial es la mitad de la información
         # que hace falta para decidir.
+        total = QLabel("Total")
+        total.setObjectName("hint")
+        card.body().addWidget(total)
         self._order_cost = QLabel("—")
         self._order_cost.setObjectName("bigNumber")
         card.body().addWidget(self._order_cost)
@@ -667,8 +801,8 @@ class PredictionPage(QWidget):
         self._book_btn.clicked.connect(lambda: spawn(self._do_load_book()))
         card.body().addWidget(self._book_btn)
 
-        self._submit_btn = QPushButton("Firmar y publicar la orden…")
-        self._submit_btn.setObjectName("danger")
+        self._submit_btn = QPushButton("Realizar orden de compra")
+        self._submit_btn.setObjectName("primary")
         self._submit_btn.setToolTip(
             "Firma la orden y la publica en el libro del recinto. No es una "
             "transacción y no cuesta gas, pero queda a la vista de todos y "
@@ -691,6 +825,37 @@ class PredictionPage(QWidget):
         card.body().addWidget(self._order_status)
         card.body().addStretch()
         return card
+
+    def _rebuild_outcome_buttons(self, market: PredictionMarket | None) -> None:
+        while self._outcome_row.count():
+            item = self._outcome_row.takeAt(0)
+            viejo = item.widget() if item is not None else None
+            if viejo is not None:
+                viejo.deleteLater()
+        self._outcome_buttons = []
+        if market is None:
+            return
+        for indice, outcome in enumerate(market.outcomes):
+            boton = QPushButton(f"{outcome.label}  {outcome.implied_percent:.0f}¢")
+            boton.setObjectName("outcome")
+            boton.setCheckable(True)
+            boton.clicked.connect(lambda _c=False, i=indice: self._outcome.setCurrentIndex(i))
+            self._outcome_row.addWidget(boton)
+            self._outcome_buttons.append(boton)
+        self._mark_outcome_buttons()
+
+    def _mark_outcome_buttons(self) -> None:
+        actual = self._outcome.currentIndex()
+        for indice, boton in enumerate(self._outcome_buttons):
+            boton.setChecked(indice == actual)
+
+    def _mark_side_buttons(self) -> None:
+        actual = self._side.currentIndex()
+        for indice in (0, 1):
+            self._side_buttons.button(indice).setChecked(indice == actual)
+
+    def _adjust_shares(self, delta: int) -> None:
+        self._shares.setValue(max(self._shares.minimum(), self._shares.value() + delta))
 
     # ------------------------------------------------------------------ #
     # Cobrar: la tarjeta de lo que ya se resolvió
@@ -938,10 +1103,15 @@ class PredictionPage(QWidget):
             except Exception as error:
                 motivos.append(f"no se pudo determinar el colateral del recinto: {error}")
             else:
-                if colateral.symbol not in limites.allowed_tokens:
+                if (
+                    ANY_TOKEN not in limites.allowed_tokens
+                    and colateral.symbol.upper() not in limites.allowed_tokens
+                ):
                     # Se dice también **qué hay declarado**: el error más común no
                     # es olvidar la lista, es escribir en ella un nombre que ningún
-                    # token tiene.
+                    # token tiene. Y la comparación es por mayúsculas, como
+                    # `check_token`: el símbolo del catálogo es `pUSD` y la lista
+                    # llega normalizada.
                     motivos.append(
                         f"el colateral «{colateral.symbol}» no está en "
                         f"`allowed_tokens` (ahora declara: "
@@ -1046,31 +1216,637 @@ class PredictionPage(QWidget):
         self._redeem_status.setText(aviso)
 
     # ------------------------------------------------------------------ #
+    # La wallet de depósito: verla y fondearla
+    # ------------------------------------------------------------------ #
+    def _build_wallet_card(self) -> Card:
+        """La tarjeta de la deposit wallet: su saldo, sus posiciones y su fondeo.
+
+        Es la cuenta por la que Polymarket opera desde 2026, y la pestaña no la
+        enseñaba en ninguna parte: se podía comprar y vender sin ver qué quedaba
+        dentro. Aquí se lee —lectura pública, sin claves—, se le añade saldo por
+        los dos caminos que de verdad hay y cada posición vuelve a la tarjeta de
+        orden de arriba.
+
+        **Nada de lo que hay aquí firma.** Leer es público, y añadir saldo abre la
+        retirada de siempre —`WithdrawFunds`, con su modo, sus topes y su
+        confirmación— con el destino ya puesto: la tarjeta no tiene un camino
+        propio hacia la firma, sólo enseña el que ya existe.
+        """
+        card = Card("Wallet de depósito", subtitle="— la cuenta que opera en Polymarket")
+        card.setMinimumWidth(400)
+
+        self._wallet_chip = Chip("", COLOR_MUTED)
+        card.header.addWidget(self._wallet_chip)
+
+        intro = QLabel(
+            "Polymarket ya no opera desde una cartera normal: tus compras y ventas "
+            "van por una <b>deposit wallet</b>, un contrato que custodia el "
+            "colateral y las participaciones y que controla tu clave. No necesita "
+            "gas —los permisos y los envíos los manda el relayer— y sólo liquida "
+            "con el colateral del recinto (pUSD): mandar otro token ahí lo deja "
+            "encerrado."
+        )
+        intro.setObjectName("hint")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        card.body().addWidget(intro)
+
+        fila_dir = QHBoxLayout()
+        fila_dir.setSpacing(6)
+        rotulo = QLabel("Dirección")
+        rotulo.setObjectName("hint")
+        fila_dir.addWidget(rotulo)
+        self._wallet_address = QLineEdit()
+        self._wallet_address.setReadOnly(True)
+        self._wallet_address.setCursorPosition(0)
+        self._wallet_address.setToolTip(
+            "La dirección de tu deposit wallet, derivada de tu cartera. Se conoce "
+            "antes de desplegarla: recibir en ella no depende de ningún permiso ni "
+            "de credenciales del relayer."
+        )
+        fila_dir.addWidget(self._wallet_address, 1)
+        self._wallet_copy_btn = QPushButton("Copiar")
+        self._wallet_copy_btn.setObjectName("secondary")
+        self._wallet_copy_btn.setToolTip(
+            "Copia la dirección para pegarla donde vayas a enviar el saldo."
+        )
+        self._wallet_copy_btn.clicked.connect(self._on_copy_wallet)
+        fila_dir.addWidget(self._wallet_copy_btn)
+        self._wallet_qr_btn = QPushButton("Ver QR")
+        self._wallet_qr_btn.setObjectName("secondary")
+        self._wallet_qr_btn.setToolTip(
+            "El código para escanear desde una cartera o un exchange. Se enseña la "
+            "dirección sola: la red la eliges tú al enviar."
+        )
+        self._wallet_qr_btn.clicked.connect(self._on_show_wallet_qr)
+        fila_dir.addWidget(self._wallet_qr_btn)
+        card.add_row(fila_dir)
+
+        # Que la dirección no se pueda derivar —el motor activo puede no saber
+        # planificar— se dice aquí, junto al hueco: una caja vacía sin motivo se
+        # lee como que no hay wallet, y sí la hay.
+        self._wallet_address_error = QLabel("")
+        self._wallet_address_error.setWordWrap(True)
+        self._wallet_address_error.setStyleSheet(f"color: {COLOR_DANGER};")
+        card.body().addWidget(self._wallet_address_error)
+
+        saldo = QHBoxLayout()
+        saldo.setSpacing(8)
+        etiqueta = QLabel("Saldo")
+        etiqueta.setObjectName("hint")
+        saldo.addWidget(etiqueta)
+        self._wallet_balance = QLabel("—")
+        self._wallet_balance.setObjectName("bigNumber")
+        saldo.addWidget(self._wallet_balance)
+        self._wallet_total = QLabel("")
+        self._wallet_total.setObjectName("hint")
+        self._wallet_total.setWordWrap(True)
+        saldo.addWidget(self._wallet_total, 1)
+        card.add_row(saldo)
+
+        fila = QHBoxLayout()
+        fila.setSpacing(8)
+        self._wallet_read_btn = QPushButton("Leer la wallet")
+        self._wallet_read_btn.setObjectName("secondary")
+        self._wallet_read_btn.setToolTip(
+            "Lee el saldo y las posiciones de la wallet de depósito. Es una "
+            "lectura pública: no firma ni emite nada."
+        )
+        self._wallet_read_btn.clicked.connect(lambda: spawn(self._do_read_wallet()))
+        fila.addWidget(self._wallet_read_btn, 1)
+        self._wallet_add_btn = QPushButton("Añadir saldo…")
+        self._wallet_add_btn.setObjectName("secondary")
+        self._wallet_add_btn.setToolTip(
+            "Retira colateral de tu cartera hacia la wallet, con el destino ya "
+            "puesto: es la retirada de siempre, con su confirmación y sus topes. "
+            "Para recibir desde fuera, usa «Ver QR» o «Copiar»."
+        )
+        self._wallet_add_btn.clicked.connect(self._on_add_funds)
+        fila.addWidget(self._wallet_add_btn, 1)
+        card.add_row(fila)
+
+        self._wallet_table = QTableWidget(0, 7)
+        self._wallet_table.setHorizontalHeaderLabels(
+            [
+                "Mercado",
+                "Resultado",
+                "Participaciones",
+                "Precio medio",
+                "Valor",
+                "Ganancia",
+                "",
+            ]
+        )
+        self._wallet_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self._wallet_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._wallet_table.setAlternatingRowColors(True)
+        self._wallet_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._wallet_table.setWordWrap(True)
+        self._wallet_table.setMinimumHeight(_WALLET_TABLE_HEIGHT)
+        cabecera = self._wallet_table.horizontalHeaderItem(5)
+        if cabecera is not None:
+            cabecera.setToolTip(
+                "Lo ganado (o perdido) frente a lo pagado, según la fuente: el "
+                "signo y el color lo dicen todo. Un guion es «la fuente no lo "
+                "publica», nunca un cero."
+            )
+
+        #: El rótulo que ocupa el sitio de la tabla mientras está vacía, con la
+        #: misma altura que ella para que el alto no salte. Mismo recurso que en
+        #: las otras dos tablas, y distingue «todavía no has leído» de «leíste y
+        #: no hay nada», que se arreglan de forma distinta.
+        self._wallet_empty = QLabel("")
+        self._wallet_empty.setObjectName("empty")
+        self._wallet_empty.setWordWrap(True)
+        self._wallet_empty.setAlignment(Qt.AlignCenter)
+        self._wallet_empty.setMinimumHeight(_WALLET_TABLE_HEIGHT)
+        card.body().addWidget(self._wallet_table)
+        card.body().addWidget(self._wallet_empty)
+
+        self._wallet_note = QLabel("")
+        self._wallet_note.setWordWrap(True)
+        self._wallet_note.setStyleSheet(f"color: {COLOR_DANGER};")
+        card.body().addWidget(self._wallet_note)
+
+        self._wallet_status = QLabel("")
+        self._wallet_status.setObjectName("hint")
+        self._wallet_status.setWordWrap(True)
+        card.body().addWidget(self._wallet_status)
+        return card
+
+    def _fill_wallet_card(self) -> None:
+        """Pinta el saldo, la tabla de posiciones y su rótulo vacío."""
+        view = self._wallet_view
+        self._wallet_table.setRowCount(0)
+        if view is None:
+            self._wallet_balance.setText("—")
+            self._wallet_total.setText("")
+        else:
+            self._wallet_balance.setText(
+                f"{format_amount(view.balance.as_decimal())} {view.collateral.symbol}"
+            )
+            self._wallet_total.setText(self._wallet_total_text(view))
+            self._fill_wallet_rows(view)
+        set_empty(self._wallet_table, self._wallet_empty, self._wallet_empty_text())
+
+    def _fill_wallet_rows(self, view: SettlementWalletView) -> None:
+        """Una fila por posición, con sus cifras y sus dos botones de acción.
+
+        El «Valor» se calcula —participaciones por precio actual— porque la
+        fuente publica las dos cifras y una multiplicación no es una segunda
+        verdad; la «Ganancia», en cambio, se copia tal cual: recalcularla
+        exigiría el histórico de compras, que esta lectura no trae.
+        """
+        self._wallet_table.setRowCount(len(view.positions))
+        for fila, posicion in enumerate(view.positions):
+            valor = (
+                posicion.shares * posicion.cur_price
+                if posicion.cur_price is not None
+                else None
+            )
+            celdas = (
+                posicion.question,
+                posicion.outcome_label,
+                f"{posicion.shares:f}",
+                "—" if posicion.avg_price is None else f"{posicion.avg_price:f}",
+                "—" if valor is None else f"{valor:f}",
+            )
+            for columna, texto in enumerate(celdas):
+                self._wallet_table.setItem(fila, columna, QTableWidgetItem(texto))
+            ganancia = QTableWidgetItem(_pnl_text(posicion))
+            if posicion.cash_pnl is not None:
+                # El color repite el signo del número: se lee de un vistazo qué
+                # posiciones van a favor y cuáles en contra.
+                ganancia.setForeground(
+                    QColor(COLOR_SUCCESS if posicion.cash_pnl >= 0 else COLOR_DANGER)
+                )
+            self._wallet_table.setItem(fila, 5, ganancia)
+            self._wallet_table.setCellWidget(fila, 6, self._wallet_row_actions(posicion))
+        self._wallet_table.resizeRowsToContents()
+
+    def _wallet_row_actions(self, posicion: PredictionPosition) -> QWidget:
+        """Los dos botones de una fila: «Vender» y «Comprar más».
+
+        Cargan la tarjeta de orden y **no firman**: lo que hacen es traer el
+        mercado de la posición —por su `conditionId`, que es una lectura de red— y
+        dejar el resultado, el lado y el tamaño puestos para revisarlos. La firma
+        sigue siendo el botón de arriba, con sus comprobaciones y su diálogo.
+
+        Una fila ya resuelta sale con los dos apagados y el motivo escrito: sus
+        participaciones se cobran, no se operan —y el cobro desde la wallet
+        todavía no existe, porque pide un lote del relayer que la aplicación aún
+        no construye—.
+        """
+        contenedor = QWidget()
+        caja = QHBoxLayout(contenedor)
+        caja.setContentsMargins(0, 0, 0, 0)
+        caja.setSpacing(4)
+        vender = QPushButton("Vender")
+        vender.setObjectName("secondary")
+        comprar = QPushButton("Comprar más")
+        comprar.setObjectName("secondary")
+        if posicion.redeemable:
+            for boton in (vender, comprar):
+                boton.setEnabled(False)
+                boton.setToolTip(
+                    "El mercado ya resolvió: estas participaciones se cobran, no se "
+                    "operan. El cobro desde la wallet de depósito todavía no está "
+                    "en la aplicación."
+                )
+        else:
+            vender.setToolTip(
+                "Carga esta posición en la tarjeta de orden de arriba para "
+                "venderla. No firma nada: revisa el precio y publica allí."
+            )
+            comprar.setToolTip(
+                "Carga este mercado en la tarjeta de orden de arriba para comprar "
+                "más de este resultado. No firma nada."
+            )
+            vender.clicked.connect(
+                lambda _c=False, p=posicion: self._on_position_action(
+                    p, PredictionSide.SELL
+                )
+            )
+            comprar.clicked.connect(
+                lambda _c=False, p=posicion: self._on_position_action(
+                    p, PredictionSide.BUY
+                )
+            )
+        caja.addWidget(vender)
+        caja.addWidget(comprar)
+        return contenedor
+
+    @staticmethod
+    def _wallet_total_text(view: SettlementWalletView) -> str:
+        """La suma de lo ganado, y **de qué está sumada**.
+
+        Sólo suma lo que la fuente publica: si una posición no trae resultado, no
+        se le inventa un cero. Y cuando falta alguna se dice, porque una suma
+        incompleta presentada como total es una cifra falsa.
+        """
+        conocidos = [
+            posicion.cash_pnl
+            for posicion in view.positions
+            if posicion.cash_pnl is not None
+        ]
+        if not conocidos:
+            return ""
+        total = sum(conocidos, Decimal(0))
+        texto = (
+            f"En conjunto: {'+' if total > 0 else ''}{total:f} {view.collateral.symbol}"
+        )
+        if len(conocidos) < len(view.positions):
+            texto += (
+                f" (suma de {len(conocidos)} de {len(view.positions)} posiciones: "
+                "la fuente no publica el resto)"
+            )
+        return texto
+
+    def _wallet_empty_text(self) -> str:
+        """Por qué la tabla está vacía. Nunca es un «error» a secas."""
+        if self._wallet_error is not None:
+            return f"No se pudo leer la wallet: {self._wallet_error}"
+        view = self._wallet_view
+        if view is None:
+            return (
+                "Pulsa «Leer la wallet» para ver su saldo y sus posiciones. Es "
+                "una lectura pública: no firma ni emite nada."
+            )
+        if not view.positions:
+            if view.balance.is_zero:
+                return (
+                    "La wallet no tiene saldo ni posiciones abiertas. Añádele "
+                    "saldo con «Añadir saldo…» —desde tu cartera o desde fuera— y "
+                    "opera en la tarjeta de orden de arriba."
+                )
+            return (
+                f"Tiene {format_amount(view.balance.as_decimal())} "
+                f"{view.collateral.symbol} y ninguna posición abierta: lo que "
+                "compres en la tarjeta de orden sale de ese saldo, y las "
+                "posiciones aparecen aquí mientras el mercado no resuelva."
+            )
+        return ""
+
+    async def _do_read_wallet(self) -> None:
+        """Lee saldo y posiciones de la wallet. Lectura pública, sin claves.
+
+        Se leen **todas** las posiciones y no sólo las cobrables —lo contrario
+        que en la tarjeta de cobro—: aquí lo que interesa es lo abierto, para
+        poder operar sobre ello, y lo resuelto sólo aparece para decir que no se
+        opera.
+        """
+        self._wallet_read_btn.setEnabled(False)
+        self._wallet_status.setText("Leyendo la wallet de depósito…")
+        try:
+            view = await self._container.read_settlement_wallet()
+        except Exception as error:
+            # Un fallo de lectura no se disfraza de «no hay nada»: el rótulo
+            # vacío lo cuenta con el motivo entero.
+            self._wallet_view = None
+            self._wallet_error = str(error)
+        else:
+            self._wallet_view = view
+            self._wallet_error = None
+            self._wallet_status.setText("")
+        finally:
+            self._wallet_read = True
+            self._wallet_read_btn.setEnabled(True)
+        self._fill_wallet_card()
+
+    def _refresh_wallet_state(self) -> None:
+        """Pinta la dirección, el botón de añadir saldo y su motivo.
+
+        La dirección se **deriva** en cada repintado —es pura, sin red— y no se
+        guarda: si la clave cambia en Credenciales, el repintado llega antes que
+        cualquier otra cosa y la dirección tiene que ser la nueva, no la de la
+        cartera anterior.
+        """
+        try:
+            direccion = self._container.read_settlement_wallet.address()
+        except Exception as error:
+            direccion = ""
+            self._wallet_address_error.setText(str(error))
+        else:
+            self._wallet_address_error.setText("")
+        self._wallet_address.setText(direccion)
+        self._wallet_address.setCursorPosition(0)
+        self._wallet_copy_btn.setEnabled(bool(direccion))
+        self._wallet_qr_btn.setEnabled(bool(direccion))
+
+        motivos = self._wallet_add_blockers()
+        self._wallet_add_btn.setEnabled(not motivos and bool(direccion))
+        # Aquí el motivo se enseña **siempre** que falte algo, y no sólo después
+        # de leer: añadir saldo es lo que estrena la wallet, así que un botón
+        # apagado sin motivo se leería como que la función no existe. Es la regla
+        # de las otras dos tarjetas, con el «cuándo» adaptado a que aquí no hay
+        # nada que esperar a tener.
+        self._wallet_note.setText(
+            "" if not motivos else "No se puede añadir saldo: " + _motivos(motivos)
+        )
+        puede = self._container.guard.allows(Capability.BROADCAST_TX)
+        self._wallet_chip.set_state(
+            f"MODO {self._container.guard.mode.label}",
+            COLOR_SUCCESS if puede else COLOR_MUTED,
+        )
+
+    def _wallet_add_blockers(self) -> tuple[str, ...]:
+        """Todo lo que falta para poder añadir saldo. Vacío significa que sí.
+
+        Mira lo mismo que mira `WithdrawFunds` antes de emitir —el modo, el
+        interruptor, la red, el token, el motor y la cartera— y en el mismo orden,
+        porque añadir saldo **es** una retirada: la de la pestaña de cartera, con
+        el destino puesto. Si esta lista dijera que sí y el caso de uso dijera que
+        no, la interfaz estaría prometiendo algo que no cumple.
+        """
+        container = self._container
+        motivos: list[str] = []
+        if not container.guard.mode.grants(Capability.BROADCAST_TX):
+            motivos.append(
+                f"el modo {container.guard.mode.label} no permite emitir "
+                "(cambia a EJECUCIÓN)"
+            )
+        if not container.policy.limits.enabled:
+            motivos.append(
+                "la ejecución está apagada (`enabled = true` bajo `[execution]` "
+                "en config.toml)"
+            )
+        if not container.keys.available():
+            motivos.append(
+                "no hay cartera configurada, así que no hay desde dónde retirar"
+            )
+            # Sin cartera no hay más que comprobar: el destino y el origen salen
+            # de ella, y sin ella no hay ni una cosa ni la otra.
+            return tuple(motivos)
+
+        limites = container.policy.limits
+        if SETTLEMENT_WALLET_CHAIN not in limites.allowed_chains:
+            motivos.append(
+                f"la red «{SETTLEMENT_WALLET_CHAIN}» no está en `allowed_chains` "
+                f"(ahora declara: {', '.join(sorted(limites.allowed_chains)) or 'nada'})"
+            )
+        try:
+            colateral = container.read_settlement_wallet.collateral()
+        except Exception as error:
+            motivos.append(f"no se pudo determinar el colateral del recinto: {error}")
+        else:
+            # Por mayúsculas, como `ExecutionLimits.check_token`: la lista llega
+            # normalizada y el símbolo del catálogo es `pUSD`.
+            if (
+                ANY_TOKEN not in limites.allowed_tokens
+                and colateral.symbol.upper() not in limites.allowed_tokens
+            ):
+                motivos.append(
+                    f"el colateral «{colateral.symbol}» no está en "
+                    f"`allowed_tokens` (ahora declara: "
+                    f"{', '.join(sorted(limites.allowed_tokens)) or 'nada'}; "
+                    f"añádelo en config.toml)"
+                )
+        if WALLET_ENGINE_ID not in limites.allowed_engines:
+            motivos.append(
+                f"el motor «{WALLET_ENGINE_ID}» no está en `allowed_engines` "
+                f"(ahora declara: {', '.join(sorted(limites.allowed_engines)) or 'nada'})"
+            )
+        return tuple(motivos)
+
+    def _on_copy_wallet(self) -> None:
+        """Copia la dirección de la wallet. Sin efectos: es texto al portapapeles."""
+        direccion = self._wallet_address.text().strip()
+        if not direccion:
+            return
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(direccion)
+        self._wallet_status.setText(
+            "Dirección copiada. Se queda en el portapapeles hasta que algo la "
+            "sustituya."
+        )
+
+    def _on_show_wallet_qr(self) -> None:
+        """El QR de la dirección, con lo que hay que mandarle y lo que no."""
+        direccion = self._wallet_address.text().strip()
+        if not direccion:
+            return
+        DepositDialog(
+            direccion,
+            SETTLEMENT_WALLET_CHAIN,
+            self,
+            note=(
+                "Esta es tu deposit wallet de Polymarket: sólo liquida con el "
+                "<b>colateral del recinto (pUSD)</b>, y cualquier otro token que "
+                "llegue aquí queda encerrado —la aplicación todavía no sabe "
+                "sacarlo—. Manda sólo pUSD por la red Polygon."
+            ),
+        ).exec()
+
+    def _on_add_funds(self) -> None:
+        """Retira de la cartera propia a la wallet, con el destino ya puesto.
+
+        El diálogo y el caso de uso son **los de la pestaña de cartera**, sin una
+        copia: aquí sólo se prefija el destino y se limita la lista al colateral.
+        Ofrecer otros tokens sería ofrecer fondos que quedarían encerrados: la
+        wallet los recibiría y todavía no hay forma de sacarlos.
+        """
+        direccion = self._wallet_address.text().strip()
+        if not direccion:
+            return
+        try:
+            colateral = self._container.read_settlement_wallet.collateral()
+        except Exception as error:
+            self._wallet_status.setText(
+                f"No se puede añadir saldo sin saber cuál es el colateral del "
+                f"recinto: {error}"
+            )
+            return
+        dialogo = WithdrawDialog(
+            (colateral,),
+            default=colateral,
+            owner=self._container.keys.address() or "",
+            recipient=direccion,
+            parent=self,
+        )
+        if dialogo.exec() != QDialog.Accepted:
+            return
+        token, texto, destino = dialogo.chosen()
+        try:
+            amount = token.amount(texto)
+        except Exception as error:
+            self._wallet_status.setText(f"Importe no válido: {error}")
+            return
+        self._wallet_status.setText(
+            f"Retirando {amount} de {token.symbol} hacia la wallet… cada paso pide "
+            "su confirmación."
+        )
+        spawn(self._do_add_funds(token, amount, destino))
+
+    async def _do_add_funds(
+        self, token: Token, amount: TokenAmount, recipient: str
+    ) -> None:
+        """Ejecuta la retirada y relee la wallet para que el saldo no mienta.
+
+        La relectura va antes de escribir el resultado, y no después: su propio
+        mensaje borraría el de la retirada. Y existe porque ver el saldo viejo
+        justo después de fondear es la forma más rápida de fondear dos veces.
+        """
+        try:
+            receipt = await self._container.withdraw_funds(
+                token, amount, recipient=recipient
+            )
+        except Exception as error:
+            # El motivo entero a la pantalla. Un caso de uso que explica por qué
+            # no firma —«no se pudo valorar», «no cabe el gas»— pierde todo su
+            # valor si la interfaz lo resume en «error».
+            self._wallet_status.setText(f"No se retiró nada: {error}")
+            return
+        await self._do_read_wallet()
+        self._wallet_status.setText(
+            f"Retirada emitida: {amount} de {token.symbol} → {shorten(recipient)}. "
+            f"Transacción {receipt.tx_hash}."
+        )
+
+    def _on_position_action(
+        self, posicion: PredictionPosition, side: PredictionSide
+    ) -> None:
+        """Carga la posición en la tarjeta de orden. Sólo carga: no firma."""
+        spawn(self._do_load_position_market(posicion, side))
+
+    async def _do_load_position_market(
+        self, posicion: PredictionPosition, side: PredictionSide
+    ) -> None:
+        """Trae el mercado de la posición y deja la tarjeta lista para revisarla.
+
+        El mercado se busca por el `conditionId` y no por el nombre: el nombre se
+        repite entre mercados, y cargar «el que se le parece» sería enseñar un
+        mercado distinto de aquel en el que se tiene la posición —y firmar sobre
+        él—. Nada se toca hasta que la carga puede terminar: cuando algo la
+        impide, se dice con la tarjeta como estaba.
+        """
+        self._order_status.setText(
+            "Buscando el mercado de la posición… es una lectura pública."
+        )
+        try:
+            engine = self._container.registry.active_prediction()
+            market = await engine.market_by_condition(posicion.condition_id)
+        except Exception as error:
+            self._order_status.setText(
+                f"No se pudo cargar el mercado de esa posición: {error}"
+            )
+            return
+
+        resultado = next(
+            (o for o in market.outcomes if o.token_id == posicion.token_id), None
+        )
+        if resultado is None:
+            self._order_status.setText(
+                f"El mercado «{market.question}» ya no publica el resultado "
+                f"«{posicion.outcome_label}» que tienes. No se cargó nada: operar "
+                "sobre otro resultado no sería operar sobre tu posición."
+            )
+            return
+
+        if side is PredictionSide.SELL:
+            # Suelo a dos decimales —los del campo— y **hacia abajo**: el widget
+            # redondearía hacia arriba y propondría vender más participaciones de
+            # las que hay.
+            cantidad = posicion.shares.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            minimo = market.min_order_size or Decimal(1)
+            if cantidad < minimo:
+                self._order_status.setText(
+                    f"Tu posición es de {posicion.shares:f} participaciones y el "
+                    f"mercado pide un mínimo de {minimo} por orden: la venta entera "
+                    "no se puede publicar. «Comprar más» sí está disponible para "
+                    "llegar al mínimo."
+                )
+                return
+        else:
+            # Comprar más se propone por el mínimo del mercado: es el compromiso
+            # más pequeño que existe, y ampliarlo es del usuario.
+            cantidad = market.min_order_size or Decimal(1)
+
+        self._table.clearSelection()
+        self._detail.setText("")
+        self._fill_order_card(market)
+        indice = self._outcome.findData(resultado.label)
+        if indice >= 0:
+            self._outcome.setCurrentIndex(indice)
+        self._shares.setValue(float(cantidad))
+        self._side.setCurrentIndex(0 if side is PredictionSide.BUY else 1)
+        self._order_status.setText(
+            f"Cargada desde tu posición de la wallet: {posicion.shares:f} "
+            f"{posicion.outcome_label}. Revisa el precio contra el libro y publica "
+            "— cargarla no firma nada."
+        )
+
+    # ------------------------------------------------------------------ #
     # Estado de la orden
     # ------------------------------------------------------------------ #
     def refresh_execution_state(self) -> None:
-        """Repinta lo que depende del modo: los dos botones que firman.
+        """Repinta lo que depende del modo: los botones que firman.
 
         Público porque quien sabe que el modo ha cambiado es la ventana, no esta
         pestaña: `ModeGuard.subscribe` avisa a quien se apunte, y la pestaña no se
         apunta sola. Existe en vez de que la ventana llame a los privados porque un
         método privado de otra clase no es una interfaz, es un atajo.
 
-        Y son **los dos**: el de publicar y el de cobrar. El modo decide si se
-        puede emitir, así que sin esto los dos se quedan como estaban y el usuario
-        descubre el cambio al pulsarlos —que es justo lo que enseña a desconfiar
-        de los botones—.
+        Y son **los tres**: el de publicar, el de cobrar y el de añadir saldo a la
+        wallet. El modo decide si se puede emitir, así que sin esto los tres se
+        quedan como estaban y el usuario descubre el cambio al pulsarlos —que es
+        justo lo que enseña a desconfiar de los botones—.
         """
         self._refresh_order_state()
         self._refresh_redeem_state()
+        self._refresh_wallet_state()
 
     def _market(self) -> PredictionMarket | None:
-        """El mercado seleccionado, o `None` si no hay ninguno."""
-        rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
-        if not rows or not self._reports:
-            return None
-        row = rows[0].row()
-        return self._reports[row].market if 0 <= row < len(self._reports) else None
+        """El mercado cargado en la tarjeta, o `None` si no hay ninguno.
+
+        No se deriva de la selección de la tabla: las filas de la wallet de
+        depósito también cargan la tarjeta —«Vender», «Comprar más»— y para
+        entonces la selección de la tabla puede estar vacía. Lo que manda es lo
+        que la tarjeta está enseñando, que es exactamente lo que se firmaría.
+        """
+        return self._chosen_market
 
     def _outcome_label(self) -> str | None:
         label = self._outcome.currentData()
@@ -1083,6 +1859,7 @@ class PredictionPage(QWidget):
 
     def _on_outcome_changed(self) -> None:
         """Cambiar de resultado cambia de libro: es otro token, otra profundidad."""
+        self._mark_outcome_buttons()
         self._apply_market_limits()
         spawn(self._do_load_book())
 
@@ -1097,6 +1874,7 @@ class PredictionPage(QWidget):
         con una propuesta que ya no corresponde a lo que va a firmar.
         """
         self._price_auto = True
+        self._mark_side_buttons()
         self._apply_market_limits()
         self._refresh_order_state()
 
@@ -1336,7 +2114,10 @@ class PredictionPage(QWidget):
             except Exception as error:
                 motivos.append(f"no se pudo determinar el colateral del recinto: {error}")
             else:
-                if colateral.symbol not in limites.allowed_tokens:
+                if (
+                    ANY_TOKEN not in limites.allowed_tokens
+                    and colateral.symbol not in limites.allowed_tokens
+                ):
                     # Se dice también **qué hay declarado**: el error más común
                     # no es olvidar la lista, es escribir en ella un nombre que
                     # ningún token tiene.
@@ -1457,6 +2238,12 @@ class PredictionPage(QWidget):
                 f"{submitted.status}. No es una transacción: está en el libro y "
                 "se puede cancelar mientras nadie la haya cruzado."
             )
+            # Comprar baja el saldo de la wallet y sube sus posiciones —vender, al
+            # revés—: releerla evita que la tarjeta de abajo siga enseñando el
+            # saldo de antes de operar. Sólo si ya se había leído: una lectura que
+            # nadie ha pedido no se gasta por publicar una orden.
+            if self._wallet_read:
+                spawn(self._do_read_wallet())
         finally:
             self._refresh_order_state()
             # El libro cambió con la orden, y la orden pudo cruzarse sola.
@@ -1539,3 +2326,16 @@ class PredictionPage(QWidget):
             item = self._baskets.item(row, column)
             if item is not None:
                 item.setToolTip(f"{breakdown}\n\n{opportunity.note}")
+
+
+def _boton_paso(texto: str, accion: Callable[[], None]) -> QPushButton:
+    boton = QPushButton(texto)
+    boton.setObjectName("stepper")
+    boton.clicked.connect(lambda _c=False: accion())
+    return boton
+
+
+def _contenedor(fila: QHBoxLayout) -> QWidget:
+    contenedor = QWidget()
+    contenedor.setLayout(fila)
+    return contenedor

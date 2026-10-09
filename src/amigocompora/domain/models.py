@@ -96,7 +96,20 @@ class Token:
         """
         if self.address is None:
             return f"{self.symbol} (nativo)"
-        return f"{self.symbol} {self.address[:10]}…"
+        return f"{self.display_symbol} {self.address[:10]}…"
+
+    @property
+    def display_symbol(self) -> str:
+        """El nombre con el que se enseña el token, cuando el símbolo engaña.
+
+        El USDC puenteado de Polygon publica `USDC`, igual que el nativo; se enseña
+        como «USDC.e», que es como lo llama el mercado. El símbolo que usa el
+        cálculo no cambia: sólo cambia lo que ve el usuario.
+        """
+        if self.address is None:
+            return self.symbol
+        nombres = {("polygon", "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"): "USDC.e"}
+        return nombres.get((self.chain, self.address.lower()), self.symbol)
 
     def amount(self, value: Decimal | int | str) -> TokenAmount:
         """Construye una cantidad de este token desde unidades humanas."""
@@ -1068,6 +1081,15 @@ class PredictionPosition:
     #: Precio actual de la participación, para poder valorar lo que aún no se
     #: puede cobrar. Puede faltar: no todas las fuentes lo publican.
     cur_price: Decimal | None = None
+    #: Precio medio de entrada de las participaciones que se tienen. Puede
+    #: faltar: no todas las fuentes lo publican, y sin él no se puede decir
+    #: **cuánto se ha ganado** frente a lo pagado —sólo cuánto vale hoy—.
+    avg_price: Decimal | None = None
+    #: Resultado no realizado de la posición, en unidades de colateral, según la
+    #: fuente. El signo es de la fuente: un negativo es una pérdida latente.
+    cash_pnl: Decimal | None = None
+    #: El mismo resultado en porcentaje sobre lo desembolsado, según la fuente.
+    percent_pnl: Decimal | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
@@ -1092,6 +1114,13 @@ class PredictionPosition:
             raise InvalidAmountError(
                 f"el precio de una participación está en [0, 1], llegó "
                 f"{self.cur_price} en «{self.question}»"
+            )
+        if self.avg_price is not None and not (
+            Decimal(0) <= self.avg_price <= Decimal(1)
+        ):
+            raise InvalidAmountError(
+                f"el precio medio de entrada está en [0, 1], llegó "
+                f"{self.avg_price} en «{self.question}»"
             )
 
     @property
@@ -1755,6 +1784,44 @@ class BroadcastStatus(StrEnum):
     @property
     def is_final(self) -> bool:
         return self in {BroadcastStatus.SUCCESS, BroadcastStatus.REVERTED}
+
+
+class BridgeTrackState(StrEnum):
+    """En qué va un puente después de emitir su origen."""
+
+    PENDING = "pending"
+    #: El proveedor devolvió los fondos a la dirección de origen.
+    REFUNDING = "refunding"
+    REFUNDED = "refunded"
+    DONE = "done"
+    FAILED = "failed"
+    #: El proveedor aún no lo conoce —suele ser la primera ventana de indexación—.
+    UNKNOWN = "unknown"
+
+    @property
+    def is_final(self) -> bool:
+        return self in {
+            BridgeTrackState.DONE,
+            BridgeTrackState.REFUNDED,
+            BridgeTrackState.FAILED,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeProgress:
+    """Lo que el proveedor dice de un puente en este momento, sin reinterpretarlo.
+
+    `provider_status` y `substatus` son las cadenas tal cual llegan, para que la
+    pantalla pueda enseñarlas junto a la traducción.
+    """
+
+    state: BridgeTrackState
+    provider_status: str
+    substatus: str
+    message: str
+    receiving_tx_hash: str | None = None
+    received_raw: int | None = None
+    received_chain: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

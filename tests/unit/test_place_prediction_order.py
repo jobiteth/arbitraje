@@ -1,7 +1,8 @@
 """El camino por el que se publica una orden en un mercado de predicción.
 
-Lo que se fija aquí son los sitios donde **podría perderse dinero**, y son cinco,
-los mismos cinco del camino de swaps leídos al lado del otro:
+Lo que se fija aquí son los sitios donde **podría perderse dinero**: los cinco
+del camino de swaps, leídos al lado del otro, y un sexto que sólo existe en este
+recinto —el canal de la deposit wallet, por el que el recinto admite operar hoy—:
 
 1. **Que no se publique fuera del modo `EJECUCIÓN`**, y que la barrera corte
    **antes** de trabajar: se mide en peticiones de red y en veces que se le pidió
@@ -20,6 +21,12 @@ los mismos cinco del camino de swaps leídos al lado del otro:
    un campo que lo dice y la descripción lo repite.
 5. **Que la clave privada no acabe ni en el registro ni en el log ni en el
    cuerpo que se envía.** Se busca la cadena literal en lo que se escribió.
+6. **Que el canal de la deposit wallet no se use a medias.** Con credenciales del
+   relayer la orden sale con la wallet de `maker` —el recinto rechaza la EOA—, y
+   antes de firmar la wallet tiene que estar desplegada, con fondos y con el
+   permiso **releído en la cadena** después de que el relayer confirme: un
+   «confirmado» del relayer no es una medición, y el dato del que depende el
+   cobro se mide.
 
 Se usa un `EvmBroadcaster` **real** sobre un nodo de mentira, y una clave de
 desarrollo publicada —la cuenta 0 de Hardhat, sin fondos y conocida
@@ -56,6 +63,7 @@ from amigocompora.app.execution_policy import (
 from amigocompora.app.mode_guard import ModeGuard
 from amigocompora.app.registry import EngineRegistry
 from amigocompora.app.usecases.place_prediction_order import PlacePredictionOrder
+from amigocompora.domain.addresses import shorten
 from amigocompora.domain.clock import FrozenClock
 from amigocompora.domain.errors import (
     ConfirmationDeniedError,
@@ -79,7 +87,12 @@ from amigocompora.domain.models import (
     VenueKind,
 )
 from amigocompora.domain.modes import Capability, OperationMode
-from amigocompora.domain.protocols import EngineKind, EngineManifest
+from amigocompora.domain.protocols import (
+    EngineKind,
+    EngineManifest,
+    WalletChannelCredentials,
+    WalletChannelSource,
+)
 from amigocompora.engines.polymarket.orders import (
     build_order as build_prediction_order,
 )
@@ -102,7 +115,7 @@ DIRECCION = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 #: y no se sacan de una constante del producto: son contra lo que se firma y a
 #: quién se le concede el permiso, y sacarlas de donde las saca el camino dejaría
 #: la prueba comprobándose a sí misma.
-EXCHANGE = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
+EXCHANGE = "0xe111180000d2663c0091e4f400237545b87b996b"
 COLATERAL = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 COLECCION = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 
@@ -114,6 +127,30 @@ SELECTOR_APPROVE_ERC20 = "095ea7b3"
 SELECTOR_SET_APPROVAL_FOR_ALL = "a22cb465"
 #: El máximo de `uint256`, que es lo que **no** puede aparecer en un `approve`.
 MAXIMO_UINT256 = "f" * 64
+#: El mismo máximo, en número, para contestarlo desde el nodo de mentira.
+MAXIMO_RAW = (1 << 256) - 1
+
+#: Selectores de las preguntas que se le hacen al nodo en el canal de la wallet,
+#: escritos a mano desde la definición pública de cada estándar:
+#: `balanceOf(address)` y `allowance(address,address)` son ERC-20, y
+#: `isApprovedForAll(address,address)` es ERC-1155.
+SELECTOR_BALANCE_OF = "0x70a08231"
+SELECTOR_ALLOWANCE = "0xdd62ed3e"
+SELECTOR_IS_APPROVED_FOR_ALL = "0xe985e9c5"
+
+#: La deposit wallet con la que opera el canal del relayer en estas pruebas. No
+#: se deriva: el motor falso decide cuál es, y lo que se comprueba es que el
+#: camino la use —para firmar, para leer saldos y para pedir el permiso— y no la
+#: EOA.
+DEPOSITO = "0x2222222222222222222222222222222222222222"
+
+#: Un secreto con forma inconfundible, para poder buscarlo en lo escrito.
+BUILDER_SECRETO = "secreto-del-builder-de-prueba"
+
+#: La frase de paso del builder. Va en constante y no en la llamada porque un
+#: literal con forma de credencial en un argumento así lo señala el linter — con
+#: razón: es la forma en que una credencial acaba escrita en el código.
+FRASE_DE_PASO = "frase-de-paso-de-prueba"
 
 #: El identificador que el recinto le da a la orden. Tiene la misma forma que un
 #: hash de transacción, y esa es exactamente la razón de que el registro lleve un
@@ -168,6 +205,31 @@ class FakeKey(PrivateKeySource):
         return CLAVE
 
 
+class FakeWallets(WalletChannelSource):
+    """Credenciales del canal de la deposit wallet, con contador y con interruptor.
+
+    El secreto lleva una cadena reconocible para poder buscarla en el registro y
+    en el log: lo que no puede aparecer ahí no es sólo la clave privada.
+    """
+
+    def __init__(self, *, available: bool = True) -> None:
+        self.pedida = 0
+        self._available = available
+
+    def available(self) -> bool:
+        return self._available
+
+    def require(self) -> WalletChannelCredentials:
+        self.pedida += 1
+        return WalletChannelCredentials(
+            builder_api_key="builder-publica-de-prueba",
+            builder_secret=BUILDER_SECRETO,
+            builder_passphrase=FRASE_DE_PASO,
+            relayer_api_key="relayer-de-prueba",
+            relayer_address="0x31f4Cc01976Ace75A5646272352E270Db6f39584",
+        )
+
+
 class _FakePassphrase:
     def get(self) -> str | None:
         return None
@@ -219,7 +281,13 @@ class MotorFalso:
     ) -> None:
         self.construidos = 0
         self.claves_vistas: list[str] = []
+        self.carteras_vistas: list[str | None] = []
         self.publicadas: list[SignedPredictionOrder] = []
+        self.duenos_vistos: list[str] = []
+        self.despliegues: list[str] = []
+        self.aprobaciones_wallet: list[tuple[str, str]] = []
+        self.claves_en_lotes: list[str] = []
+        self.credenciales_vistas: list[WalletChannelCredentials] = []
         self._estado = estado
         self._orden_id = orden_id
         self._coleccion = coleccion
@@ -244,6 +312,12 @@ class MotorFalso:
 
     async def market(self, market_id: str) -> PredictionMarket:
         raise AssertionError(f"no se pidió un mercado suelto: {market_id}")
+
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        # La búsqueda por condición es de la pestaña —cargar una posición en la
+        # tarjeta de orden—, no de publicar: la orden llega con su mercado ya
+        # resuelto. Por eso aquí se afirma que no se pidió.
+        raise AssertionError(f"no se buscó por condición: {condition_id}")
 
     async def book(self, token_id: str) -> MarketDepth:
         # `book` está en el protocolo de **lectura**, así que un motor que no lo
@@ -270,9 +344,16 @@ class MotorFalso:
             price=price,
         )
 
-    def sign_order(self, order: PredictionOrder, *, private_key: str) -> SignedPredictionOrder:
+    def sign_order(
+        self,
+        order: PredictionOrder,
+        *,
+        private_key: str,
+        wallet: str | None = None,
+    ) -> SignedPredictionOrder:
         self.claves_vistas.append(private_key)
-        return sign_order(order, private_key=private_key)
+        self.carteras_vistas.append(wallet)
+        return sign_order(order, private_key=private_key, wallet=wallet)
 
     async def submit_order(
         self, signed: SignedPredictionOrder, *, private_key: str
@@ -292,6 +373,48 @@ class MotorFalso:
     def shares_collection_for(self, market: PredictionMarket) -> str:
         del market
         return self._coleccion
+
+    # ---- El canal de la deposit wallet: el motor falso también lo sabe. ----
+    def settlement_wallet(self, owner: str) -> str:
+        self.duenos_vistos.append(owner)
+        return DEPOSITO
+
+    async def deploy_settlement_wallet(
+        self, *, owner: str, credentials: WalletChannelCredentials
+    ) -> str:
+        self.despliegues.append(owner)
+        self.credenciales_vistas.append(credentials)
+        return DEPOSITO
+
+    async def approve_wallet_collateral(
+        self,
+        *,
+        owner: str,
+        collateral: Token,
+        spender: str,
+        private_key: str,
+        credentials: WalletChannelCredentials,
+    ) -> str:
+        del owner, collateral
+        self.aprobaciones_wallet.append(("colateral", spender))
+        self.claves_en_lotes.append(private_key)
+        self.credenciales_vistas.append(credentials)
+        return "relayer-de-la-aprobacion"
+
+    async def approve_wallet_shares(
+        self,
+        *,
+        owner: str,
+        collection: str,
+        spender: str,
+        private_key: str,
+        credentials: WalletChannelCredentials,
+    ) -> str:
+        del owner, collection
+        self.aprobaciones_wallet.append(("participaciones", spender))
+        self.claves_en_lotes.append(private_key)
+        self.credenciales_vistas.append(credentials)
+        return "relayer-de-la-autorizacion"
 
 
 class MotorSoloLectura:
@@ -316,6 +439,9 @@ class MotorSoloLectura:
 
     async def market(self, market_id: str) -> PredictionMarket:
         raise AssertionError(market_id)
+
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        raise AssertionError(condition_id)
 
     async def book(self, token_id: str) -> MarketDepth:
         raise AssertionError(token_id)
@@ -432,6 +558,51 @@ def _permisos() -> Callable[[list[Any]], str]:
     return handler
 
 
+def _cartera(
+    *,
+    saldo: int,
+    permiso: int | Callable[[], int] = 0,
+    aprobado: bool | Callable[[], bool] = False,
+) -> Callable[[list[Any]], str]:
+    """`eth_call` que contesta las preguntas del canal de la wallet.
+
+    Se despacha por **selector** y no sólo por contrato, porque las tres van al
+    mismo método JSON-RPC y dos de ellas al mismo contrato: sin mirar el selector,
+    un nodo falso no podría distinguir «cuánto saldo tiene» de «cuánto puede
+    gastar», y el camino leería el permiso donde pidió el saldo.
+
+    El permiso y la autorización se contestan con una función cuando la prueba
+    necesita que cambien **después** de que el relayer confirme: el camino vuelve
+    a leerlos a propósito, y un nodo que contestara siempre lo mismo haría pasar
+    la comprobación sin que el permiso se hubiera concedido de verdad.
+
+    Las cifras se contestan **como las contesta un nodo**: una palabra de 32
+    bytes, no un hexadecimal corto. No es cosmético —el camino lee el saldo
+    cortando esa palabra, y un retorno corto lo rechaza con razón: un contrato
+    distinto del que se cree es exactamente lo que ese corte detecta.
+    """
+
+    def palabra(valor: int) -> str:
+        return "0x" + f"{valor:064x}"
+
+    def handler(params: list[Any]) -> str:
+        llamada = params[0]
+        destino = str(llamada.get("to", "")).lower()
+        selector = str(llamada.get("data", ""))[:10]
+        if destino == COLATERAL and selector == SELECTOR_BALANCE_OF:
+            return palabra(saldo)
+        if destino == COLATERAL and selector == SELECTOR_ALLOWANCE:
+            return palabra(permiso() if callable(permiso) else permiso)
+        if destino == COLECCION and selector == SELECTOR_IS_APPROVED_FOR_ALL:
+            valor = aprobado() if callable(aprobado) else aprobado
+            return palabra(1 if valor else 0)
+        raise AssertionError(
+            f"la prueba sólo espera saldo, permiso o autorización, no {destino} {selector}"
+        )
+
+    return handler
+
+
 def _node(**overrides: Any) -> FakeNode:
     handlers: dict[str, Any] = {
         "eth_chainId": hex(POLYGON_ID),
@@ -440,6 +611,7 @@ def _node(**overrides: Any) -> FakeNode:
         "eth_getBlockByNumber": {"baseFeePerGas": "0x3b9aca00"},
         "eth_maxPriorityFeePerGas": "0x3b9aca",
         "eth_call": _permisos(),
+        "eth_getCode": "0x6001",
         "eth_sendRawTransaction": _hash_of,
         "eth_getTransactionReceipt": {"blockNumber": "0x10", "status": "0x1"},
     }
@@ -497,6 +669,7 @@ async def _armed(
     engine_id: str = "polymarket",
     broadcasters: Mapping[str, EvmBroadcaster] | None = None,
     hay_clave: bool = True,
+    wallets: WalletChannelSource | None = None,
 ) -> tuple[PlacePredictionOrder, FakeNode, ExecutionLedger, RecordingPrompt, FakeKey, Any]:
     """Un `PlacePredictionOrder` completo, con emisor **real** sobre un nodo falso."""
     clock = FrozenClock(AHORA)
@@ -526,6 +699,7 @@ async def _armed(
         keys=keys,
         policy=policy,
         broadcasters=({"polygon": _broadcaster(fake)} if broadcasters is None else broadcasters),
+        wallets=wallets,
         clock=clock,
     )
     return use_case, fake, ledger, prompt, keys, engine
@@ -973,3 +1147,256 @@ async def test_sin_clave_no_se_dice_ninguna_direccion(tmp_path: Path) -> None:
 
     assert sin_clave.address() is None
     assert con_clave.address() == DIRECCION
+
+
+# --------------------------------------------------------------------------- #
+# 9. La deposit wallet
+# --------------------------------------------------------------------------- #
+async def test_con_credenciales_la_orden_sale_de_la_wallet_no_de_la_clave(
+    tmp_path: Path,
+) -> None:
+    """Con credenciales del relayer el `maker` es la wallet: el recinto rechaza la EOA.
+
+    Lo que se mira es lo que el recinto recibió —`maker`, `signer` y el tipo de
+    firma—, no lo que el doble diga de sí mismo. Con la wallet ya desplegada, con
+    saldo y con permiso de sobra no se pide ninguna aprobación: el camino
+    comprueba antes de gastar.
+    """
+    use_case, node, ledger, prompt, _, motor = await _armed(
+        tmp_path,
+        node=_node(eth_call=_cartera(saldo=COSTE_RAW, permiso=10**18)),
+        wallets=FakeWallets(),
+    )
+
+    await _comprar(use_case)
+
+    (publicada,) = motor.publicadas
+    assert publicada.signer == DEPOSITO
+    assert f'"maker":"{DEPOSITO}"' in publicada.payload
+    assert '"signatureType":3' in publicada.payload, "el tipo de firma del canal"
+    assert DIRECCION not in publicada.payload, "la EOA firma por dentro y no se nombra"
+    assert motor.carteras_vistas == [DEPOSITO], "se firma con la wallet del canal"
+    assert motor.duenos_vistos == [DIRECCION], "y la wallet es la de la EOA"
+    assert motor.despliegues == [], "no hay que desplegar nada"
+    assert motor.aprobaciones_wallet == [], "ni aprobar nada"
+    assert node.sent_raw() == [], "por este canal no se emite ninguna transacción"
+    assert len(prompt.asked) == 1, "sólo la orden: no hay nada que aprobar"
+    aviso = " ".join(prompt.asked[0].details)
+    # Las dos direcciones, con nombres distintos: son dos cosas distintas.
+    assert "Firma la clave" in aviso
+    assert "Opera la wallet de depósito" in aviso
+    assert "paga y cobra" in aviso
+    # Y el destinatario que se enseña es la **wallet**, no la clave: con la
+    # compra real del 9/10/2026 las 5 participaciones quedaron en la wallet y
+    # ninguna en la EOA, así que decir que recibe la clave era engañoso.
+    assert f"Recibe: {shorten(DEPOSITO)}" in aviso
+    # El asiento apunta a donde fue el dinero de verdad.
+    (asiento,) = ledger.entries()
+    assert asiento.recipient == DEPOSITO
+
+
+async def test_sin_código_en_la_dirección_se_pide_el_despliegue_antes_de_seguir(
+    tmp_path: Path,
+) -> None:
+    """Una dirección sin código no puede pagar nada: el despliegue va primero.
+
+    Lo ejecuta el relayer y no cuesta gas, así que no pide confirmación aparte.
+    Lo que se comprueba es que ocurre **antes** de leer saldo o permiso, y que
+    quien lo pide es el **dueño** —la EOA—, no la wallet que todavía no existe.
+    """
+    motor = MotorFalso()
+    use_case, node, _, _, _, _ = await _armed(
+        tmp_path,
+        node=_node(eth_getCode="0x", eth_call=_cartera(saldo=COSTE_RAW, permiso=10**18)),
+        motor=motor,
+        wallets=FakeWallets(),
+    )
+
+    await _comprar(use_case)
+
+    assert motor.despliegues == [DIRECCION]
+    assert motor.credenciales_vistas, "el despliegue lo pide el relayer, con credenciales"
+    assert node.calls[0][0] == "eth_getCode", "y se pregunta antes que nada"
+    assert len(motor.publicadas) == 1, "después la orden sale con normalidad"
+
+
+async def test_sin_fondos_en_la_wallet_se_dice_antes_de_firmar_y_con_las_dos_cifras(
+    tmp_path: Path,
+) -> None:
+    """La orden se paga desde la wallet, y si no le llega se corta antes de firmar.
+
+    No se mueve dinero automáticamente entre la cartera y la wallet —pasar fondos
+    de una a otra es una transferencia real y se decide aparte—, así que lo que se
+    hace es decirlo con las dos direcciones y las dos cifras, en vez de dejar que
+    el recinto rechace la orden hablando de saldos. Y ocurre **antes** de pedir la
+    confirmación: no se le enseña a firmar algo que ya se sabe que va a fallar.
+    """
+    use_case, node, ledger, prompt, _, motor = await _armed(
+        tmp_path,
+        node=_node(eth_call=_cartera(saldo=COSTE_RAW - 1)),
+        wallets=FakeWallets(),
+    )
+
+    with pytest.raises(ExecutionError, match="wallet de depósito") as error:
+        await _comprar(use_case)
+
+    mensaje = str(error.value)
+    assert DIRECCION in mensaje, "de qué cartera hay que enviar los fondos"
+    assert DEPOSITO in mensaje, "a qué wallet"
+    assert prompt.asked == [], "no se pide confirmar una orden que no se puede pagar"
+    assert motor.publicadas == []
+    assert node.sent_raw() == []
+    assert ledger.entries() == ()
+
+
+async def test_el_permiso_de_la_wallet_lo_concede_el_relayer_y_se_relee(
+    tmp_path: Path,
+) -> None:
+    """El relayer exige el permiso máximo, y el diálogo lo dice con esas palabras.
+
+    Contradice la regla del camino de la EOA —importe exacto, nunca ilimitado—,
+    así que no puede aparecer sin explicación. Y después de que el relayer
+    confirme se vuelve a **leer** el permiso en la cadena: la confirmación dice
+    que su transacción salió, no cuánto quedó concedido.
+
+    El permiso no se emite como transacción propia —lo ejecuta el relayer por la
+    wallet— así que no hay ningún `raw` que emitir, y por eso no hay asiento de
+    aprobación en el registro: no hay transacción que anotar.
+    """
+    motor = MotorFalso()
+    use_case, node, ledger, prompt, _, _ = await _armed(
+        tmp_path,
+        node=_node(
+            eth_call=_cartera(
+                saldo=COSTE_RAW,
+                permiso=lambda: MAXIMO_RAW if motor.aprobaciones_wallet else 0,
+            )
+        ),
+        motor=motor,
+        wallets=FakeWallets(),
+    )
+
+    await _comprar(use_case)
+
+    assert len(prompt.asked) == 2, "la aprobación y la orden"
+    aviso = " ".join(prompt.asked[0].details)
+    assert "ilimitado" in aviso
+    assert "lo exige el relayer de Polymarket" in aviso
+    assert motor.aprobaciones_wallet == [("colateral", exchange_for(False))]
+    assert motor.claves_en_lotes == [CLAVE], "el lote del relayer va firmado"
+    assert motor.credenciales_vistas, "y con las credenciales del canal"
+    assert motor.duenos_vistos == [DIRECCION]
+    assert node.sent_raw() == [], "la aprobación no la emite esta aplicación"
+    (orden,) = ledger.entries()  # sólo el asiento de la orden
+    assert orden.kind == "order"
+
+
+async def test_si_el_permiso_de_la_wallet_no_cuaja_no_se_publica(
+    tmp_path: Path,
+) -> None:
+    """Un «confirmado» del relayer no basta: el permiso se relee y se exige.
+
+    Es la misma propiedad que en el camino de la EOA —el permiso se mide, no se
+    supone— aplicada al canal donde es más fácil confiarse, porque la
+    confirmación la da el propio relayer que ejecutó el lote.
+    """
+    use_case, node, ledger, prompt, _, motor = await _armed(
+        tmp_path,
+        node=_node(eth_call=_cartera(saldo=COSTE_RAW, permiso=0)),
+        wallets=FakeWallets(),
+    )
+
+    with pytest.raises(ExecutionError, match="sigue siendo insuficiente"):
+        await _comprar(use_case)
+
+    assert motor.publicadas == []
+    assert node.sent_raw() == []
+    assert len(prompt.asked) == 1, "sólo la aprobación: la orden no llega a enseñarse"
+    assert ledger.entries() == ()
+
+
+async def test_vender_por_la_wallet_autoriza_las_participaciones_sin_importe(
+    tmp_path: Path,
+) -> None:
+    """Vender por la wallet pide el permiso de la colección, no el del colateral.
+
+    Es el mismo permiso sin importe del camino de la EOA —ERC-1155 no tiene
+    permiso por cantidad— dicho desde la wallet, y lo ejecuta el relayer. Y no se
+    comprueba saldo: vender no gasta colateral.
+    """
+    motor = MotorFalso()
+    use_case, node, ledger, prompt, _, _ = await _armed(
+        tmp_path,
+        node=_node(
+            eth_call=_cartera(saldo=0, aprobado=lambda: bool(motor.aprobaciones_wallet))
+        ),
+        motor=motor,
+        wallets=FakeWallets(),
+    )
+
+    await _comprar(use_case, side=PredictionSide.SELL)
+
+    assert motor.aprobaciones_wallet == [("participaciones", exchange_for(False))]
+    assert node.sent_raw() == []
+    aviso = " ".join(prompt.asked[0].details)
+    assert "NO tiene importe" in aviso
+    assert "la wallet" in aviso
+    (orden,) = ledger.entries()
+    assert orden.kind == "order"
+
+
+async def test_sin_credenciales_se_opera_por_la_eoa_como_siempre(tmp_path: Path) -> None:
+    """El canal de la wallet es una capacidad, no un requisito: sin él, la EOA.
+
+    Y no se piden las credenciales siquiera: la fuente contesta que no está
+    disponible y el camino no llega a `require()`. El diálogo lo tiene que decir
+    con la otra palabra —«cartera», no «wallet de depósito»—, porque son dos
+    formas distintas de operar y confundirlas sería no saber quién firma.
+    """
+    wallets = FakeWallets(available=False)
+    use_case, node, _, prompt, _, motor = await _armed(tmp_path, wallets=wallets)
+
+    await _comprar(use_case)
+
+    assert wallets.pedida == 0
+    assert motor.carteras_vistas == [None], "se firma sin wallet"
+    assert motor.publicadas[0].signer == DIRECCION
+    assert len(node.sent_raw()) == 1, "la aprobación, como transacción propia"
+    aviso = " ".join(prompt.asked[-1].details)
+    assert "Firma la cartera" in aviso
+    assert "wallet de depósito" not in aviso
+
+
+async def test_los_secretos_del_canal_no_aparecen_ni_en_el_registro_ni_en_el_log(
+    tmp_path: Path,
+) -> None:
+    """El secreto del builder no es la clave privada, y tampoco puede filtrarse.
+
+    Se ejecuta el caso que **usa** las credenciales —el lote de la aprobación—
+    para que la búsqueda no pase por vacío: si el lote no se enviara, no habría
+    nada que filtrar y la prueba no mediría nada.
+    """
+    motor = MotorFalso()
+    use_case, _, ledger, _, _, _ = await _armed(
+        tmp_path,
+        node=_node(
+            eth_call=_cartera(
+                saldo=COSTE_RAW,
+                permiso=lambda: MAXIMO_RAW if motor.aprobaciones_wallet else 0,
+            )
+        ),
+        motor=motor,
+        wallets=FakeWallets(),
+    )
+
+    with capture_logs() as registros:
+        await _comprar(use_case)
+
+    assert motor.credenciales_vistas, "el caso tiene que haber usado el canal"
+    assert BUILDER_SECRETO not in repr(motor.credenciales_vistas[0])
+    escrito = ledger.path.read_text(encoding="utf-8")
+    assert BUILDER_SECRETO not in escrito
+    volcado = json.dumps(registros, default=str)
+    assert BUILDER_SECRETO not in volcado
+    assert BUILDER_SECRETO not in motor.publicadas[0].payload
+    assert DEPOSITO in volcado, "la wallet sí: es lo que el usuario necesita ver"

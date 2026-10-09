@@ -114,6 +114,19 @@ class MotorFalso:
                 return market
         raise AssertionError(market_id)
 
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        """El mercado de una posición, por su `conditionId`.
+
+        Los mercados de este doble no traen `conditionId`: la pestaña que esta
+        prueba maneja no opera sobre posiciones de la wallet, y por eso el doble
+        sólo declara que sabe hacerlo —lo exige el protocolo— sin tener ninguno
+        que devolver.
+        """
+        for market in _MERCADOS:
+            if market.condition_id == condition_id:
+                return market
+        raise AssertionError(condition_id)
+
     async def book(self, token_id: str) -> MarketDepth:
         """Un libro de un solo nivel por lado, para los resultados que conoce.
 

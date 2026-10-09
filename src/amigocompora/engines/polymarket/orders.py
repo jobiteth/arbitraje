@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
@@ -47,6 +48,7 @@ import structlog
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils.address import to_checksum_address
+from eth_utils.crypto import keccak
 
 from amigocompora.domain.errors import ExecutionError
 from amigocompora.domain.models import (
@@ -54,6 +56,10 @@ from amigocompora.domain.models import (
     PredictionOrder,
     PredictionSide,
     SignedPredictionOrder,
+)
+from amigocompora.engines.polymarket.deposit_wallet import (
+    recover_wrapped_signer,
+    wrap_order_signature,
 )
 from amigocompora.infra.evm.broadcast import selector, word_address, word_uint
 
@@ -73,19 +79,19 @@ CHAIN_ID: Final = 137
 #: nombre y no verlo nunca.
 CHAIN_KEY: Final = "polygon"
 
-#: Contrato de intercambio general, medido del cliente oficial.
-EXCHANGE: Final = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+#: Contrato de intercambio general de la versión 2 del recinto (documentación
+#: oficial de creación de órdenes). El de la versión 1 ya no acepta órdenes.
+EXCHANGE: Final = "0xE111180000d2663C0091e4f400237545B87B996B"
 
-#: Contrato para los mercados de resultados excluyentes que comparten colateral.
-NEG_RISK_EXCHANGE: Final = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+#: Contrato para los mercados de resultados excluyentes, versión 2.
+NEG_RISK_EXCHANGE: Final = "0xe2222d279d744050d28e00520010520000310F59"
 
 #: El token condicional ERC-1155, donde viven las participaciones.
 CONDITIONAL_TOKENS: Final = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-#: Colateral del recinto: el USDC **puenteado** desde Ethereum, no el nativo de
-#: Polygon. Los dos publican `symbol() == "USDC"`, así que se distinguen por
-#: dirección o no se distinguen.
-COLLATERAL: Final = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+#: Colateral del recinto: pUSD, según la documentación oficial de Polymarket. Medido
+#: on-chain en Polygon: `symbol() == "pUSD"`, `decimals() == 6`.
+COLLATERAL: Final = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
 #: Escala de los importes dentro de la orden. Medido: `to_token_decimals` del
 #: cliente oficial multiplica por 10⁶, que son los decimales del colateral.
@@ -94,13 +100,21 @@ AMOUNT_DECIMALS: Final = 6
 #: Tipo de firma: una cuenta normal (EOA). Es la que no obliga a crear nada en
 #: Polymarket —ni cartera proxy ni Safe—, y la única que esta entrega produce.
 SIGNATURE_TYPE_EOA: Final = 0
+SIGNATURE_TYPE_DEPOSIT_WALLET: Final = 3
 
 #: `taker` en cero significa «orden pública»: cualquiera puede cruzarla. Es lo
 #: que se quiere al publicar en el libro.
 ZERO_ADDRESS: Final = "0x0000000000000000000000000000000000000000"
 
 DOMAIN_NAME: Final = "Polymarket CTF Exchange"
-DOMAIN_VERSION: Final = "1"
+DOMAIN_VERSION: Final = "2"
+
+#: `metadata` y `builder` van a cero: ni etiqueta de la orden ni código de builder.
+ZERO_BYTES32: Final = "0x" + "00" * 32
+
+#: Límite de la sal dentro del JSON: el recinto la lee como entero de JavaScript,
+#: y por encima de 2^53 la orden se rechaza como payload inválido.
+SALT_LIMIT: Final = 2**53
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,15 +389,14 @@ ORDER_TYPES: Final[dict[str, list[dict[str, str]]]] = {
         {"name": "salt", "type": "uint256"},
         {"name": "maker", "type": "address"},
         {"name": "signer", "type": "address"},
-        {"name": "taker", "type": "address"},
         {"name": "tokenId", "type": "uint256"},
         {"name": "makerAmount", "type": "uint256"},
         {"name": "takerAmount", "type": "uint256"},
-        {"name": "expiration", "type": "uint256"},
-        {"name": "nonce", "type": "uint256"},
-        {"name": "feeRateBps", "type": "uint256"},
         {"name": "side", "type": "uint8"},
         {"name": "signatureType", "type": "uint8"},
+        {"name": "timestamp", "type": "uint256"},
+        {"name": "metadata", "type": "bytes32"},
+        {"name": "builder", "type": "bytes32"},
     ],
 }
 
@@ -393,7 +406,9 @@ def typed_data(
     *,
     signer: str,
     salt: int,
+    timestamp: int,
     maker: str | None = None,
+    signature_type: int = SIGNATURE_TYPE_EOA,
 ) -> dict[str, Any]:
     """El mensaje EIP-712 completo, listo para firmar.
 
@@ -421,15 +436,14 @@ def typed_data(
             "salt": salt,
             "maker": to_checksum_address(maker or signer),
             "signer": to_checksum_address(signer),
-            "taker": to_checksum_address(ZERO_ADDRESS),
             "tokenId": int(order.token_id),
             "makerAmount": maker_amount,
             "takerAmount": taker_amount,
-            "expiration": order.expiration,
-            "nonce": order.nonce,
-            "feeRateBps": order.fee_rate_bps,
             "side": 0 if order.is_buy else 1,
-            "signatureType": SIGNATURE_TYPE_EOA,
+            "signatureType": signature_type,
+            "timestamp": timestamp,
+            "metadata": ZERO_BYTES32,
+            "builder": ZERO_BYTES32,
         },
     }
 
@@ -440,6 +454,8 @@ def sign_order(
     private_key: str,
     order_type: str | None = None,
     salt: int | None = None,
+    timestamp: int | None = None,
+    wallet: str | None = None,
 ) -> SignedPredictionOrder:
     """Firma la orden y devuelve el cuerpo exacto que se enviará al recinto.
 
@@ -452,45 +468,79 @@ def sign_order(
     firma construida sobre un mensaje distinto del que se cree. Si no cuadra, no
     se devuelve una orden a medias: se lanza.
     """
-    account = Account.from_key(private_key)
-    signer = account.address
+    eoa = Account.from_key(private_key).address
     if salt is None:
-        # La sal existe para que dos órdenes idénticas —mismo mercado, mismo
-        # precio, mismo tamaño— no colisionen en el recinto. Se deriva del azar
-        # del sistema y no del reloj: dos órdenes emitidas en el mismo segundo
-        # tienen que ser distintas.
-        salt = int.from_bytes(secrets.token_bytes(32), "big")
+        # La sal evita que dos órdenes idénticas colisionen en el recinto. Se
+        # envía como número JSON y el recinto lo lee como entero de JavaScript:
+        # por encima de 2^53 la orden se rechaza con «Invalid order payload».
+        salt = secrets.randbelow(SALT_LIMIT)
+    if timestamp is None:
+        timestamp = int(time.time() * 1000)
 
-    mensaje = typed_data(order, signer=signer, salt=salt)
-    firmado = Account.sign_message(encode_typed_data(full_message=mensaje), private_key)
-    firma = _hex(firmado.signature)
-    digest = _hex(firmado.message_hash)
+    if wallet is None:
+        mensaje = typed_data(order, signer=eoa, salt=salt, timestamp=timestamp)
+        firmado = Account.sign_message(encode_typed_data(full_message=mensaje), private_key)
+        firma = _hex(firmado.signature)
+        digest = _hex(firmado.message_hash)
+        recuperada = Account.recover_message(
+            encode_typed_data(full_message=mensaje), signature=firma
+        )
+    else:
+        # Cartera de depósito: la EOA firma por dentro y el recinto valida con la
+        # wallet. `maker` y `signer` son la wallet, no la EOA.
+        mensaje = typed_data(
+            order,
+            signer=wallet,
+            salt=salt,
+            timestamp=timestamp,
+            maker=wallet,
+            signature_type=SIGNATURE_TYPE_DEPOSIT_WALLET,
+        )
+        exchange = exchange_for(order.neg_risk)
+        firma = wrap_order_signature(
+            mensaje["message"],
+            chain_id=CHAIN_ID,
+            exchange=exchange,
+            wallet=wallet,
+            private_key=private_key,
+        )
+        digest = _hex(keccak(hexstr=firma))
+        recuperada = recover_wrapped_signer(
+            mensaje["message"],
+            firma,
+            chain_id=CHAIN_ID,
+            exchange=exchange,
+            wallet=wallet,
+        )
 
-    recuperada = Account.recover_message(
-        encode_typed_data(full_message=mensaje), signature=firma
-    )
-    if recuperada.lower() != signer.lower():
+    if recuperada.lower() != eoa.lower():
         raise ExecutionError(
-            f"la firma de la orden no se corresponde con la cartera que la emite "
-            f"({recuperada} frente a {signer}). No se publica: una orden firmada por "
+            f"la firma de la orden no se corresponde con la clave que la emite "
+            f"({recuperada} frente a {eoa}). No se publica: una orden firmada por "
             f"otra cuenta la rechazaría el recinto, y si la aceptara estaría "
             f"operando con dinero ajeno."
         )
 
+    m = mensaje["message"]
     cuerpo = {
         "order": {
-            **{
-                clave: str(valor)
-                for clave, valor in mensaje["message"].items()
-                if clave not in {"side", "signatureType", "salt"}
-            },
+            "builder": m["builder"],
+            "expiration": str(order.expiration),
+            "maker": m["maker"],
+            "makerAmount": str(m["makerAmount"]),
+            "metadata": m["metadata"],
             "salt": salt,
             "side": "BUY" if order.is_buy else "SELL",
-            "signatureType": SIGNATURE_TYPE_EOA,
             "signature": firma,
+            "signatureType": m["signatureType"],
+            "signer": m["signer"],
+            "takerAmount": str(m["takerAmount"]),
+            "timestamp": str(timestamp),
+            "tokenId": str(m["tokenId"]),
         },
         "owner": "",  # lo rellena el cliente con la credencial L2
         "orderType": order_type or order.order_type,
+        "deferExec": False,
         "postOnly": False,
     }
     _log.info(
@@ -500,12 +550,12 @@ def sign_order(
         side=order.side.value,
         price=str(order.price),
         size=str(order.size),
-        signer=signer,
+        signer=m["signer"],
         digest=digest,
     )
     return SignedPredictionOrder(
         order=order,
-        signer=signer,
+        signer=m["signer"],
         signature=firma,
         digest=digest,
         payload=json.dumps(cuerpo, separators=(",", ":"), ensure_ascii=False),

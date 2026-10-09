@@ -488,6 +488,19 @@ class EvmBroadcaster:
         raw = await self._pool.call("eth_getBalance", [address, "latest"])
         return _parse_quantity(raw, field="el saldo nativo")
 
+    async def has_code(self, address: str) -> bool:
+        """Si en esa dirección hay un contrato desplegado.
+
+        Se pregunta a la cadena con `eth_getCode` y no a un índice de terceros:
+        un índice puede ir por detrás, y fiarse de él daría por desplegada una
+        wallet que todavía no lo está — y una dirección sin código no puede
+        pagar nada. `0x` es la respuesta para una cuenta sin código y también
+        para una dirección en la que nadie ha escrito nunca; el `0x0` que
+        devuelven algunos nodos significa lo mismo y se trata igual.
+        """
+        raw = await self._pool.call("eth_getCode", [address, "latest"])
+        return str(raw).strip() not in ("0x", "0x0", "")
+
     async def token_balance(self, token: str, owner: str) -> int:
         """El saldo de un ERC-20, en su unidad mínima.
 

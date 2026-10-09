@@ -38,6 +38,7 @@ import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils.address import to_checksum_address
+from eth_utils.crypto import keccak
 from structlog.testing import capture_logs
 
 from amigocompora.domain.errors import ExecutionError, InvalidAmountError
@@ -49,6 +50,10 @@ from amigocompora.domain.models import (
     SignedPredictionOrder,
     Venue,
     VenueKind,
+)
+from amigocompora.engines.polymarket.deposit_wallet import (
+    derive_beacon_deposit_wallet,
+    recover_wrapped_signer,
 )
 from amigocompora.engines.polymarket.orders import (
     ROUNDING,
@@ -74,8 +79,8 @@ DIRECCION = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 #: Las direcciones de los contratos, en minúsculas y escritas a mano: son contra
 #: lo que se firma, y sacarlas de una constante del producto dejaría la prueba
 #: comprobándose a sí misma.
-EXCHANGE = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
-EXCHANGE_NEG_RISK = "0xc5d563a36ae78145c45a50134d48a1215220f80a"
+EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+EXCHANGE_NEG_RISK = "0xe2222d279d744050d28e00520010520000310F59"
 COLATERAL = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
 #: Los dos resultados de un mercado de sí/no. Son cadenas de dígitos porque el
@@ -107,15 +112,14 @@ TIPOS: dict[str, list[dict[str, str]]] = {
         {"name": "salt", "type": "uint256"},
         {"name": "maker", "type": "address"},
         {"name": "signer", "type": "address"},
-        {"name": "taker", "type": "address"},
         {"name": "tokenId", "type": "uint256"},
         {"name": "makerAmount", "type": "uint256"},
         {"name": "takerAmount", "type": "uint256"},
-        {"name": "expiration", "type": "uint256"},
-        {"name": "nonce", "type": "uint256"},
-        {"name": "feeRateBps", "type": "uint256"},
         {"name": "side", "type": "uint8"},
         {"name": "signatureType", "type": "uint8"},
+        {"name": "timestamp", "type": "uint256"},
+        {"name": "metadata", "type": "bytes32"},
+        {"name": "builder", "type": "bytes32"},
     ],
 }
 
@@ -458,32 +462,34 @@ def test_la_firma_se_hace_contra_el_contrato_del_mercado(neg_risk: bool, contrat
     """
     order = _orden(market=_mercado(neg_risk=neg_risk))
 
-    mensaje = typed_data(order, signer=DIRECCION, salt=1)
+    mensaje = typed_data(order, signer=DIRECCION, salt=1, timestamp=1)
 
     assert mensaje["domain"]["verifyingContract"] == to_checksum_address(contrato)
     assert mensaje["domain"]["name"] == "Polymarket CTF Exchange"
-    assert mensaje["domain"]["version"] == "1"
+    assert mensaje["domain"]["version"] == "2"
     assert mensaje["domain"]["chainId"] == 137
 
 
-def test_la_orden_es_publica_y_la_firma_una_cuenta_normal() -> None:
-    """`taker` en cero es «cualquiera puede cruzarla», y el tipo 0 es una EOA.
+def test_la_firma_es_de_una_cuenta_normal_y_sin_etiqueta_ni_builder() -> None:
+    """El tipo 0 es una EOA, y `metadata` y `builder` van a cero.
 
-    Se afirma explícitamente porque son los dos campos que, cambiados, convierten
-    una orden pública en una que sólo un destinatario concreto puede cruzar, o que
-    exige una cartera proxy que esta entrega no crea.
+    Se afirma explícitamente porque un builder o una etiqueta distintos de cero
+    cambian el mensaje firmado y el recinto los trataría como otra orden.
     """
-    mensaje = typed_data(_orden(), signer=DIRECCION, salt=1)
+    mensaje = typed_data(_orden(), signer=DIRECCION, salt=1, timestamp=1)
 
-    assert mensaje["message"]["taker"] == "0x0000000000000000000000000000000000000000"
     assert mensaje["message"]["signatureType"] == 0
     assert mensaje["message"]["maker"] == DIRECCION
+    assert mensaje["message"]["metadata"] == "0x" + "00" * 32
+    assert mensaje["message"]["builder"] == "0x" + "00" * 32
+    assert "taker" not in mensaje["message"]
+    assert "nonce" not in mensaje["message"]
 
 
 def test_el_lado_va_como_numero_dentro_del_mensaje_firmado() -> None:
     """Comprar es 0 y vender es 1, y eso es parte de lo que se firma."""
-    compra = typed_data(_orden(side=PredictionSide.BUY), signer=DIRECCION, salt=1)
-    venta = typed_data(_orden(side=PredictionSide.SELL), signer=DIRECCION, salt=1)
+    compra = typed_data(_orden(side=PredictionSide.BUY), signer=DIRECCION, salt=1, timestamp=1)
+    venta = typed_data(_orden(side=PredictionSide.SELL), signer=DIRECCION, salt=1, timestamp=1)
 
     assert compra["message"]["side"] == 0
     assert venta["message"]["side"] == 1
@@ -505,7 +511,7 @@ def _mensaje_desde_el_cuerpo(cuerpo: dict[str, Any], contrato: str) -> dict[str,
         "primaryType": "Order",
         "domain": {
             "name": "Polymarket CTF Exchange",
-            "version": "1",
+            "version": "2",
             "chainId": 137,
             "verifyingContract": to_checksum_address(contrato),
         },
@@ -513,15 +519,14 @@ def _mensaje_desde_el_cuerpo(cuerpo: dict[str, Any], contrato: str) -> dict[str,
             "salt": cuerpo["salt"],
             "maker": cuerpo["maker"],
             "signer": cuerpo["signer"],
-            "taker": cuerpo["taker"],
             "tokenId": int(cuerpo["tokenId"]),
             "makerAmount": int(cuerpo["makerAmount"]),
             "takerAmount": int(cuerpo["takerAmount"]),
-            "expiration": int(cuerpo["expiration"]),
-            "nonce": int(cuerpo["nonce"]),
-            "feeRateBps": int(cuerpo["feeRateBps"]),
             "side": 0 if cuerpo["side"] == "BUY" else 1,
             "signatureType": cuerpo["signatureType"],
+            "timestamp": int(cuerpo["timestamp"]),
+            "metadata": cuerpo["metadata"],
+            "builder": cuerpo["builder"],
         },
     }
 
@@ -647,3 +652,84 @@ def test_la_orden_firmada_no_se_puede_construir_sin_firma() -> None:
             digest="0x" + "ab" * 32,
             payload="{}",
         )
+
+
+# --------------------------------------------------------------------------- #
+# 7. Cuenta con deposit wallet (tipo de firma 3)
+# --------------------------------------------------------------------------- #
+WALLET = derive_beacon_deposit_wallet(DIRECCION)
+MARCA_MS = 1_700_000_000_000
+
+
+def _firma_de_wallet() -> SignedPredictionOrder:
+    return sign_order(_orden(), private_key=CLAVE, salt=7, timestamp=MARCA_MS, wallet=WALLET)
+
+
+def _mensaje_desde_cuerpo_de_wallet(cuerpo: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "salt": cuerpo["salt"],
+        "maker": cuerpo["maker"],
+        "signer": cuerpo["signer"],
+        "tokenId": int(cuerpo["tokenId"]),
+        "makerAmount": int(cuerpo["makerAmount"]),
+        "takerAmount": int(cuerpo["takerAmount"]),
+        "side": 0 if cuerpo["side"] == "BUY" else 1,
+        "signatureType": cuerpo["signatureType"],
+        "timestamp": int(cuerpo["timestamp"]),
+        "metadata": cuerpo["metadata"],
+        "builder": cuerpo["builder"],
+    }
+
+
+def test_la_orden_de_wallet_va_con_tipo_3_y_la_wallet_como_maker_y_signer() -> None:
+    """La wallet es la que posee el dinero y la que el recinto valida.
+
+    Con tipo 3 la EOA no aparece en el cuerpo: sale de la clave, pero no es
+    `maker` ni `signer`. Si aparecieran, el recinto rechazaría la orden con el
+    error de «maker address not allowed».
+    """
+    cuerpo = json.loads(_firma_de_wallet().payload)["order"]
+
+    assert cuerpo["signatureType"] == 3
+    assert cuerpo["maker"] == WALLET
+    assert cuerpo["signer"] == WALLET
+    assert _firma_de_wallet().signer == WALLET
+
+
+def test_la_firma_envuelta_recupera_la_eoa_de_la_clave() -> None:
+    """La EOA firma por dentro; la comprobación recupera esa EOA desde el cuerpo."""
+    cuerpo = json.loads(_firma_de_wallet().payload)["order"]
+
+    recuperada = recover_wrapped_signer(
+        _mensaje_desde_cuerpo_de_wallet(cuerpo),
+        cuerpo["signature"],
+        chain_id=137,
+        exchange=EXCHANGE,
+        wallet=WALLET,
+    )
+
+    assert recuperada == DIRECCION
+
+
+def test_la_firma_no_verifica_contra_otra_wallet() -> None:
+    """La firma va atada a la wallet: con otra dirección la EOA ya no se recupera."""
+    cuerpo = json.loads(_firma_de_wallet().payload)["order"]
+    otra = derive_beacon_deposit_wallet("0x" + "11" * 20)
+
+    recuperada = recover_wrapped_signer(
+        _mensaje_desde_cuerpo_de_wallet(cuerpo),
+        cuerpo["signature"],
+        chain_id=137,
+        exchange=EXCHANGE,
+        wallet=otra,
+    )
+
+    assert recuperada != DIRECCION
+
+
+def test_el_digest_de_la_orden_de_wallet_es_el_hash_de_la_firma_envuelta() -> None:
+    """El digest que se registra es el de la firma que viaja, no el de la interna."""
+    firmada = _firma_de_wallet()
+    cuerpo = json.loads(firmada.payload)["order"]
+
+    assert firmada.digest == "0x" + keccak(hexstr=cuerpo["signature"]).hex()

@@ -74,6 +74,13 @@ SEVERITY_COLOR: Final[dict[str, str]] = {
 RADIUS: Final = 8
 RADIUS_SM: Final = 6
 
+#: Lado del icono de marca en los listados (redes, tokens, motores). 18 px y no
+#: los 16 del estilo: los SVG traen el logo pegado al borde de un lienzo de 24 y
+#: a 16 px los que llevan texto dentro (USDC, BNB) se vuelven una mancha. El
+#: tamaño va en la hoja de estilos —los widgets no lo piden uno a uno—, y ésta
+#: es la única fuente del número.
+ICON_PX: Final = 18
+
 STYLESHEET: Final = f"""
 /* ------------------------------------------------------------------ base -- */
 QMainWindow, QDialog {{
@@ -156,6 +163,58 @@ QPushButton#segment:checked {{
     border-color: {COLOR_BORDER_STRONG};
     color: {COLOR_TEXT};
 }}
+/* El resultado de un mercado de predicción. Marcado se pinta en verde, como el
+   «Sí» de un panel de operación; sin marcar, es un botón más de la tarjeta. */
+QPushButton#outcome {{
+    background: {COLOR_ELEVATED};
+    border: 1px solid {COLOR_BORDER_STRONG};
+    border-radius: {RADIUS}px;
+    color: {COLOR_TEXT};
+    padding: 10px 12px;
+    font-weight: 700;
+    font-size: 15px;
+}}
+QPushButton#outcome:hover {{
+    border-color: {COLOR_ACCENT};
+}}
+QPushButton#outcome:checked {{
+    background: {COLOR_SUCCESS};
+    border-color: {COLOR_SUCCESS};
+    color: {COLOR_ON_ACCENT};
+}}
+/* El botón de firmar la orden: la acción principal de la tarjeta, en azul. */
+QPushButton#primary {{
+    background: {COLOR_ACCENT};
+    border: none;
+    border-radius: {RADIUS}px;
+    color: {COLOR_ON_ACCENT};
+    padding: 14px;
+    font-weight: 700;
+    font-size: 15px;
+}}
+QPushButton#primary:hover {{
+    background: {COLOR_ACCENT_HOVER};
+}}
+QPushButton#primary:pressed {{
+    background: {COLOR_ACCENT_PRESSED};
+}}
+QPushButton#primary:disabled {{
+    background: {COLOR_ELEVATED};
+    color: {COLOR_MUTED};
+}}
+/* Los botones −/+ que acompañan a un campo numérico. */
+QPushButton#stepper {{
+    background: {COLOR_ELEVATED};
+    border: 1px solid {COLOR_BORDER_STRONG};
+    border-radius: {RADIUS}px;
+    color: {COLOR_TEXT};
+    padding: 6px 12px;
+    font-weight: 700;
+    min-width: 28px;
+}}
+QPushButton#stepper:hover {{
+    border-color: {COLOR_ACCENT};
+}}
 /* El botón que abre el selector de tokens. Es la cara visible de una elección que
    se hace en un modal: lleva el símbolo y un galón que dice que se puede cambiar,
    y por eso no se parece a un desplegable ni a un botón de acción. */
@@ -172,6 +231,37 @@ QPushButton#tokenButton:hover {{
     border-color: {COLOR_ACCENT};
     background: {COLOR_CARD};
 }}
+/* El desplegable del token dentro de una pata, con la misma cara que el botón de
+   token: es la misma elección y no puede verse de dos maneras según la pantalla.
+   Aquí sigue siendo un desplegable y no el modal del selector porque en un cruce
+   la lista es la de **una** red y la decisión es qué moneda se cruza; en swaps la
+   lista puede traer cien mints de la cartera y hace falta el buscador. */
+QComboBox#tokenPill {{
+    background: {COLOR_ELEVATED};
+    border: 1px solid {COLOR_BORDER_STRONG};
+    border-radius: {RADIUS}px;
+    color: {COLOR_TEXT};
+    padding: 7px 10px;
+    font-weight: 700;
+    font-size: 14px;
+}}
+QComboBox#tokenPill:hover {{
+    border-color: {COLOR_ACCENT};
+    background: {COLOR_CARD};
+}}
+/* La red de la pata, en su cabecera: el rótulo dice «entregas en» y esto remata
+   la frase. Sin fondo propio para que no compita con el token, que está a la
+   altura del importe y es el que se cambia más veces. */
+QComboBox#chainPill {{
+    background: transparent;
+    border: 1px solid {COLOR_BORDER};
+    border-radius: {RADIUS_SM}px;
+    color: {COLOR_TEXT};
+    padding: 2px 8px;
+    font-size: 12px;
+    font-weight: 700;
+}}
+QComboBox#chainPill:hover {{ border-color: {COLOR_ACCENT}; }}
 /* El botón de invertir el par. Sin fondo y sin el azul del acento: es un mando
    entre las dos patas, no la acción de la pantalla. */
 QPushButton#invert {{
@@ -185,17 +275,28 @@ QPushButton#invert {{
 QPushButton#invert:hover {{ border-color: {COLOR_ACCENT}; color: {COLOR_ACCENT}; }}
 /* El importe que se entrega, en grande y sin caja. Dentro del recuadro de la pata
    el borde sobra: el recuadro ya dice dónde se escribe, y una caja dentro de otra
-   caja es lo que hacía que este campo pareciera un formulario y no un importe. */
-QLineEdit#amountInput {{
+   caja es lo que hacía que este campo pareciera un formulario y no un importe.
+   El selector nombra las tres clases a propósito: el campo es un `QDoubleSpinBox`,
+   y `QLineEdit#amountInput` a secas no lo alcanzaba —un selector de tipo en Qt no
+   cruza la jerarquía— así que la regla se escribía y no se aplicaba. La última
+   línea apaga el `QLineEdit` interno del propio spinbox, que sí recogía la regla
+   general de campos y dibujaba su borde dentro. */
+QLineEdit#amountInput, QDoubleSpinBox#amountInput, QSpinBox#amountInput {{
     background: transparent;
     border: none;
     font-size: 26px;
     font-weight: 700;
     padding: 2px 0;
 }}
-QLineEdit#amountInput:hover, QLineEdit#amountInput:focus {{
+QLineEdit#amountInput:hover, QLineEdit#amountInput:focus,
+QDoubleSpinBox#amountInput:hover, QDoubleSpinBox#amountInput:focus {{
     background: transparent;
     border: none;
+}}
+QDoubleSpinBox#amountInput QLineEdit, QSpinBox#amountInput QLineEdit {{
+    background: transparent;
+    border: none;
+    padding: 0;
 }}
 /* El galón que pliega una tarjeta. Sin fondo y sin borde: es un mando, no un
    botón de acción, y con el azul del acento competiría con los que sí lo son. */
@@ -349,6 +450,16 @@ QSpinBox::up-button:hover, QSpinBox::down-button:hover,
 QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
     background: {COLOR_ELEVATED};
     border-radius: 3px;
+}}
+
+/* --------------------------------------------------------------- iconos -- */
+/* El tamaño de los iconos de marca (ui/icons.py) en los sitios donde salen:
+   desplegables de red y de token, tablas de listados y el botón de token de las
+   patas. Va aquí y no en cada widget porque si no habría que acordarse de
+   pedirlo en cada sitio nuevo, y el que se olvidara quedaría a 16 px sin que
+   nada lo delatara. */
+QComboBox, QTableView, QTableWidget, QPushButton#tokenButton {{
+    qproperty-iconSize: {ICON_PX}px {ICON_PX}px;
 }}
 
 /* ---------------------------------------------------------------- tablas -- */

@@ -134,6 +134,15 @@ class MotorFalso:
     async def market(self, market_id: str) -> PredictionMarket:
         return next(m for m in _MERCADOS if m.market_id == market_id)
 
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        """El mercado de una posición, por su `conditionId`.
+
+        Aquí no lo pide nadie —esta prueba no toca la wallet de depósito—, pero
+        el doble tiene que saberlo hacer para seguir siendo un motor de
+        predicción: el protocolo lo exige y el registro lo comprueba.
+        """
+        return next(m for m in _MERCADOS if m.condition_id == condition_id)
+
     async def book(self, token_id: str) -> MarketDepth:
         """Un libro de dos niveles, con la venta por encima y la compra por debajo.
 
@@ -186,7 +195,9 @@ class MotorFalso:
             neg_risk=bool(market.neg_risk),
         )
 
-    def sign_order(self, order: PredictionOrder, *, private_key: str) -> Any:
+    def sign_order(
+        self, order: PredictionOrder, *, private_key: str, wallet: str | None = None
+    ) -> Any:
         self.firmadas.append(order)
         raise AssertionError("el motor falso no firma: la prueba publica sin firmar")
 
@@ -201,6 +212,40 @@ class MotorFalso:
 
     def exchange_for(self, market: PredictionMarket) -> str:
         return "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+
+    # ---- El canal de la deposit wallet: los métodos tienen que **existir** ----
+    # Ninguna prueba de este fichero lo usa —aquí se opera por la EOA—, pero
+    # `EngineRegistry.prediction_planner` comprueba el tipo en tiempo de
+    # ejecución: al doble que le faltara uno de estos lo tomaría por un motor de
+    # sólo lectura, y la tarjeta diría «no sabe operar» por el doble en vez de
+    # por lo que se está midiendo.
+    def settlement_wallet(self, owner: str) -> str:
+        raise AssertionError("esta prueba opera por la EOA: no hay deposit wallet")
+
+    async def deploy_settlement_wallet(self, *, owner: str, credentials: Any) -> str:
+        raise AssertionError("esta prueba no despliega wallets")
+
+    async def approve_wallet_collateral(
+        self,
+        *,
+        owner: str,
+        collateral: Token,
+        spender: str,
+        private_key: str,
+        credentials: Any,
+    ) -> str:
+        raise AssertionError("esta prueba no concede permisos por el relayer")
+
+    async def approve_wallet_shares(
+        self,
+        *,
+        owner: str,
+        collection: str,
+        spender: str,
+        private_key: str,
+        credentials: Any,
+    ) -> str:
+        raise AssertionError("esta prueba no autoriza participaciones por el relayer")
 
 
 class ProveedorFalso:

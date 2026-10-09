@@ -37,11 +37,11 @@ no toca ninguna clave.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Final
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -58,6 +58,7 @@ from amigocompora.app.container import Container
 from amigocompora.domain.chains import CHAINS
 from amigocompora.domain.execution import ANY_TOKEN
 from amigocompora.domain.models import Token
+from amigocompora.ui import icons
 from amigocompora.ui.theme import (
     COLOR_ACCENT,
     COLOR_DANGER,
@@ -255,8 +256,17 @@ class TokenLeg(QFrame):
         self._caption_text = text
         self._caption.setText(text)
 
-    def set_token_label(self, text: str) -> None:
+    def set_token_label(self, text: str, *, icon_key: str | None = None) -> None:
+        """El nombre del token en el botón, con su icono delante si se conoce.
+
+        `icon_key` puede no coincidir con el texto: el USDC puenteado de Polygon
+        publica el símbolo «USDC» y así se enseña, pero el nombre con el que está
+        en el catálogo de iconos es «USDC.e». Sin clave se quita el icono: «Elegir
+        token» no es una marca y no puede llevar logo.
+        """
         self._token_btn.setText(text)
+        self._token_btn.setIcon(icons.token_icon(icon_key) if icon_key else QIcon())
+        self._token_btn.setToolTip(icon_key or "")
 
     def set_unit(self, text: str) -> None:
         self._unit.setText(text)
@@ -321,7 +331,7 @@ class SwapCard(QWidget):
 
         self._chain = QComboBox()
         for key in sorted(CHAINS):
-            self._chain.addItem(f"{CHAINS[key].name} ({key})", key)
+            self._chain.addItem(icons.network_icon(key), f"{CHAINS[key].name} ({key})", key)
         # El ancho natural de un `QComboBox` es el de su ítem **más largo**, y aquí
         # eso son cuatrocientos píxeles por «Robinhood Chain (robinhood)»: la mitad
         # de la cabecera gastada en un nombre que se lee entero al desplegarlo.
@@ -607,7 +617,7 @@ class SwapCard(QWidget):
             combo.blockSignals(True)
             combo.clear()
             for etiqueta, token in zip(etiquetas, tokens, strict=True):
-                combo.addItem(etiqueta, token)
+                combo.addItem(icons.token_icon(token.display_symbol), etiqueta, token)
             combo.blockSignals(False)
 
         from amigocompora.engines.catalog import quote_token, wrapped_native
@@ -665,9 +675,9 @@ class SwapCard(QWidget):
             self._pair.setText("—")
             return
         self._pair.setText(f"{entrega.symbol} → {recibe.symbol}")
-        self._give.set_token_label(entrega.symbol)
+        self._give.set_token_label(entrega.symbol, icon_key=entrega.display_symbol)
         self._give.set_unit(entrega.symbol)
-        self._want.set_token_label(recibe.symbol)
+        self._want.set_token_label(recibe.symbol, icon_key=recibe.display_symbol)
         self._give.set_caption(f"ENTREGAS · {entrega.symbol}")
         self._want.set_caption(f"RECIBES · {recibe.symbol}")
         # La estimación es de la ruta anterior: en cuanto cambia el par deja de
@@ -814,7 +824,10 @@ class SwapCard(QWidget):
         if holding is None or holding.is_empty:
             return
         completo = holding.as_decimal()
-        leg.amount.setValue(float(completo))
+        # El campo redondea al más cercano, no hacia abajo: 0,0928237 pasaba a
+        # 0,092824, por encima del saldo, y el swap revertía con TRANSFER_FROM_FAILED.
+        por_debajo = completo.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        leg.amount.setValue(float(por_debajo))
         escrito = Decimal(str(leg.amount.value()))
         if escrito < completo:
             self.set_status(
@@ -847,7 +860,7 @@ class SwapCard(QWidget):
         self._send_token.blockSignals(True)
         self._send_token.clear()
         for etiqueta, token in zip(etiquetas, tokens, strict=True):
-            self._send_token.addItem(etiqueta, token)
+            self._send_token.addItem(icons.token_icon(token.display_symbol), etiqueta, token)
         indice = position_of(self._send_token, previo)
         self._send_token.setCurrentIndex(max(indice, 0))
         self._send_token.blockSignals(False)
@@ -855,7 +868,10 @@ class SwapCard(QWidget):
 
     def _on_send_token_changed(self) -> None:
         token = self.selected_send_token()
-        self._send_leg.set_token_label(token.symbol if token else "Elegir token")
+        self._send_leg.set_token_label(
+            token.symbol if token else "Elegir token",
+            icon_key=token.display_symbol if token else None,
+        )
         self._send_leg.set_unit(token.symbol if token else "")
         self._send_leg.set_caption(
             f"ENVÍAS · {token.symbol}" if token else "ENVÍAS"

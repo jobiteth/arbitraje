@@ -40,6 +40,7 @@ dependencies = [
     # una matriz de ceros y unos para pintarla con QPainter—. Se declara aunque
     # sólo lo use la interfaz: la interfaz es parte del paquete.
     "segno>=1.6,<2",
+    "tomlkit>=0.15.1",
 ]
 
 # Sólo necesario para motores que decodifican ABIs / contratos (M2+).
@@ -65,6 +66,7 @@ uniswap_v4 = "amigocompora.engines.uniswap_v4:PROVIDER"
 zeroex = "amigocompora.engines.zeroex:PROVIDER"
 lifi = "amigocompora.engines.lifi:PROVIDER"
 relay = "amigocompora.engines.relay:PROVIDER"
+circle = "amigocompora.engines.circle:PROVIDER"
 polymarket = "amigocompora.engines.polymarket:PROVIDER"
 stub_advisor = "amigocompora.engines.llm.providers:STUB_PROVIDER"
 claude = "amigocompora.engines.llm.providers:CLAUDE_PROVIDER"

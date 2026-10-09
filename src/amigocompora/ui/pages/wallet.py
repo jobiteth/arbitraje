@@ -59,8 +59,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -84,6 +86,7 @@ from amigocompora.domain.wallet import (
     WalletSnapshot,
 )
 from amigocompora.engines.catalog import quote_token
+from amigocompora.ui import icons
 from amigocompora.ui.theme import (
     COLOR_MUTED,
     COLOR_SUCCESS,
@@ -157,9 +160,21 @@ class DepositDialog(QDialog):
     prefijo hace que muchas carteras pidan confirmar la red, y aquí la red es una
     elección de esta pantalla: ponerla dentro del código haría que el QR dijera
     una red distinta de la que está seleccionada arriba.
+
+    `note` es una línea extra para quien abre el diálogo desde otra pantalla y
+    necesita decir algo suyo —la pestaña de predicciones avisa aquí de que a su
+    wallet sólo hace falta mandarle el colateral—. El diálogo no interpreta ese
+    texto: lo enseña.
     """
 
-    def __init__(self, address: str, chain_key: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        address: str,
+        chain_key: str,
+        parent: QWidget | None = None,
+        *,
+        note: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Depositar en {CHAINS[chain_key].name}")
         lay = QVBoxLayout(self)
@@ -174,6 +189,13 @@ class DepositDialog(QDialog):
         aviso.setWordWrap(True)
         aviso.setStyleSheet(f"color: {COLOR_WARNING};")
         lay.addWidget(aviso)
+
+        if note:
+            pista = QLabel(note)
+            pista.setTextFormat(Qt.RichText)
+            pista.setWordWrap(True)
+            pista.setObjectName("hint")
+            lay.addWidget(pista)
 
         qr = QLabel()
         qr.setPixmap(qr_pixmap(address))
@@ -215,6 +237,11 @@ class WithdrawDialog(QDialog):
     un solo sitio: modo, red, destino, topes, saldo, permiso, firma. Un diálogo
     que llamara a firmar tendría su propia copia de ese orden, y la copia es
     justo lo que se desvía.
+
+    `recipient` prefija el destino. No es una comodidad: teclear de memoria una
+    dirección de 42 caracteres es la forma más común de perder fondos, y las
+    pantallas que saben el destino —la pestaña de predicciones, que retira a la
+    wallet de depósito— lo traen puesto. Queda editable: prefijar no es prohibir.
     """
 
     def __init__(
@@ -223,6 +250,7 @@ class WithdrawDialog(QDialog):
         *,
         default: Token | None = None,
         owner: str = "",
+        recipient: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -232,7 +260,7 @@ class WithdrawDialog(QDialog):
 
         self.token = QComboBox()
         for etiqueta, token in zip(token_labels(tokens), tokens, strict=True):
-            self.token.addItem(etiqueta, token)
+            self.token.addItem(icons.token_icon(token.display_symbol), etiqueta, token)
         if default is not None:
             for index in range(self.token.count()):
                 if self.token.itemData(index) == default:
@@ -244,7 +272,7 @@ class WithdrawDialog(QDialog):
         self.amount.setPlaceholderText("0.0")
         form.addRow("Importe", self.amount)
 
-        self.recipient = QLineEdit()
+        self.recipient = QLineEdit(recipient)
         self.recipient.setPlaceholderText("0x…")
         self.recipient.setMinimumWidth(380)
         form.addRow("Destino", self.recipient)
@@ -456,28 +484,12 @@ class WalletPage(QWidget):
         )
         self._withdraw_btn.clicked.connect(self._on_withdraw)
 
-        self._refresh_btn = QPushButton("Actualizar")
-        self._refresh_btn.setObjectName("secondary")
-        self._refresh_btn.clicked.connect(self.refresh)
-
-        self._full_btn = QPushButton("Cifras completas")
-        self._full_btn.setObjectName("secondary")
-        self._full_btn.setCheckable(True)
-        self._full_btn.setToolTip(
-            "Alterna entre el saldo recortado —el que se lee— y el número entero "
-            "con todos sus decimales. El recorte es sólo de la pantalla: lo que se "
-            "firma sale de la cifra completa."
-        )
-        self._full_btn.toggled.connect(self._on_full_toggled)
-
-        # Las cuatro acciones una por fila, y no en una fila compartida: con el
-        # panel lateral de ~340 px, repartir el ancho entre cuatro deja a cada una
-        # menos espacio que su texto y los recorta. Apiladas se leen enteras, y el
-        # orden —primero lo que mueve dinero, después lo que sólo mira— se mantiene.
-        actions = QVBoxLayout()
+        # Depositar y Retirar en la misma fila: son las dos que mueven dinero y se leen
+        # juntas. Con el panel de ~340 px caben, cada una con su texto completo.
+        actions = QHBoxLayout()
         actions.setSpacing(8)
-        for boton in (self._deposit_btn, self._withdraw_btn, self._full_btn, self._refresh_btn):
-            actions.addWidget(boton)
+        actions.addWidget(self._deposit_btn, 1)
+        actions.addWidget(self._withdraw_btn, 1)
         card.add_row(actions)
 
         self._notice = QLabel("")
@@ -524,6 +536,17 @@ class WalletPage(QWidget):
         )
         self._add_btn.clicked.connect(self._on_add_token)
 
+        self._refresh_btn = QToolButton()
+        self._refresh_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self._refresh_btn.setToolTip("Actualizar saldos y cotizaciones de la red")
+        self._refresh_btn.setAccessibleName("Actualizar")
+        self._refresh_btn.clicked.connect(self.refresh)
+
+        acciones_lista = QHBoxLayout()
+        acciones_lista.addWidget(self._add_btn, 1)
+        acciones_lista.addWidget(self._refresh_btn)
+        card.body().addLayout(acciones_lista)
+
         self._only_positive = QCheckBox("Sólo con saldo")
         self._only_positive.setChecked(True)
         self._only_positive.setToolTip(
@@ -531,10 +554,18 @@ class WalletPage(QWidget):
             "Sirve para comprobar que un token está en la cartera aunque ahora no "
             "tenga nada."
         )
-        # Cada uno en su fila: «+ Añadir token» y el interruptor juntos pedían 422 px
-        # y el panel tiene 381 útiles. Apilados, cada uno se lee entero.
-        card.body().addWidget(self._add_btn)
-        card.body().addWidget(self._only_positive)
+
+        self._full_btn = QCheckBox("Cifras completas")
+        self._full_btn.setToolTip(
+            "Muestra el saldo con todos sus decimales en vez del recortado. El recorte "
+            "es sólo de la pantalla: lo que se firma sale de la cifra completa."
+        )
+        self._full_btn.toggled.connect(self._on_full_toggled)
+
+        filtros = QHBoxLayout()
+        filtros.addWidget(self._only_positive)
+        filtros.addWidget(self._full_btn)
+        card.body().addLayout(filtros)
 
         self._table = QTableWidget(0, 6)
         # La última columna no lleva título: es el botón de cambiar, y un
@@ -792,7 +823,7 @@ class WalletPage(QWidget):
         self._chain.addItem("Todas las redes", None)
         for key in profile.chains_of():
             if key in self._engine_chains():
-                self._chain.addItem(f"{CHAINS[key].name}", key)
+                self._chain.addItem(icons.network_icon(key), f"{CHAINS[key].name}", key)
         self._chain.blockSignals(False)
         for index in range(self._chain.count()):
             if self._chain.itemData(index) == previa:
@@ -942,6 +973,7 @@ class WalletPage(QWidget):
     def _fill_row(self, indice: int, cadena: ChainHoldings, holding: TokenHolding) -> None:
         token = holding.token
         nombre = QTableWidgetItem(token.qualified_symbol)
+        nombre.setIcon(icons.token_icon(token.display_symbol))
         nombre.setToolTip(
             f"{token.symbol} en {CHAINS[cadena.chain].name}, {token.decimals} decimales"
             + ("" if token.address else " (moneda nativa de la red)")
@@ -991,7 +1023,13 @@ class WalletPage(QWidget):
         valor.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._table.setItem(indice, 2, valor)
 
-        self._table.setItem(indice, 3, QTableWidgetItem(CHAINS[cadena.chain].name))
+        # El icono va aquí y no en el nombre porque lo que desempata una fila de la
+        # cartera es en qué red está: el mismo USDC aparece una vez por red, y el
+        # logo de la red a la izquierda lo dice sin leer la columna. El texto de la
+        # celda no se toca: hay código que lo lee para saber de qué red es la fila.
+        celda_red = QTableWidgetItem(CHAINS[cadena.chain].name)
+        celda_red.setIcon(icons.network_icon(cadena.chain))
+        self._table.setItem(indice, 3, celda_red)
         contrato = QTableWidgetItem(shorten(token.address) if token.address else "—")
         if token.address:
             contrato.setToolTip(token.address)
@@ -1233,7 +1271,6 @@ class WalletPage(QWidget):
 
     def _on_full_toggled(self, activo: bool) -> None:
         self._full_figures = activo
-        self._full_btn.setText("Cifras recortadas" if activo else "Cifras completas")
         self._repaint_rows()
 
     def _on_deposit(self) -> None:

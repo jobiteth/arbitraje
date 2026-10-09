@@ -32,13 +32,18 @@ from amigocompora.app.container import Container, build_container
 from amigocompora.infra.config import Settings
 from amigocompora.infra.secrets import (
     AUTONOMY_PASSPHRASE_SECRET,
+    POLYMARKET_BUILDER_KEY_SECRET,
+    POLYMARKET_BUILDER_PASSPHRASE_SECRET,
+    POLYMARKET_BUILDER_SECRET_SECRET,
+    POLYMARKET_RELAYER_ADDRESS_SECRET,
+    POLYMARKET_RELAYER_KEY_SECRET,
     PRIVATE_KEY_SECRET,
     InMemorySecretStore,
     SecretStoreError,
     app_env_var_name,
     app_secret_key,
 )
-from amigocompora.ui.pages.engines import EnginesPage
+from amigocompora.ui.pages.credentials import CredentialsCard
 
 #: Clave de desarrollo **publicada** (la primera de Hardhat). No es un secreto:
 #: que sea conocida es justo lo que la hace útil aquí.
@@ -78,7 +83,7 @@ async def _pagina(
     store: object,
     *,
     ajustes: dict[str, object] | None = None,
-) -> AsyncIterator[tuple[Container, EnginesPage]]:
+) -> AsyncIterator[tuple[Container, CredentialsCard]]:
     """La pestaña montada sobre un contenedor de verdad.
 
     El contenedor es el de verdad y no un doble porque lo que se mide incluye
@@ -95,7 +100,7 @@ async def _pagina(
         configure_logs=False,
     )
     try:
-        yield container, EnginesPage(container)
+        yield container, CredentialsCard(container)
     finally:
         await container.aclose()
 
@@ -104,7 +109,7 @@ async def _pagina(
 _APAGADO: dict[str, object] = {"execution": {"allow_env_key": False}}
 
 
-def _textos(pagina: EnginesPage) -> list[str]:
+def _textos(pagina: CredentialsCard) -> list[str]:
     """Todo el texto visible de la pestaña: rótulos y campos.
 
     La ayuda emergente no entra: es lo que se lee a propósito al pasar por encima,
@@ -139,6 +144,64 @@ async def test_sin_configurar_es_distinto_de_configurada() -> None:
     """Lo que no está se dice que no está, para no prometer una cartera que falta."""
     async with _pagina(InMemorySecretStore()) as (_, pagina):
         assert pagina._secret_states[CLAVE_PRIVADA].text() == "sin configurar"
+
+
+async def test_polymarket_tiene_su_clave_y_su_direccion_enmascaradas() -> None:
+    """La Clave API del relayer y la dirección se piden aquí, y ninguna se ve."""
+    clave = app_secret_key(POLYMARKET_RELAYER_KEY_SECRET)
+    direccion = app_secret_key(POLYMARKET_RELAYER_ADDRESS_SECRET)
+    async with _pagina(InMemorySecretStore()) as (_, pagina):
+        for nombre in (clave, direccion):
+            assert nombre in pagina._secret_fields
+            assert pagina._secret_fields[nombre].echoMode() == QLineEdit.EchoMode.Password
+            assert pagina._secret_states[nombre].text() == "sin configurar"
+
+
+async def test_la_builder_key_tiene_sus_tres_campos_enmascarados() -> None:
+    """Clave pública, secreto y frase: los tres se piden aquí, y el secreto nunca se ve."""
+    nombres = [
+        app_secret_key(POLYMARKET_BUILDER_KEY_SECRET),
+        app_secret_key(POLYMARKET_BUILDER_SECRET_SECRET),
+        app_secret_key(POLYMARKET_BUILDER_PASSPHRASE_SECRET),
+    ]
+    async with _pagina(InMemorySecretStore()) as (_, pagina):
+        for nombre in nombres:
+            assert pagina._secret_fields[nombre].echoMode() == QLineEdit.EchoMode.Password
+            assert pagina._secret_states[nombre].text() == "sin configurar"
+
+
+async def test_guardar_el_secreto_builder_no_lo_muestra_y_lo_escribe() -> None:
+    nombre = app_secret_key(POLYMARKET_BUILDER_SECRET_SECRET)
+    store = InMemorySecretStore()
+    async with _pagina(store) as (_, pagina):
+        pagina._secret_fields[nombre].setText("secreto-builder-de-prueba")
+        pagina._on_save_secret(nombre)
+
+        assert store.get(nombre) == "secreto-builder-de-prueba"
+        assert not any("secreto-builder-de-prueba" in texto for texto in _textos(pagina))
+
+
+async def test_guardar_la_clave_polymarket_la_escribe_en_el_llavero() -> None:
+    clave = app_secret_key(POLYMARKET_RELAYER_KEY_SECRET)
+    store = InMemorySecretStore()
+    async with _pagina(store) as (_, pagina):
+        pagina._secret_fields[clave].setText("clave-de-prueba-relayer")
+        pagina._on_save_secret(clave)
+
+        assert store.get(clave) == "clave-de-prueba-relayer"
+        assert pagina._secret_states[clave].text() == "configurada"
+        assert not any("clave-de-prueba-relayer" in texto for texto in _textos(pagina))
+
+
+async def test_guardar_la_direccion_polymarket_la_escribe_en_el_llavero() -> None:
+    direccion = app_secret_key(POLYMARKET_RELAYER_ADDRESS_SECRET)
+    store = InMemorySecretStore()
+    async with _pagina(store) as (_, pagina):
+        pagina._secret_fields[direccion].setText("0x2c887da24C6E6c939B0Fe3adaE50814b938B44f9")
+        pagina._on_save_secret(direccion)
+
+        assert store.get(direccion) == "0x2c887da24C6E6c939B0Fe3adaE50814b938B44f9"
+        assert pagina._secret_states[direccion].text() == "configurada"
 
 
 async def test_guardar_escribe_en_el_llavero_y_vacia_el_campo() -> None:
@@ -337,7 +400,7 @@ def test_los_nombres_de_un_endpoint_salen_de_la_configuracion() -> None:
     manifiesto: escribir «Infura» en la pantalla habría dejado fuera a Alchemy, a
     QuickNode y a cualquier nodo propio, que usan este mismo mecanismo.
     """
-    from amigocompora.ui.pages.engines import rpc_secret_usage
+    from amigocompora.ui.pages.credentials import rpc_secret_usage
 
     uso = rpc_secret_usage(Settings.model_validate(_CON_NODO_PROPIO))
 
@@ -347,9 +410,9 @@ def test_los_nombres_de_un_endpoint_salen_de_la_configuracion() -> None:
 
 def test_un_nodo_sin_marcador_no_pide_ninguna_credencial() -> None:
     """Un nodo público no lleva clave: ofrecerle una casilla sería inventar un paso."""
-    from amigocompora.ui.pages.engines import rpc_secret_usage
+    from amigocompora.ui.pages.credentials import rpc_secret_usage
 
-    ajustes = Settings.model_validate(
+    ajustes =Settings.model_validate(
         {"chains": [{"chain": "ethereum", "endpoints": [{"url": "https://rpc.libre/eth"}]}]}
     )
     assert rpc_secret_usage(ajustes) == {}

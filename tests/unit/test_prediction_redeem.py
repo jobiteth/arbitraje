@@ -48,7 +48,7 @@ AHORA = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 MERCADO = "0x" + "ab" * 32
 
 #: Las direcciones contra las que se firma, en minúsculas y escritas a mano.
-COLATERAL_ESPERADO = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+COLATERAL_ESPERADO = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
 
 #: El `tokenId` de cada resultado dentro del mercado. Es el número entero que el
 #: contrato condicional calcula a partir de la condición y del índice, y tiene
@@ -125,8 +125,8 @@ def test_el_calldata_declara_los_dos_resultados() -> None:
     assert calldata.endswith(_palabra("2") + _palabra("1") + _palabra("2"))
 
 
-def test_el_colateral_es_el_puenteado_y_no_el_nativo() -> None:
-    """Los dos publican `symbol() == "USDC"` y sólo uno es el colateral.
+def test_el_colateral_es_pusd_y_no_el_usdc() -> None:
+    """El colateral es pUSD, no ninguna de las dos USDC de Polygon.
 
     Se comprueba sobre la palabra del `calldata` y no sobre la constante del
     módulo, porque es la palabra la que llega al contrato.
@@ -136,8 +136,8 @@ def test_el_colateral_es_el_puenteado_y_no_el_nativo() -> None:
     # primera palabra de la cabecera, que es la del colateral.
     palabra_colateral = calldata[2 + 8 : 2 + 8 + 64]
     assert palabra_colateral == _palabra(COLATERAL_ESPERADO[2:])
-    # Y no es la del USDC nativo de Polygon, que es otra dirección.
     assert palabra_colateral != _palabra("3c499c542cef5e3811e1192ce70d8cc03d5c3359")
+    assert palabra_colateral != _palabra("2791bca1f2de4661ed88a30c99a7a9449aa84174")
 
 
 def test_se_acepta_el_identificador_con_y_sin_prefijo() -> None:
@@ -246,6 +246,37 @@ async def test_una_posicion_se_traduce_entera() -> None:
     # payload que hablaría de otra cosa.
     assert posicion.observed_at == AHORA
     assert posicion.venue.venue_id == "polymarket"
+
+
+async def test_una_posicion_trae_su_precio_medio_y_su_resultado() -> None:
+    """Lo que se pagó y lo que se gana latente: sin esto no se puede decir «cuánto»."""
+    engine, _ = _motor(
+        [
+            _posicion(
+                extra={
+                    "avgPrice": "0.42",
+                    "cashPnl": "-0.15",
+                    "percentPnl": "-14.3",
+                }
+            )
+        ]
+    )
+    (posicion,) = await engine.positions(wallet="0xcartera")
+    assert posicion.avg_price == Decimal("0.42")
+    assert posicion.cash_pnl == Decimal("-0.15")
+    assert posicion.percent_pnl == Decimal("-14.3")
+
+
+async def test_sin_precio_medio_ni_resultado_no_se_inventa_un_cero() -> None:
+    """`None` es «la fuente no lo publica», y la pantalla enseña un guion.
+
+    Un cero sería una afirmación —«estás en tablas»— que la fuente no ha hecho.
+    """
+    engine, _ = _motor([_posicion()])
+    (posicion,) = await engine.positions(wallet="0xcartera")
+    assert posicion.avg_price is None
+    assert posicion.cash_pnl is None
+    assert posicion.percent_pnl is None
 
 
 async def test_un_mercado_sin_decir_si_comparte_colateral_queda_en_duda() -> None:

@@ -68,8 +68,10 @@ from amigocompora.domain.errors import (
     UnsupportedOperationError,
 )
 from amigocompora.domain.models import (
+    BridgeProgress,
     BridgeQuote,
     BridgeRequest,
+    BridgeTrackState,
     Measurement,
     Token,
     TokenApproval,
@@ -85,6 +87,7 @@ _log = structlog.get_logger(__name__)
 SOURCE_NAME: Final = "LI.FI"
 HOST: Final = "li.quest"
 QUOTE_URL: Final = f"https://{HOST}/v1/quote"
+STATUS_URL: Final = f"https://{HOST}/v1/status"
 
 CONFIG_API_KEY: Final = "api_key"
 
@@ -264,6 +267,29 @@ class LifIEngine:
         """El diamante medido para esa red de origen, o `None` si no se midió."""
         return DIAMONDS.get(chain_key)
 
+    # ---------------------------------------------------------- seguir #
+    async def track_bridge(
+        self, tx_hash: str, *, origin_chain: str, destination_chain: str
+    ) -> BridgeProgress:
+        """Lo que LI.FI dice de un puente emitido. Sólo lee."""
+        raw = await self._source.get_json(
+            STATUS_URL,
+            params={
+                "txHash": tx_hash,
+                "fromChain": str(chain(origin_chain).require_eip155_id()),
+                "toChain": str(chain(destination_chain).require_eip155_id()),
+            },
+            absent_statuses=frozenset({404}),
+        )
+        if raw is None:
+            return BridgeProgress(
+                state=BridgeTrackState.UNKNOWN,
+                provider_status="",
+                substatus="",
+                message="LI.FI aún no conoce esta transacción.",
+            )
+        return progress_from_status(as_mapping(raw, "estado", SOURCE_NAME))
+
     # ------------------------------------------------------------ interno #
     async def _quote_payload(
         self, request: BridgeRequest, *, recipient: str
@@ -436,6 +462,42 @@ class LifIEngine:
 # --------------------------------------------------------------------------- #
 # Lectura del formato de la fuente
 # --------------------------------------------------------------------------- #
+def progress_from_status(payload: Mapping[str, Any]) -> BridgeProgress:
+    """Traduce la respuesta de `/v1/status` a un estado, sin inventar pasos."""
+    status = str(payload.get("status", ""))
+    substatus = str(payload.get("substatus", ""))
+    message = str(payload.get("substatusMessage", "")) or status
+    receiving = payload.get("receiving")
+    receiving_map: Mapping[str, Any] = receiving if isinstance(receiving, Mapping) else {}
+
+    if status == "DONE":
+        state = BridgeTrackState.DONE
+    elif status == "FAILED":
+        state = (
+            BridgeTrackState.REFUNDED if substatus == "REFUNDED" else BridgeTrackState.FAILED
+        )
+    elif status == "PENDING":
+        state = (
+            BridgeTrackState.REFUNDING
+            if substatus == "REFUND_IN_PROGRESS"
+            else BridgeTrackState.PENDING
+        )
+    else:
+        state = BridgeTrackState.UNKNOWN
+
+    tx = receiving_map.get("txHash")
+    chain_id = receiving_map.get("chainId")
+    return BridgeProgress(
+        state=state,
+        provider_status=status,
+        substatus=substatus,
+        message=message,
+        receiving_tx_hash=tx if isinstance(tx, str) and tx else None,
+        received_raw=_uint(receiving_map.get("amount")),
+        received_chain=str(chain_id) if chain_id is not None else None,
+    )
+
+
 def _token_address(token: Token) -> str:
     """La dirección con la que esta API nombra ese token. Siempre hay una.
 

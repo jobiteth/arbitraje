@@ -31,6 +31,7 @@ from amigocompora.app.registry import EngineRegistry, sole_engine_for
 from amigocompora.app.scheduler import Scheduler
 from amigocompora.app.usecases.analyze_prediction_market import AnalyzePredictionMarkets
 from amigocompora.app.usecases.analyze_with_ai import AnalyzeWithAi
+from amigocompora.app.usecases.claim_bridge import ClaimBridge
 from amigocompora.app.usecases.compare_bridges import CompareBridges
 from amigocompora.app.usecases.compare_prices import ComparePrices
 from amigocompora.app.usecases.execute_bridge import ExecuteBridge
@@ -41,8 +42,10 @@ from amigocompora.app.usecases.find_prediction_opportunities import (
 from amigocompora.app.usecases.place_prediction_order import PlacePredictionOrder
 from amigocompora.app.usecases.prepare_bridge import PrepareBridge
 from amigocompora.app.usecases.prepare_swap import PrepareSwap
+from amigocompora.app.usecases.read_settlement_wallet import ReadSettlementWallet
 from amigocompora.app.usecases.redeem_prediction import RedeemPrediction
 from amigocompora.app.usecases.scan_opportunities import ScanOpportunities
+from amigocompora.app.usecases.track_bridge import BridgeTracking
 from amigocompora.app.usecases.value_in_reference import ValueInReference
 from amigocompora.app.usecases.wallet import ReadWallet, ValueWallet
 from amigocompora.app.usecases.watch_scan import WatchedPair, WatchScan
@@ -62,6 +65,7 @@ from amigocompora.infra.secrets import (
     AutonomyPassphraseProvider,
     KeyringSecretStore,
     MissingSecretError,
+    PolymarketWalletChannelProvider,
     SecretStore,
     SpendingKeyProvider,
     build_config_resolver,
@@ -87,19 +91,13 @@ DEFAULT_ENGINE_IDS: Final[Mapping[str, str]] = {
     # configurar ninguna clave. El usuario puede cambiar a Claude/DeepSeek/ChatGPT
     # desde el panel de motores o fijarlo en config.toml.
     EngineKind.AI_ADVISOR.value: "stub_advisor",
-    # LI.FI y no Relay, y por una razón que no es de gusto: Relay declara su
-    # clave en `required_config`, así que autoactivarlo sin credencial fallaría en
-    # el arranque y dejaría la ranura igual de vacía. LI.FI cotiza y construye
-    # sin clave —la suya es `optional_config`— y su manifiesto ya se declara
-    # «antes que Relay» con `bridge_priority=50`.
-    #
-    # Sin esta línea la ranura se quedaba vacía: `sole_engine_for` sólo
-    # autoactiva cuando hay **un** motor instalado de la ranura, y desde que hay
-    # dos puentes no hay ninguno que sea el único. La pestaña «Entre redes» se
-    # abría, dejaba elegir redes, tokens e importe, y al buscar contestaba que no
-    # había a quién preguntar.
-    EngineKind.CROSS_CHAIN.value: "lifi",
 }
+
+#: Puentes que arrancan activos, en orden. LI.FI y no Relay: Relay declara su clave
+#: en `required_config` y autoactivarlo sin credencial fallaría en el arranque.
+#: Circle no pide clave. Sin esta lista la ranura de puentes se queda vacía, porque
+#: `sole_engine_for` sólo autoactiva con un único motor instalado.
+DEFAULT_BRIDGE_ENGINES: Final = ("lifi", "circle")
 
 
 @dataclass(slots=True)
@@ -133,6 +131,8 @@ class Container:
     #: Se separa del swap porque lo que se comprueba no es lo mismo: aquí la lista
     #: blanca de redes tiene que cubrir **las dos** redes, no sólo la de origen.
     execute_bridge: ExecuteBridge
+    #: Los puentes emitidos hasta que llegan a un estado final, guardados en disco.
+    bridge_tracking: BridgeTracking
     #: Construye, firma y **publica** una orden en un mercado de predicción. Es,
     #: junto con `execute_swap`, el otro camino por el que sale dinero: mismo
     #: modo y mismo interruptor, y por eso comparten emisores y política.
@@ -142,6 +142,11 @@ class Container:
     #: dinero **entra**: por eso no le aplica el tope de gasto, sólo el resto de
     #: la comprobación.
     redeem_prediction: RedeemPrediction
+    #: Lee la wallet de depósito —dirección, saldo y posiciones—. Sólo lectura y
+    #: sin clave privada: la dirección se **deriva** de la EOA, así que se puede
+    #: enseñar sin credenciales del relayer y sin que la wallet exista aún en la
+    #: cadena. De ahí que esté aunque el canal de la wallet no esté configurado.
+    read_settlement_wallet: ReadSettlementWallet
     #: La política de autonomía, con sus límites y su registro. La interfaz la lee
     #: para saber si puede ofrecer el botón, y para poder explicar por qué no.
     policy: AutonomyPolicy
@@ -197,6 +202,7 @@ class Container:
     async def aclose(self) -> None:
         """Cierra scheduler, motores y el cliente de RPC. La UI lo llama al salir."""
         try:
+            await self.bridge_tracking.aclose()
             await self.scheduler.stop()
         finally:
             try:
@@ -323,8 +329,14 @@ async def build_container(
         prepare_bridge=prepare_bridge,
         execute_swap=execution.execute_swap,
         execute_bridge=execution.execute_bridge,
+        bridge_tracking=BridgeTracking(
+            config_module.config_dir() / "bridge_tracking.json",
+            registry,
+            claimer=execution.claim_bridge,
+        ),
         place_prediction_order=execution.place_prediction_order,
         redeem_prediction=execution.redeem_prediction,
+        read_settlement_wallet=execution.read_settlement_wallet,
         policy=execution.policy,
         keys=execution.keys,
         passphrase=execution.passphrase,
@@ -462,6 +474,14 @@ class _Execution:
     withdraw_funds: WithdrawFunds
     place_prediction_order: PlacePredictionOrder
     redeem_prediction: RedeemPrediction
+    #: La lectura de la wallet de depósito. Va con las que firman aunque no firme
+    #: nada, y por el mismo motivo que la retirada: lo que necesita —los
+    #: emisores— se construye aquí, y un segundo mapa sería otro sitio donde el
+    #: pool de una red puede quedar distinto del otro sin que nada lo diga.
+    read_settlement_wallet: ReadSettlementWallet
+    #: La recepción en destino de un puente de Circle. Va aquí, con el resto de
+    #: lo que firma, para que el seguimiento la pida por el mismo gateway.
+    claim_bridge: ClaimBridge
     policy: AutonomyPolicy
     keys: SpendingKeyProvider
     #: Va con las dos anteriores y por el mismo motivo: la pantalla de credenciales
@@ -506,6 +526,11 @@ def _build_execution(
     # La frase sola no firma nada; lo que habilita es la ejecución desatendida.
     keys = SpendingKeyProvider(store, allow_env_fallback=cfg.allow_env_key)
     passphrase = AutonomyPassphraseProvider(store, allow_env_fallback=cfg.allow_env_key)
+    # El canal de la deposit wallet de Polymarket, para que una orden pueda salir
+    # por el único canal que ese recinto admite hoy. Es una fuente que se pregunta
+    # en el momento: sin credenciales guardadas, las órdenes salen por la EOA como
+    # siempre, y la pestaña de credenciales es donde se cargan.
+    wallets = PolymarketWalletChannelProvider(store)
 
     # El registro se abre por el **módulo** y no por la función importada, y eso
     # no es estilo: `from ... import config_dir` copia la referencia al objeto, así
@@ -586,14 +611,32 @@ def _build_execution(
             keys=keys,
             policy=policy,
             broadcasters=broadcasters,
+            wallets=wallets,
             clock=clock,
-        ),        redeem_prediction=RedeemPrediction(
+        ),
+        redeem_prediction=RedeemPrediction(
             registry=registry,
             gateway=gateway,
             keys=keys,
             policy=policy,
             broadcasters=broadcasters,
             clock=clock,
+        ),
+        # Sin gateway: una lectura no tiene nada que confirmar. Se le pasa la
+        # dirección —`keys`— y no la clave: la wallet que enseña se deriva de la
+        # EOA, que es pública.
+        read_settlement_wallet=ReadSettlementWallet(
+            registry=registry,
+            keys=keys,
+            broadcasters=broadcasters,
+            clock=clock,
+        ),
+        claim_bridge=ClaimBridge(
+            registry=registry,
+            gateway=gateway,
+            keys=keys,
+            policy=policy,
+            broadcasters=broadcasters,
         ),
         # La retirada no cotiza nada —se manda lo que se manda—, así que no tiene
         # `prepare` del que tirar: construye su propia transferencia. Lo que sí
@@ -709,6 +752,8 @@ async def _activate_configured_engines(registry: EngineRegistry, settings: Setti
     for kind in EngineKind:
         if kind.value in settings.active_engines:
             configured = _configured_engines(settings.active_engines[kind.value])
+        elif kind is EngineKind.CROSS_CHAIN:
+            configured = tuple(e for e in DEFAULT_BRIDGE_ENGINES if e in installed)
         else:
             preferred = DEFAULT_ENGINE_IDS.get(kind.value)
             fallback = preferred if preferred in installed else sole_engine_for(catalog, kind)

@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 
 import structlog
 
+from amigocompora.infra.error_journal import capturar_errores
+
 #: Máscara que se escribe en lugar del valor. Longitud fija: la longitud real
 #: de un secreto también es información.
 MASK: Final = "***"
@@ -119,6 +121,7 @@ def configure_logging(*, level: str = "INFO", as_json: bool = False) -> None:
             # La redacción va antes del renderizado y después de añadir
             # contexto, para que también cubra lo que inyecten los binds.
             redact_sensitive,
+            capturar_errores,
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             renderer,

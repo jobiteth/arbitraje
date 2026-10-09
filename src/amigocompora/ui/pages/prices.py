@@ -74,6 +74,7 @@ from amigocompora.domain.models import (
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import BasisPoints
+from amigocompora.ui import icons
 from amigocompora.ui.execution_gate import (
     cap_blockers,
     execution_blockers,
@@ -202,7 +203,7 @@ class PricesPage(QWidget):
         # que menos se hace. La ventana la lleva a su propia pestaña con
         # `take_bridges`; si nadie la reclama —una `PricesPage` suelta, que es como
         # la montan las pruebas— se queda aquí, que es donde ha vivido siempre.
-        self._bridges = BridgesSection(container)
+        self._bridges = BridgesSection(container, balances=self._balances)
         lay.addWidget(self._bridges)
         # Con peso 1 y no 0: `addStretch()` sin argumento crea un espaciador con
         # peso **cero**, que no absorbe nada, y el sobrante acababa repartido entre
@@ -811,7 +812,9 @@ class PricesPage(QWidget):
             # mezcla, y dos motores pueden cotizar el mismo par por caminos
             # distintos: sin esta columna, dos filas del mismo venue parecerían un
             # error de la vista en vez de dos fuentes que no coinciden.
-            self._table.setItem(row, 1, QTableWidgetItem(quote.engine_id))
+            motor = QTableWidgetItem(quote.engine_id)
+            motor.setIcon(icons.brand_icon(quote.engine_id))
+            self._table.setItem(row, 1, motor)
             # El valor completo se guarda en la celda y el texto visible se decide en
             # `_apply_decimales`: así la casilla no tiene que volver a consultar nada.
             out = QTableWidgetItem()

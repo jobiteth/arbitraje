@@ -1123,6 +1123,30 @@ def test_an_empty_whitelist_means_nothing_is_allowed() -> None:
         limits.check_engine("zeroex")
 
 
+def test_a_mixed_case_symbol_matches_the_normalized_whitelist() -> None:
+    """`pUSD` casa con una lista escrita `pusd` o `PUSD`, y no por casualidad.
+
+    La lista se normaliza a mayúsculas porque quien la escribe es una persona, y
+    el catálogo tiene símbolos en caja mixta —`pUSD`, el colateral del recinto de
+    predicción, o `BTC.b`—. Comparar en crudo bloquearía una retirada de pUSD
+    contra una lista que dice `PUSD`: el usuario leería «pUSD no está en la lista
+    blanca (PUSD)», que es un error imposible de creer.
+    """
+    limits = limits_from_config(
+        enabled=True,
+        max_quote_per_trade=None,
+        max_quote_per_day=None,
+        allowed_tokens=["pusd"],
+        allowed_chains=[],
+        allowed_engines=[],
+        max_executions_per_cycle=1,
+        slippage_bps=50,
+    )
+    limits.check_token(("pUSD",))
+    with pytest.raises(ExecutionLimitExceededError):
+        limits.check_token(("USDC",))
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("max_quote_per_trade", "0"), ("max_quote_per_day", "-1"), ("max_quote_per_trade", "no")],

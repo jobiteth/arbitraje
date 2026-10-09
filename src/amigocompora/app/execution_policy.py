@@ -103,6 +103,24 @@ class PrivateKeySource(Protocol):
     def available(self) -> bool: ...
 
 
+class AddressSource(Protocol):
+    """De dónde sale la **dirección** pública, sin la clave privada.
+
+    Es lo que necesita una lectura que sólo mira: enseñar el saldo de una
+    cartera no debe leer la clave privada ni de refilón, y tipar el caso de uso
+    contra `PrivateKeySource` obligaría a que el doble de prueba —y cualquier
+    implementación futura— pudiera entregarla. Aquí no se puede: lo único que
+    este protocolo entrega es una dirección, que es pública.
+
+    `available()` no lanza —pinta botones—; `address()` devuelve `None` cuando
+    no hay cartera, igual que el proveedor del llavero.
+    """
+
+    def address(self) -> str | None: ...
+
+    def available(self) -> bool: ...
+
+
 class PassphraseSource(Protocol):
     """De dónde sale la frase de autonomía."""
 

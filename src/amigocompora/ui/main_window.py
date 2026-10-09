@@ -20,8 +20,10 @@ from amigocompora.domain.modes import Capability, OperationMode
 from amigocompora.ui.pages.ai import AiPage
 from amigocompora.ui.pages.alerts import AlertsPage
 from amigocompora.ui.pages.engines import EnginesPage
+from amigocompora.ui.pages.errors import ErrorsPage
 from amigocompora.ui.pages.prediction import PredictionPage
 from amigocompora.ui.pages.prices import PricesPage
+from amigocompora.ui.pages.settings import ConfiguracionPage
 from amigocompora.ui.pages.wallet import WalletPage
 from amigocompora.ui.theme import (
     APP_SUBTITLE,
@@ -106,6 +108,7 @@ class MainWindow(QMainWindow):
         self._prices = PricesPage(container, balances=self._balances)
         self._prediction = PredictionPage(container)
         self._engines = EnginesPage(container)
+        self._settings = ConfiguracionPage(container)
         self._tabs = QTabWidget()
 
         # La cartera va **al lado** del swap y no dentro de él: la pantalla tiene
@@ -132,7 +135,9 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._prediction, "Predicción")
         self._tabs.addTab(AiPage(container), "Copiloto IA")
         self._tabs.addTab(self._engines, "Motores")
+        self._tabs.addTab(self._settings, "Configuración")
         self._tabs.addTab(self._alerts_page, "Alertas")
+        self._tabs.addTab(ErrorsPage(), "Errores")
         lay.addWidget(self._tabs, stretch=1)
 
         # «Intercambiar este token» en la cartera: se prepara el par y la vista
@@ -148,13 +153,13 @@ class MainWindow(QMainWindow):
         # firmar, y los botones que firman viven en otras dos pestañas. Sin esto,
         # el usuario guardaría su clave y encontraría los botones todavía
         # apagados, que es exactamente lo que enseña a desconfiar de un botón.
-        self._engines.credentials_changed.connect(self._prices.refresh_execution_state)
-        self._engines.credentials_changed.connect(self._prediction.refresh_execution_state)
+        self._settings.credentials_changed.connect(self._prices.refresh_execution_state)
+        self._settings.credentials_changed.connect(self._prediction.refresh_execution_state)
         # Y la cartera: la dirección que se lee **es** la que abre esa clave, así
         # que guardarla o borrarla cambia lo que hay que enseñar. Sin esto, la
         # pestaña seguiría mostrando la cartera anterior —o ninguna— con la
         # misma seguridad que si fuera la correcta.
-        self._engines.credentials_changed.connect(self._wallet.refresh)
+        self._settings.credentials_changed.connect(self._wallet.refresh)
 
         # Status bar
         status = QStatusBar()

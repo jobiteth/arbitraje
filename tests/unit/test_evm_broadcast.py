@@ -562,3 +562,29 @@ async def test_a_short_return_cuts_instead_of_reading_a_zero() -> None:
         await emisor.read_permit2_allowance(PERMIT2, USDC, WALLET, ROUTER)
 
     assert "no es el que se cree" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# 8. `has_code`: si hay contrato en la dirección, se pregunta a la cadena
+# --------------------------------------------------------------------------- #
+async def test_has_code_asks_the_chain_for_the_code_at_latest() -> None:
+    """La única fuente que no llega tarde: un índice daría por desplegada una
+    wallet que todavía no lo está, y una dirección sin código no paga nada."""
+    node = _node(eth_getCode="0x60016001")
+    emisor = _broadcaster(node)
+
+    assert await emisor.has_code(WALLET) is True
+
+    (params,) = node.called("eth_getCode")
+    assert params == [WALLET, "latest"]
+
+
+async def test_without_code_the_address_is_read_as_not_deployed() -> None:
+    """`0x` es una cuenta sin código, y `0x0` significa lo mismo en algunos nodos.
+
+    Las dos formas se tratan igual —como «no hay contrato»—: leerlas como
+    desplegada haría consultar saldo y permiso contra una dirección que no puede
+    pagar nada, que es justo lo que el despliegue previo existe para evitar."""
+    for respuesta in ("0x", "0x0", ""):
+        emisor = _broadcaster(_node(eth_getCode=respuesta))
+        assert await emisor.has_code(WALLET) is False, respuesta

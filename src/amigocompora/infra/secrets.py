@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Protocol, runtime_checkable
 
@@ -25,7 +25,11 @@ from amigocompora.domain.errors import (
     KeyCustodyError,
     NoWalletError,
 )
-from amigocompora.domain.protocols import ConfigResolver, EngineManifest
+from amigocompora.domain.protocols import (
+    ConfigResolver,
+    EngineManifest,
+    WalletChannelCredentials,
+)
 from amigocompora.infra.evm.signer import address_from_key
 
 _log = structlog.get_logger(__name__)
@@ -51,6 +55,13 @@ _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 PRIVATE_KEY_SECRET: Final = "execution_private_key"  # noqa: S105
 #: Credencial de la frase que habilita la ejecución desatendida. Mismo caso.
 AUTONOMY_PASSPHRASE_SECRET: Final = "execution_autonomy_passphrase"  # noqa: S105
+#: Clave API del relayer de Polymarket y la dirección a la que pertenece.
+POLYMARKET_RELAYER_KEY_SECRET: Final = "polymarket_relayer_key"  # noqa: S105
+POLYMARKET_RELAYER_ADDRESS_SECRET: Final = "polymarket_relayer_address"  # noqa: S105
+#: Builder key de Polymarket: la única que puede crear la deposit wallet.
+POLYMARKET_BUILDER_KEY_SECRET: Final = "polymarket_builder_key"  # noqa: S105
+POLYMARKET_BUILDER_SECRET_SECRET: Final = "polymarket_builder_secret"  # noqa: S105
+POLYMARKET_BUILDER_PASSPHRASE_SECRET: Final = "polymarket_builder_passphrase"  # noqa: S105
 
 
 class SecretStoreError(AmigocomporaError):
@@ -101,6 +112,11 @@ def app_env_var_name(name: str) -> str:
     """
     slug = _NON_ALNUM.sub("_", name.upper()).strip("_")
     return f"AMIGOCOMPORA_{slug}"
+
+
+def _first_missing(values: Sequence[tuple[str, str | None]]) -> str:
+    """El primer nombre cuyo valor falta, para poder decir **cuál** es."""
+    return next(name for name, value in values if value is None)
 
 
 @runtime_checkable
@@ -296,6 +312,99 @@ class SpendingKeyProvider:
                 + "."
             )
         return key
+
+
+class PolymarketWalletChannelProvider:
+    """Las credenciales del canal de la deposit wallet de Polymarket.
+
+    Son las del relayer: la **Builder key** —la única que puede desplegar la
+    wallet y firmar los lotes por cuenta de cualquiera— y, opcional, la
+    **Relayer key** con su dirección, que sólo sirve para operaciones de esa
+    misma dirección (medido: el relayer la rechaza para otro dueño). Sin la
+    Builder key no hay canal, y `available()` lo dice; con ella y sin Relayer,
+    los lotes van autenticados con la Builder key, que es lo que se midió que
+    funciona.
+
+    Se leen en el momento y no se cachean: `require()` devuelve un valor que
+    quien llama usa y suelta, igual que la clave privada. El fallback a variable
+    de entorno viene **encendido**, como en el resto de las claves de API de la
+    aplicación y a diferencia de la clave privada: una API key filtrada se rota
+    en un minuto, y estas dos no pueden mover un céntimo sin una firma de la
+    cartera, que no viaja por aquí.
+    """
+
+    __slots__ = ("_allow_env_fallback", "_store")
+
+    def __init__(self, store: SecretStore, *, allow_env_fallback: bool = True) -> None:
+        self._store = store
+        self._allow_env_fallback = allow_env_fallback
+
+    def _read(self, name: str) -> str | None:
+        try:
+            value = self._store.get(app_secret_key(name))
+        except SecretStoreError as error:
+            # Un almacén caído se trata como «esta clave no está»: la decisión
+            # —operar por la EOA— recae del lado seguro, y el aviso dice la causa.
+            _log.warning("secrets.wallet_channel_store_unavailable", reason=str(error))
+            value = None
+        if value:
+            return value
+        if self._allow_env_fallback:
+            from_env = os.environ.get(app_env_var_name(name))
+            if from_env:
+                _log.warning(
+                    "secrets.wallet_channel_from_env",
+                    name=name,
+                    hint=(
+                        "una credencial del canal de la deposit wallet se leyó de "
+                        "una variable de entorno; cualquiera con acceso al entorno "
+                        "del proceso la ve."
+                    ),
+                )
+                return from_env
+        return None
+
+    def available(self) -> bool:
+        """Si hay con qué operar la wallet. No lanza: se pregunta para decidir."""
+        return all(
+            self._read(name)
+            for name in (
+                POLYMARKET_BUILDER_KEY_SECRET,
+                POLYMARKET_BUILDER_SECRET_SECRET,
+                POLYMARKET_BUILDER_PASSPHRASE_SECRET,
+            )
+        )
+
+    def require(self) -> WalletChannelCredentials:
+        """Las credenciales del canal, o un error que dice **cuál** falta."""
+        builder = self._read(POLYMARKET_BUILDER_KEY_SECRET)
+        secret = self._read(POLYMARKET_BUILDER_SECRET_SECRET)
+        passphrase = self._read(POLYMARKET_BUILDER_PASSPHRASE_SECRET)
+        if builder is None or secret is None or passphrase is None:
+            raise MissingSecretError(
+                _first_missing(
+                    (
+                        (POLYMARKET_BUILDER_KEY_SECRET, builder),
+                        (POLYMARKET_BUILDER_SECRET_SECRET, secret),
+                        (POLYMARKET_BUILDER_PASSPHRASE_SECRET, passphrase),
+                    )
+                ),
+                "el canal de la deposit wallet de Polymarket",
+            )
+        relayer_key = self._read(POLYMARKET_RELAYER_KEY_SECRET)
+        relayer_address = self._read(POLYMARKET_RELAYER_ADDRESS_SECRET)
+        if relayer_key is None or relayer_address is None:
+            # A medias no vale —la clave sin su dirección no autentica nada, y la
+            # dirección sin la clave tampoco—, así que se opera sin Relayer key.
+            relayer_key = None
+            relayer_address = None
+        return WalletChannelCredentials(
+            builder_api_key=builder,
+            builder_secret=secret,
+            builder_passphrase=passphrase,
+            relayer_api_key=relayer_key,
+            relayer_address=relayer_address,
+        )
 
 
 class AutonomyPassphraseProvider:

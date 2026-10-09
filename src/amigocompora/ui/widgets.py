@@ -203,20 +203,15 @@ def tokens_for_chain(store: UserTokenStore, chain_key: str) -> tuple[Token, ...]
 def token_labels(tokens: tuple[Token, ...]) -> tuple[str, ...]:
     """Etiquetas de un desplegable de tokens, desempatando los homónimos.
 
-    Dos tokens distintos pueden publicar el mismo símbolo, y repetir la etiqueta
-    deja al usuario eligiendo a ciegas entre dos cosas que no son la misma. Sólo
-    cuando un símbolo aparece más de una vez se le añade el principio de la
-    dirección, que es lo que sí distingue; con símbolos únicos la etiqueta queda
-    limpia, que es el caso normal.
+    Primero se da a cada token su nombre de uso (el USDC puenteado de Polygon es
+    «USDC.e», y el nativo sigue siendo «USDC»). Dos tokens distintos que aun así
+    compartan nombre se desempatan con el principio de la dirección, que es lo que
+    sí los distingue; con nombres únicos la etiqueta queda limpia.
     """
-    repetidos = {
-        token.symbol
-        for token in tokens
-        if sum(otro.symbol == token.symbol for otro in tokens) > 1
-    }
+    nombres = [token.display_symbol for token in tokens]
     return tuple(
-        token.qualified_symbol if token.symbol in repetidos else token.symbol
-        for token in tokens
+        token.qualified_symbol if nombres.count(nombre) > 1 else nombre
+        for token, nombre in zip(tokens, nombres, strict=True)
     )
 
 

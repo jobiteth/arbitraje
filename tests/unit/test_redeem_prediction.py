@@ -223,6 +223,12 @@ class MotorQueCobra:
     async def market(self, market_id: str) -> PredictionMarket:
         raise AssertionError(f"cobrar no pide un mercado suelto: {market_id}")
 
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        # Buscar por condición es lo que hace la pestaña al pulsar «Vender» o
+        # «Comprar más» sobre una posición. Cobrar no lo usa: recibe las
+        # posiciones ya leídas y firma con lo que traen.
+        raise AssertionError(f"cobrar no busca por condición: {condition_id}")
+
     async def book(self, token_id: str) -> MarketDepth:
         raise AssertionError(f"cobrar no lee el libro: {token_id}")
 
@@ -268,6 +274,9 @@ class MotorSoloLectura:
 
     async def market(self, market_id: str) -> PredictionMarket:
         raise AssertionError(market_id)
+
+    async def market_by_condition(self, condition_id: str) -> PredictionMarket:
+        raise AssertionError(condition_id)
 
     async def book(self, token_id: str) -> MarketDepth:
         raise AssertionError(token_id)

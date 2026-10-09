@@ -276,17 +276,14 @@ def test_el_manifiesto_ocupa_la_ranura_de_cartera_y_solo_lee() -> None:
     assert not MANIFEST.needs_secrets, "leer saldos no puede exigir una credencial"
 
 
-def test_el_motor_declara_menos_redes_que_la_familia_entera() -> None:
-    """El ancla del fallo «10 de 9»: las redes sin nodos no se declaran.
+def test_el_motor_declara_las_redes_con_nodo_de_la_familia() -> None:
+    """Una red de la familia sólo se declara si tiene un nodo con el que leerla.
 
-    `arc` y `robinhood` están en `CHAINS` y una cartera EVM las cubre por familia,
-    pero no tienen nodos medidos. Declararlas haría que fallaran **siempre** y que
-    el patrimonio no se pudiera afirmar nunca.
+    `arc` y `robinhood` tienen respaldo público, así que se leen igual que el
+    resto; una red sin ningún nodo quedaría fuera y no fallaría en silencio.
     """
     cubiertas = set(_perfil().chains_of())
-    declaradas_evm = set(WALLET_CHAINS) & cubiertas
-    assert declaradas_evm < cubiertas, "no se está declarando un subconjunto estricto"
-    assert {"arc", "robinhood"}.isdisjoint(WALLET_CHAINS)
+    assert {"arc", "robinhood"} <= set(WALLET_CHAINS)
     # Y la familia que no es EVM entra por su propio lado, no por el de esta.
     assert "solana" in WALLET_CHAINS
     assert "solana" not in cubiertas
@@ -409,8 +406,7 @@ async def test_solo_se_intentan_las_redes_que_el_motor_declara_saber_leer() -> N
 
     assert set(motor.pedidas) == set(REDES_EVM)
     assert len(motor.pedidas) == len(foto.chains)
-    assert "arc" not in motor.pedidas
-    assert "robinhood" not in motor.pedidas
+    assert {"arc", "robinhood"} <= set(motor.pedidas)
     assert "solana" not in motor.pedidas, "una cartera EVM no puede leer Solana"
 
 
@@ -429,7 +425,7 @@ async def test_se_puede_pedir_un_subconjunto_de_redes() -> None:
 async def test_pedir_una_red_que_el_motor_no_declara_no_la_activa() -> None:
     """Limitar no puede ensanchar: `chains` filtra, nunca añade."""
     motor = _Motor()
-    foto = await _leer(motor)(_perfil(), chains=("arc", "robinhood"))
+    foto = await _leer(motor)(_perfil(), chains=("solana",))
     assert motor.pedidas == []
     assert foto.chains == ()
 

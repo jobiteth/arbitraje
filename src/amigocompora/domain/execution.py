@@ -238,13 +238,25 @@ class ExecutionLimits:
         predicción mueve sólo el colateral. La comprobación es la misma —ninguno
         fuera de la lista—, así que la lista blanca se escribe una vez y vale
         para los dos caminos.
+
+        La comparación es **por mayúsculas en los dos lados**, y no por capricho:
+        el catálogo tiene símbolos en caja mixta —`pUSD`, el colateral del recinto
+        de predicción, o `BTC.b`— y la lista llega normalizada a mayúsculas desde
+        `limits_from_config`. Comparar en crudo bloquearía esos tokens contra una
+        lista que el usuario escribió bien, y el mensaje diría «pUSD no está»
+        mientras enseña `PUSD` declarado, que es de los errores que más caro
+        cuestan de creer. Se normalizan los dos lados y no sólo el símbolo porque
+        unos límites construidos a mano —pruebas, cables sueltos— pueden traer la
+        lista sin normalizar, y una comprobación que dependiera de que alguien la
+        normalizara antes sería una trampa esperando a su dueño.
         """
         # El comodín permite cualquier token a propósito: es una decisión del usuario,
         # escrita como tal en la configuración, y no un vacío que se confunda con
         # «nada permitido». Sin él, la lista vacía sigue significando que no se opera.
         if ANY_TOKEN in self.allowed_tokens:
             return
-        outside = sorted(symbol for symbol in symbols if symbol not in self.allowed_tokens)
+        permitidos = {entrada.upper() for entrada in self.allowed_tokens}
+        outside = sorted(symbol for symbol in symbols if symbol.upper() not in permitidos)
         if outside:
             raise ExecutionLimitExceededError(
                 "tokens permitidos",

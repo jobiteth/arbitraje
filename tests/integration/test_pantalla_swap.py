@@ -312,7 +312,7 @@ async def test_ninguna_pestana_recorta_su_contenido() -> None:
 async def test_la_pantalla_de_swap_tiene_la_lista_de_tokens() -> None:
     """La cartera es una columna de la pestaña de swap, y el swap es la primera.
 
-    Se afirma sobre las seis pestañas enteras, en orden, y no sólo sobre la
+    Se afirma sobre las ocho pestañas enteras, en orden, y no sólo sobre la
     primera: la composición es lo que hace que esto sea «una pantalla, tipo
     MetaMask» en vez de seis formularios, y colar una pestaña en medio es
     exactamente lo que la volvería a romper.
@@ -324,7 +324,9 @@ async def test_la_pantalla_de_swap_tiene_la_lista_de_tokens() -> None:
             "Predicción",
             "Copiloto IA",
             "Motores",
+            "Configuración",
             "Alertas",
+            "Errores",
         ]
         # La cartera cuelga de la pestaña de swap: no es una pestaña.
         assert window._tabs.indexOf(window._wallet) == -1
