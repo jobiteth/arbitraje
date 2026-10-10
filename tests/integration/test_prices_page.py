@@ -20,31 +20,37 @@ de que se importe nada de Qt.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QTableWidgetItem
+from PySide6.QtWidgets import QApplication
 
 from amigocompora.app.container import Container, build_container
 from amigocompora.app.execution_policy import LedgerEntry
+from amigocompora.app.usecases.estimate_cost import NetworkCost
+from amigocompora.app.usecases.prepare_swap import PreparedSwap, PrepareSwap
+from amigocompora.domain.addresses import shorten
 from amigocompora.domain.models import (
     BroadcastStatus,
     PriceComparison,
     Quote,
     Token,
     TradingPair,
+    UnsignedTransaction,
     Venue,
     VenueKind,
 )
 from amigocompora.domain.modes import OperationMode
-from amigocompora.domain.money import BasisPoints
+from amigocompora.domain.money import BasisPoints, TokenAmount
 from amigocompora.engines.catalog import quote_token, wrapped_native
 from amigocompora.infra.config import Settings
 from amigocompora.infra.secrets import (
@@ -54,11 +60,17 @@ from amigocompora.infra.secrets import (
     secret_key,
 )
 from amigocompora.ui.pages.prices import PricesPage
+from amigocompora.ui.route_list import RouteCard
+from amigocompora.ui.theme import COLOR_MUTED, COLOR_WARNING, STYLESHEET
 
 #: Clave de desarrollo **publicada** (la primera de Hardhat). No es un secreto:
 #: que sea conocida es justo lo que la hace útil aquí, porque se puede afirmar
 #: sobre la dirección derivada sin que la calcule el código que se está probando.
 CLAVE_DE_DESARROLLO = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+#: La nota de las cotizaciones de prueba. Es la frase que dice de dónde sale cada
+#: cifra; se escribe aquí y no en cada cotización para poder afirmar sobre ella.
+_NOTA = "Leído del pool falso contra el estado de la cadena."
 
 #: Con esto la ejecución queda lista salvo por lo que cada prueba quite.
 _TERMINOS: dict[str, object] = {
@@ -100,10 +112,10 @@ def _comparison(pair: TradingPair) -> PriceComparison:
                 fee_bps=BasisPoints(5),
                 price_impact_bps=BasisPoints(1),
                 observed_at=datetime(2026, 1, 1, tzinfo=UTC),
-                # Con nota, como las de verdad: es la columna que dice de dónde
+                # Con nota, como las de verdad: es el dato que dice de dónde
                 # sale cada cifra, y sin ella la prueba de que se puede leer
                 # entera estaría afirmando sobre una cadena vacía.
-                source_note="Leído del pool falso contra el estado de la cadena.",
+                source_note=_NOTA,
             ),
         ),
     )
@@ -140,6 +152,61 @@ def _comparacion_de(filas: int) -> PriceComparison:
     )
 
 
+def _cotizacion(
+    pair: TradingPair,
+    *,
+    engine_id: str,
+    venue_id: str,
+    nombre: str,
+    importe: str,
+    nota: str = _NOTA,
+) -> Quote:
+    """Una cotización con la forma de las de verdad: comisión, impacto y nota."""
+    return Quote(
+        venue=Venue(venue_id=venue_id, name=nombre, kind=VenueKind.DEX, chain="base"),
+        engine_id=engine_id,
+        pair=pair,
+        amount_in=pair.base.amount("1"),
+        amount_out=pair.quote.amount(importe),
+        fee_bps=BasisPoints(5),
+        price_impact_bps=BasisPoints(1),
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        source_note=nota,
+    )
+
+
+def _comparacion_mixta() -> PriceComparison:
+    """Las dos clases de ruta en una tabla: la firmable y la de sólo cotización.
+
+    Es la pila real: `uniswap` construye el swap y `geckoterminal` sólo publica
+    la cifra. La de sólo cotización va **primera** en el orden de la tabla
+    —2000 contra 1999—, que es justo lo que hace que ocultarla obligue a que la
+    selección apunte a lo que sí se ve.
+    """
+    pair = _pair()
+    return PriceComparison(
+        pair=pair,
+        amount_in=pair.base.amount("1"),
+        quotes=(
+            _cotizacion(
+                pair,
+                engine_id="uniswap",
+                venue_id="uniswap-v3@base",
+                nombre="uniswap-v3@0.05",
+                importe="1999",
+            ),
+            _cotizacion(
+                pair,
+                engine_id="geckoterminal",
+                venue_id="fake@base",
+                nombre="fake",
+                importe="2000",
+                nota="Observado en GeckoTerminal.",
+            ),
+        ),
+    )
+
+
 def _store(*, con_cartera: bool) -> InMemorySecretStore:
     store = InMemorySecretStore()
     if con_cartera:
@@ -158,6 +225,8 @@ async def _pagina(
     con_planificador: bool,
     permitidos: list[str] | None = None,
     topes: dict[str, str] | None = None,
+    motores: list[str] | None = None,
+    ocultar_solo_cotiza: bool = False,
 ) -> AsyncIterator[tuple[Container, PricesPage]]:
     terminos = dict(_TERMINOS)
     if permitidos is not None:
@@ -166,7 +235,12 @@ async def _pagina(
         terminos.update(topes)
     config: dict[str, object] = {"mode": modo.value, "execution": terminos}
     if con_planificador:
-        config["active_engines"] = {"dex_quotes": "uniswap"}
+        # `motores` permite reproducir la pila real —`uniswap` y `geckoterminal`
+        # activos a la vez—, que es el caso medido de la ruta que no se puede
+        # firmar: el que sólo cotiza está encendido y aun así no construye.
+        config["active_engines"] = {"dex_quotes": motores or "uniswap"}
+    if ocultar_solo_cotiza:
+        config["ui"] = {"hide_quote_only_routes": True}
     container = await build_container(
         Settings.model_validate(config),
         secret_store=_store(con_cartera=con_cartera),
@@ -241,8 +315,8 @@ async def test_the_execute_button_turns_on_only_when_nothing_is_missing() -> Non
     ) as (_, page):
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         assert page._selected_quote() is not None
         assert page._exec_btn.isEnabled() is True
@@ -261,8 +335,8 @@ async def test_the_button_is_off_and_the_screen_says_why() -> None:
     ) as (_, page):
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         assert page._exec_btn.isEnabled() is False
         nota = page._exec_note.text()
@@ -300,8 +374,8 @@ async def test_el_tope_por_operacion_apaga_el_boton_antes_de_pulsarlo() -> None:
     ) as (_, page):
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         assert page._exec_btn.isEnabled() is False
         nota = page._exec_note.text()
@@ -342,8 +416,8 @@ async def test_el_tope_diario_cuenta_lo_que_ya_se_gasto() -> None:
 
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         assert page._exec_btn.isEnabled() is False
         nota = page._exec_note.text()
@@ -371,8 +445,8 @@ async def test_sin_topes_el_boton_no_se_apaga_por_este_motivo() -> None:
 
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         assert page._exec_btn.isEnabled() is True
         assert page._exec_note.text() == ""
@@ -398,8 +472,8 @@ async def test_el_modo_que_bloquea_se_ofrece_con_su_atajo() -> None:
     ) as (container, page):
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         assert page._upgrade_btn.isHidden() is False
         assert "EJECUCIÓN" in page._upgrade_btn.text()
@@ -424,8 +498,8 @@ async def test_el_atajo_no_aparece_si_el_modo_no_es_lo_que_falta() -> None:
     ) as (_, page):
         pair = _pair()
         page._comparison = _comparison(pair)
-        page._fill_table(page._comparison)
-        page._table.selectRow(0)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
 
         # Falta la cartera, no el modo.
         assert "cartera" in page._exec_note.text()
@@ -631,7 +705,7 @@ async def test_el_mismo_token_en_las_dos_patas_se_dice_y_no_se_cotiza() -> None:
         await page._do_quote()
 
         assert "dos tokens distintos" in page._status.text()
-        assert page._table.rowCount() == 0
+        assert page._routes.count() == 0
 
 
 async def test_un_token_fuera_de_la_lista_blanca_se_nombra() -> None:
@@ -658,47 +732,68 @@ async def test_un_token_fuera_de_la_lista_blanca_se_nombra() -> None:
         assert permitido == ()
 
 
-# --------------------------------------------------------------------------- #
-# El alto de las tablas y lo que se dice cuando no hay nada
-# --------------------------------------------------------------------------- #
-async def test_la_tabla_de_rutas_no_reserva_alto_de_mas() -> None:
-    """Una tabla con dos filas no puede medir como una de veinte.
+async def test_la_caja_mixta_del_token_no_lo_deja_fuera_de_la_lista() -> None:
+    """`bankr` contra una lista que declara `BANKR` es un token permitido.
 
-    `QTableWidget` publica un alto natural de 192 px que no tiene nada que ver
-    con lo que lleva dentro. Sin corregirlo, la tarjeta de rutas reservaba ese
-    alto entero para dos filas y dejaba un rectángulo gris debajo de los
-    botones, que se lee como un fallo de pintado y no como «aquí cabe más».
+    Los símbolos de fuera del catálogo los publica un contrato y vienen en caja
+    mixta, y el catálogo también tiene los suyos así (`pUSD`); la lista llega
+    normalizada. El botón que firma no puede decir «bankr no está» mientras
+    enseña `BANKR` declarado.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        permitidos=["WETH", "BANKR"],
+    ) as (_, page):
+        base = wrapped_native("base")
+        assert base is not None
+
+        motivos = page._execution_blockers(TradingPair(base=base, quote=BANKR))
+        assert motivos == ()
+
+
+# --------------------------------------------------------------------------- #
+# El alto de la lista y lo que se dice cuando no hay nada
+# --------------------------------------------------------------------------- #
+async def test_la_lista_de_rutas_no_reserva_alto_de_mas() -> None:
+    """Una lista con dos rutas no puede medir como una de veinte.
+
+    `QListWidget` reserva un alto natural que no tiene nada que ver con lo que
+    lleva dentro. Sin corregirlo, la tarjeta de rutas dejaba ese alto entero
+    para dos filas y un rectángulo vacío debajo de los botones, que se lee como
+    un fallo de pintado y no como «aquí cabe más».
     """
     async with _pagina(
         modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
     ) as (_, page):
-        # Sin cotizar, el rótulo ocupa el sitio y la tabla no mide nada.
-        assert page._table.maximumHeight() == 0
+        # Sin cotizar, el rótulo ocupa el sitio y la lista no mide nada.
+        assert page._routes.maximumHeight() == 0
 
         page._comparison = _comparacion_de(1)
-        page._fill_table(page._comparison)
-        una = page._table.maximumHeight()
-        assert 0 < una < 192, "el alto tiene que salir de las filas, no de Qt"
+        page._fill_routes(page._comparison)
+        una = page._routes.maximumHeight()
+        assert 0 < una < 192, "el alto tiene que salir de las rutas, no de Qt"
 
-        # Y crece con las filas, porque la tabla de verdad las tiene.
+        # Y crece con las rutas, porque la lista de verdad las tiene.
         page._comparison = _comparacion_de(2)
-        page._fill_table(page._comparison)
-        dos = page._table.maximumHeight()
+        page._fill_routes(page._comparison)
+        dos = page._routes.maximumHeight()
         assert dos > una
 
         # Hasta un tope: veinte rutas no pueden empujar los botones fuera de la
-        # pantalla. A partir de ahí la tabla se desplaza, que es su oficio.
+        # pantalla. A partir de ahí la lista se desplaza, que es su oficio.
         page._comparison = _comparacion_de(20)
-        page._fill_table(page._comparison)
-        assert page._table.rowCount() == 20
-        # Diez filas y no veinte: el tope aguanta.
-        assert page._table.maximumHeight() == una + 9 * (dos - una)
+        page._fill_routes(page._comparison)
+        assert page._routes.count() == 20
+        # Diez rutas y no veinte: el tope aguanta.
+        assert page._routes.maximumHeight() == una + 9 * (dos - una)
 
 
 async def test_sin_rutas_la_tarjeta_no_repite_la_instruccion() -> None:
     """Una sola frase diciendo qué hacer, no dos seguidas diciendo lo mismo.
 
-    El rótulo que ocupa el sitio de la tabla vacía ya explica que falta cotizar.
+    El rótulo que ocupa el sitio de la lista vacía ya explica que falta cotizar.
     La línea de «selecciona una ruta» sólo hace falta cuando **sí** hay rutas y
     ninguna está elegida, que es cuando el usuario ha hecho lo que se le pidió y
     aun así le falta un paso.
@@ -709,37 +804,439 @@ async def test_sin_rutas_la_tarjeta_no_repite_la_instruccion() -> None:
         assert "Cotizar" in page._routes_empty.text()
         assert page._chosen.text() == ""
 
-        # Con filas y sin selección, la línea vuelve: ahora sí falta un paso.
+        # Con rutas y sin selección, la línea vuelve: ahora sí falta un paso.
         page._comparison = _comparison(_pair())
-        page._fill_table(page._comparison)
-        page._table.clearSelection()
+        page._fill_routes(page._comparison)
+        page._routes.select_row(-1)
         page._on_quote_selected()
         assert page._chosen.text().startswith("Selecciona una ruta")
 
 
 async def test_la_nota_recortada_se_puede_leer_entera() -> None:
-    """La columna que dice de dónde sale cada cifra no puede ser ilegible.
+    """El dato que dice de dónde sale cada cifra no puede ser ilegible.
 
-    La nota se dibuja en una línea y se recorta —una fila por ruta, para poder
-    comparar de un vistazo—, así que el texto completo tiene que estar en algún
-    sitio. Sin el tooltip, la única columna que explica la procedencia del dato
-    sería justo la que no se puede terminar de leer.
+    La tarjeta lleva la nota entera en su tooltip —la segunda línea se recorta
+    para que la lista se lea de un vistazo— y el panel la escribe en su fila
+    «Origen», que es donde se lee con calma. Sin ninguno de los dos, la única
+    información que explica la procedencia del dato sería justo la que no se
+    puede terminar de leer.
     """
     async with _pagina(
         modo=OperationMode.OBSERVATION, con_cartera=True, con_planificador=True
     ) as (_, page):
         page._comparison = _comparison(_pair())
-        page._fill_table(page._comparison)
-        nota = _celda(page, 0, 7)
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+
         # La cotización de prueba trae nota: de dónde salió la cifra.
-        assert nota.text()
-        assert nota.toolTip() == nota.text()
+        assert _tarjeta(page, 0).toolTip() == _NOTA
+        origen = page._detail.values["origen"]
+        assert origen.text() == _NOTA
+        assert origen.toolTip() == origen.text()
 
 
-def _celda(pagina: PricesPage, fila: int, columna: int) -> QTableWidgetItem:
-    item = pagina._table.item(fila, columna)
-    assert item is not None, f"celda vacía en fila {fila}, columna {columna}"
-    return item
+async def test_una_ruta_que_solo_cotiza_se_marca_antes_de_elegirla() -> None:
+    """La tarjeta de un motor que no construye lo que se firma lleva su marca.
+
+    GeckoTerminal observa pools y publica cifras, pero no construye el swap: su
+    ruta se puede comparar y no se puede firmar. Hasta ahora eso se decía recién
+    al seleccionar la fila, en el aviso del botón, así que la lista dejaba
+    elegir a ciegas justo la ruta que no lleva a firmar. La marca va en la
+    tarjeta —el dato es del motor, no de la nota de la fuente—, en ámbar, como
+    todo lo que avisa sin bloquear; el contraste es la otra tarjeta, que es
+    firmable y va sin marca.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        # La pila real: el que sólo cotiza está activo y aun así no construye.
+        motores=["uniswap", "geckoterminal"],
+    ) as (_, page):
+        page._comparison = _comparacion_mixta()
+        page._fill_routes(page._comparison)
+
+        marcada = _tarjeta_de(page, "geckoterminal")
+        limpia = _tarjeta_de(page, "uniswap")
+
+        # `isHidden()` y no `isVisible()`: en una ventana que nunca se ha
+        # mostrado todos los widgets son «invisibles», y lo que se afirma es que
+        # la marca se ocultó o no, no que se haya pintado todavía.
+        assert marcada.mark.text() == "· sólo cotiza"
+        assert marcada.mark.isHidden() is False
+        assert "no se puede firmar" in marcada.mark.toolTip()
+        assert limpia.mark.isHidden() is True
+
+        # El ámbar de la marca lo pone la hoja de estilos —no viaja en el
+        # widget—, así que se afirma sobre la regla que lo pinta.
+        assert f"QLabel#routeMark {{ color: {COLOR_WARNING}" in STYLESHEET
+
+
+async def test_con_el_ajuste_encendido_la_lista_solo_ensena_lo_firmable() -> None:
+    """`[ui] hide_quote_only_routes = true`: la de sólo cotización no llega a la lista.
+
+    Lo que se afirma aquí es lo que hace seguro el ajuste: la ruta oculta **no
+    ocupa un sitio** —la firmable, que iba segunda, pasa a la primera—, la
+    selección devuelve la firmable y no la que su índice ocupaba antes, y el
+    recuento dice cuántas se ocultaron: una lista con menos rutas de las que hay
+    no puede parecer completa.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        motores=["uniswap", "geckoterminal"],
+        ocultar_solo_cotiza=True,
+    ) as (_, page):
+        page._comparison = _comparacion_mixta()
+        page._fill_routes(page._comparison)
+
+        assert page._routes.count() == 1
+        tarjeta = _tarjeta(page, 0)
+        assert tarjeta.quote is not None
+        assert tarjeta.quote.engine_id == "uniswap"
+        recuento = page._route_count.text()
+        assert "1 de 2" in recuento
+        assert "oculta" in recuento
+
+        page._routes.select_row(0)
+        elegida = page._selected_quote()
+        assert elegida is not None
+        assert elegida.engine_id == "uniswap"
+        assert page._swap_btn.isEnabled() is True
+
+
+async def test_si_todo_lo_que_se_cotizo_solo_cotiza_la_lista_lo_dice() -> None:
+    """Con el ajuste encendido y nada firmable, la lista vacía explica el porqué.
+
+    Sin esto la pantalla diría «ningún motor devolvió una ruta», que es falso:
+    los motores sí contestaron y es el ajuste el que no las enseña. El rótulo
+    nombra la clave exacta de la configuración, que es lo único que el usuario
+    puede hacer al respecto.
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION,
+        con_cartera=True,
+        con_planificador=True,
+        motores=["uniswap", "geckoterminal"],
+        ocultar_solo_cotiza=True,
+    ) as (_, page):
+        pair = _pair()
+        page._comparison = PriceComparison(
+            pair=pair,
+            amount_in=pair.base.amount("1"),
+            quotes=(
+                _cotizacion(
+                    pair,
+                    engine_id="geckoterminal",
+                    venue_id="fake@base",
+                    nombre="fake",
+                    importe="2000",
+                    nota="Observado en GeckoTerminal.",
+                ),
+            ),
+        )
+        page._fill_routes(page._comparison)
+
+        assert page._routes.count() == 0
+        texto = page._routes_empty.text()
+        assert "sólo cotizan" in texto
+        assert "hide_quote_only_routes" in texto
+
+
+# --------------------------------------------------------------------------- #
+# Cambiar algo vacía lo de antes, en el acto
+# --------------------------------------------------------------------------- #
+async def test_cambiar_el_importe_vacia_lo_viejo_en_el_acto() -> None:
+    """Lo que está en pantalla pertenece al importe que se ve; si cambia, se va.
+
+    El caso medido: se escribía otro importe y la lista, el panel y los botones
+    seguían enseñando la cotización anterior —y la anterior tarda lo que tarda
+    una cotización—, así que lo que se leía como «esto es lo que hay» era en
+    realidad lo que había. Ahora el cambio vacía en el acto y el rótulo lo
+    dice: se está cotizando otra vez.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        motores=["uniswap", "geckoterminal"],
+    ) as (_, page):
+        page._chain.setCurrentIndex(page._chain.findData("base"))
+        page._base.setCurrentIndex(page._base.findText("WETH"))
+        page._contra.setCurrentIndex(page._contra.findText("USDC"))
+        page._comparison = _comparacion_mixta()
+        page._fill_routes(page._comparison)
+        # La primera fila es la de geckoterminal —mejor importe, no firmable—,
+        # así que la elegida para esta prueba es la de uniswap, que sí lo es.
+        for fila, tarjeta in enumerate(page._routes.cards()):
+            if tarjeta.quote is not None and tarjeta.quote.engine_id == "uniswap":
+                page._routes.select_row(fila)
+                break
+        assert page._swap_btn.isEnabled() is True
+
+        # Como si se hubiera preparado el swap: el borrador también es de lo
+        # anterior y no puede sobrevivir al cambio.
+        page._prepared = _preparado(_COSTE, None).transaction
+        page._save_btn.setEnabled(True)
+
+        # El importe cambia: lo de antes describía otro número.
+        page._card.amount.setValue(page._card.amount.value() + 1)
+
+        assert page._routes.count() == 0
+        assert page._opp_table.rowCount() == 0
+        assert page._detail.isHidden() is True
+        assert page._route_count.text() == ""
+        assert page._chosen.text() == ""
+        assert page._swap_btn.isEnabled() is False
+        # Con `cast` a propósito: mypy mantiene la deducción del borrador que se
+        # asignó unas líneas antes —nadie lo reasigna en este ámbito— y no ve
+        # que quien lo vacía es la propia página, por dentro de la señal de Qt.
+        assert cast("UnsignedTransaction | None", page._prepared) is None
+        assert page._save_btn.isEnabled() is False
+        assert "Cotizando" in page._routes_empty.text()
+        assert page._routes_empty.text() == page._opps_empty.text()
+
+
+async def test_elegir_el_mismo_token_en_las_dos_patas_vacia_lo_de_antes() -> None:
+    """Un par imposible no puede dejar en pantalla las rutas del par anterior.
+
+    Antes, ese cambio ni siquiera programaba cotización —no hay nada que
+    cotizar— y lo de antes se quedaba: rutas de un par que ya no está en los
+    desplegables, todavía seleccionables para preparar y firmar. Ahora el
+    cambio vacía y el rótulo dice por qué.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        motores=["uniswap", "geckoterminal"],
+    ) as (_, page):
+        page._chain.setCurrentIndex(page._chain.findData("base"))
+        page._comparison = _comparacion_mixta()
+        page._fill_routes(page._comparison)
+        assert page._routes.count() == 2
+
+        en_base = page._base.findText("WETH")
+        en_contra = page._contra.findText("WETH")
+        assert en_base >= 0
+        assert en_contra >= 0
+        page._base.setCurrentIndex(en_base)
+        page._contra.setCurrentIndex(en_contra)
+
+        assert page._routes.count() == 0
+        assert page._detail.isHidden() is True
+        assert "dos tokens distintos" in page._routes_empty.text()
+
+
+async def test_pedir_otra_cotizacion_cancela_la_que_estaba_en_vuelo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Una petición que ya no interesa se cancela: gastaba cuota y competía.
+
+    Sin esto, cambiar el importe dos veces dejaba dos rondas completas de
+    consultas corriendo a la vez y sólo se pintaba la última: la primera seguía
+    gastando peticiones a las fuentes públicas —que van racionadas por ventana—
+    y competía con la nueva por el mismo hueco de red.
+    """
+    async with _pagina(
+        modo=OperationMode.OBSERVATION, con_cartera=False, con_planificador=False
+    ) as (_, page):
+
+        async def lenta(seq: int | None = None) -> None:
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(page, "_do_quote", lenta, raising=True)
+
+        page._on_quote()
+        primera = page._quote_task
+        page._on_quote()
+        await asyncio.sleep(0.05)
+
+        assert primera is not None
+        assert primera.cancelled()
+        assert page._quote_task is not primera
+
+        # La última no se queda viva al acabar la prueba.
+        page._invalidate_quote()
+        await asyncio.sleep(0)
+
+
+def _tarjeta(pagina: PricesPage, fila: int) -> RouteCard:
+    """La tarjeta de una fila de la lista, que es donde vive lo que se pinta."""
+    tarjeta = pagina._routes.card(fila)
+    assert tarjeta is not None, f"sin tarjeta en la fila {fila}"
+    return tarjeta
+
+
+def _tarjeta_de(pagina: PricesPage, engine_id: str) -> RouteCard:
+    """La tarjeta del motor nombrado, sin depender del orden de la comparación."""
+    for tarjeta in pagina._routes.cards():
+        if tarjeta.quote is not None and tarjeta.quote.engine_id == engine_id:
+            return tarjeta
+    raise AssertionError(f"ninguna tarjeta es del motor «{engine_id}»")
+
+
+# --------------------------------------------------------------------------- #
+# El panel de detalle: lo que el usuario está a punto de firmar
+# --------------------------------------------------------------------------- #
+async def test_el_panel_ensena_la_ruta_elegida_con_lo_que_no_se_veia() -> None:
+    """Los datos que existían y no se enseñaban en ninguna parte.
+
+    El camino de la ruta, la cartera que recibe y el deslizamiento máximo
+    configurado. Se elige la fila como lo haría un clic —la señal de la lista
+    mueve el panel— en vez de llamar al método a mano: lo que se comprueba es
+    que el panel sigue a la selección, no que sepa pintarse.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+
+        detalle = page._detail.values
+        # El camino: un solo pool, que es el par que ya está sobre la tarjeta.
+        assert detalle["ruta"].text() == "fake · WETH → USDC"
+        # La cartera: la que firmaría, recortada, con la dirección entera en el
+        # tooltip —una dirección recortada que no se puede expandir es una
+        # dirección que no se puede comprobar—.
+        cartera = container.keys.address()
+        assert cartera is not None
+        assert detalle["cartera"].text() == shorten(cartera)
+        assert detalle["cartera"].toolTip() == cartera
+        # El deslizamiento: la tolerancia configurada, dicha como es —no cambia
+        # lo que el swap acepta, que lo fija cada motor al construir—.
+        assert detalle["deslizamiento"].text() == (
+            f"{container.settings.execution.slippage_bps} bps"
+        )
+        assert "execution.slippage_bps" in detalle["deslizamiento"].toolTip()
+
+
+#: Un coste de red con la forma del de verdad: 21 000 de gas a 1 gwei son
+#: 0,000021 ETH, el producto que enseña el panel.
+_COSTE = NetworkCost(
+    native=TokenAmount(raw=21_000 * 10**9, decimals=18, symbol="ETH"),
+    gas_limit=21_000,
+    gas_price_wei=10**9,
+    source="estimado por el nodo",
+)
+
+
+def _preparar_con(
+    monkeypatch: pytest.MonkeyPatch, resultado: PreparedSwap
+) -> None:
+    """Sustituye **la llamada** del caso de uso, no el caso de uso entero.
+
+    `can_build` se deja el de verdad —responde el registro de motores—: lo que
+    se prueba es que la página lee el desenlace del coste, no qué rutas son
+    firmables, y falsear también esa mitad dejaría la prueba midiendo al doble
+    en lugar de a la página.
+    """
+
+    async def preparar(
+        self: PrepareSwap, quote: Quote, *, recipient: str, sender: str | None = None
+    ) -> PreparedSwap:
+        return resultado
+
+    monkeypatch.setattr(PrepareSwap, "__call__", preparar)
+
+
+def _preparado(coste: NetworkCost | None, error: str | None) -> PreparedSwap:
+    """Un borrador con el desenlace de coste que se quiera medir."""
+    return PreparedSwap(
+        transaction=UnsignedTransaction(
+            chain_id=8453,
+            to_address="0x2626664c2603336E57B271c5C0b26F421741e481",
+            calldata="0xdeadbeef",
+            value=TokenAmount(raw=0, decimals=18, symbol="ETH"),
+            description="Swap de prueba",
+        ),
+        network_cost=coste,
+        cost_error=error,
+    )
+
+
+@pytest.mark.parametrize(
+    ("coste", "error", "esperado", "color"),
+    [
+        # La estimación salió: la cifra, con «≈» porque es un techo.
+        (_COSTE, None, "≈ 0.000021 ETH", ""),
+        # Se intentó y no salió: el motivo, en ámbar y sin bloquear nada.
+        (
+            None,
+            "execution reverted: ERC20: transfer amount exceeds allowance",
+            "no se pudo estimar",
+            COLOR_WARNING,
+        ),
+        # No aplica —una transacción de Solana—: raya en gris apagado, que no es
+        # un cero ni una cifra.
+        (None, None, "—", COLOR_MUTED),
+    ],
+)
+async def test_el_coste_de_red_del_panel_cuenta_el_desenlace(
+    monkeypatch: pytest.MonkeyPatch,
+    coste: NetworkCost | None,
+    error: str | None,
+    esperado: str,
+    color: str,
+) -> None:
+    """Los tres desenlaces del coste, y ninguno disfrazado de cero.
+
+    La fila empieza en «se estima al preparar» —la cifra es una llamada a la red
+    por ruta y no se hace al comparar precios— y al preparar enseña lo que
+    devolvió el caso de uso. Lo que no puede pasar es que un fallo de estimación
+    tumbe la preparación ni que el hueco se rellene con un cero: el borrador
+    sale igual y el motivo se lee en el tooltip.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (_, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+        assert page._detail.values["coste"].text() == "se estima al preparar"
+
+        _preparar_con(monkeypatch, _preparado(coste, error))
+        await page._do_prepare(page._shown_quotes[0], page._owner())
+
+        etiqueta = page._detail.values["coste"]
+        assert etiqueta.text() == esperado
+        # La cifra no lleva color; el fallo va en ámbar y la raya en gris apagado,
+        # para que ninguno de los dos se lea como una cifra.
+        assert etiqueta.styleSheet() == (f"color: {color};" if color else "")
+        if error is not None:
+            assert error in etiqueta.toolTip()
+        # Y el borrador queda preparado igual: el coste es información, no un muro.
+        assert page._save_btn.isEnabled() is True
+
+
+async def test_el_coste_estimado_no_sobrevive_a_cambiar_de_ruta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La cifra es de **una** ruta: al elegir otra vuelve a «se estima al preparar».
+
+    Dejar escrita la estimación de otro swap al lado de la ruta nueva sería
+    enseñar un coste que no es el suyo, que es una forma de firmar algo distinto
+    de lo que se leyó.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION,
+        con_cartera=True,
+        con_planificador=True,
+        motores=["uniswap", "geckoterminal"],
+    ) as (_, page):
+        page._comparison = _comparacion_mixta()
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+
+        _preparar_con(monkeypatch, _preparado(_COSTE, None))
+        await page._do_prepare(page._shown_quotes[0], page._owner())
+        assert page._detail.values["coste"].text() == "≈ 0.000021 ETH"
+
+        page._routes.select_row(1)
+
+        assert page._detail.values["coste"].text() == "se estima al preparar"
 
 
 async def test_el_boton_de_invertir_se_lee_sin_depender_de_la_fuente() -> None:

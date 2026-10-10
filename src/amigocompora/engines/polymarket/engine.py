@@ -18,6 +18,13 @@ Dos cosas que conviene saber al leer la tabla que produce:
   llenaría la tabla de probabilidades del 100 % que no son una predicción de
   nada. Cuando lo que se busca es **lo que está terminando**, el orden pasa a
   ser el del reloj y la ventana se filtra contra la fecha de cierre.
+- El orden se puede pedir por nombre propio —`createdAt` para lo recién creado,
+  `volume24hr` para lo que se mueve— y la lista se filtra por categoría
+  (`tag_id`), pero las dos cosas se vuelven a aplicar aquí: pedirlas gasta el
+  `limit` en lo que se quiere ver, y aplicarlas mantiene la lista correcta
+  aunque la fuente ignore el parámetro. Las **etiquetas** —que la fuente publica
+  en el evento, no en el mercado— se traen aparte, en una consulta de adorno que
+  cuando falla cuesta la etiqueta, nunca la fila.
 
 Sin API key: la API Gamma es pública y de sólo lectura.
 """
@@ -26,11 +33,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
+from urllib.parse import quote
 
 import structlog
 
@@ -40,10 +48,12 @@ from amigocompora.domain.models import (
     DepthLevel,
     MarketDepth,
     MarketOutcome,
+    MarketTag,
     PredictionMarket,
     PredictionOrder,
     PredictionPosition,
     PredictionSide,
+    PredictionSort,
     SignedPredictionOrder,
     SubmittedPredictionOrder,
     Token,
@@ -175,6 +185,14 @@ _WALLET_BATCH_DEADLINE_SECONDS: Final = 1800
 _OVERFETCH: Final = 3
 _MAX_FETCH: Final = 200
 
+#: Cuántos eventos se piden por llamada al traer las etiquetas. Medido el
+#: 2026-10-09: la fuente admite varios `id` repetidos en una consulta (la coma
+#: no: «invalid integer»), y un evento entero con todos sus mercados llega a
+#: pesar cientos de kilobytes —60 eventos trajeron 8,3 MB—, así que el lote se
+#: queda corto a propósito: las etiquetas son adorno y no pueden costar más que
+#: la lista que adornan.
+_EVENT_BATCH: Final = 40
+
 
 class PolymarketEngine:
     """Mercados de predicción reales, de sólo lectura."""
@@ -220,6 +238,8 @@ class PolymarketEngine:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
         """Mercados abiertos.
 
@@ -228,11 +248,22 @@ class PolymarketEngine:
         reloj —lo que antes cierra, primero— y sólo entran los que cierran dentro
         de esa ventana, que es la vista de «lo que está terminando».
 
-        Ese orden se pide a la fuente **y** se vuelve a aplicar aquí. Pedirlo
-        hace que el `limit` se gaste en lo que cierra pronto en vez de en lo que
-        cierra dentro de un año; aplicarlo aquí hace que la lista sea correcta
-        aunque la fuente ignore los parámetros, que es lo que se comprueba en las
-        pruebas con una respuesta que no los respeta.
+        `sort` pide el orden por nombre propio —`createdAt` para lo recién
+        creado, `volume24hr` para lo que se mueve ahora— y `category` filtra por
+        `tag_id`. Ese orden se pide a la fuente **y** se vuelve a aplicar aquí.
+        Pedirlo hace que el `limit` se gaste en lo que se quiere ver; aplicarlo
+        aquí hace que la lista sea correcta aunque la fuente ignore los
+        parámetros, que es lo que se comprueba en las pruebas con una respuesta
+        que no los respeta. Con la categoría vale lo mismo, con una salvedad:
+        sólo se descarta en cliente un mercado del que **consta** que no es de
+        la etiqueta —uno sin etiquetas se queda, porque no se puede afirmar que
+        no la lleve—.
+
+        El umbral de liquidez —el mismo con el que se descartan los mercados
+        cuyo precio no significa nada— viaja además a la fuente
+        (`liquidity_num_min`): sin él, la vista de lo recién creado se gasta el
+        límite en mercados que todavía no tienen liquidez y se queda en cero
+        filas, que es lo que se midió con datos reales el 2026-10-09.
 
         El filtro por texto se aplica en cliente sobre la pregunta del mercado:
         así el comportamiento del buscador no depende de parámetros de la API
@@ -246,20 +277,32 @@ class PolymarketEngine:
         requested = min(limit * (_OVERFETCH * 4 if needle else _OVERFETCH), _MAX_FETCH)
 
         now = self._clock.now()
+        order, ascending = _order_params(closing_within, sort)
         params = {
             "closed": "false",
             "active": "true",
             "limit": str(requested),
-            "order": "endDate" if closing_within is not None else "volumeNum",
-            "ascending": "true" if closing_within is not None else "false",
+            "order": order,
+            "ascending": ascending,
+            # El umbral de liquidez se pide **también** a la fuente. Medido el
+            # 2026-10-09 con datos reales: los cien mercados más nuevos no
+            # llegaban al umbral —recién creados, todavía sin liquidez— y la
+            # vista «más nuevas» se quedaba en cero filas con el orden bien
+            # pedido, porque el `limit` se gastaba en filas que se tiran aquí.
+            # Pidiéndolo, llegan las más nuevas **entre las operables**.
+            "liquidity_num_min": str(MIN_LIQUIDITY_USD),
         }
         if closing_within is not None:
             params["end_date_min"] = _iso(now)
             params["end_date_max"] = _iso(now + closing_within)
+        if category is not None:
+            # Medido el 2026-10-09: `/markets` filtra de verdad por `tag_id` (un
+            # id inexistente devuelve lista vacía) y no entiende `tag_slug`.
+            params["tag_id"] = category.tag_id
 
         payload = await self._source.get_json(f"{API_ROOT}/markets", params=params)
 
-        found: list[PredictionMarket] = []
+        selected: list[tuple[Mapping[str, Any], PredictionMarket]] = []
         for raw in as_sequence(payload, "markets", SOURCE_NAME):
             entry = raw if isinstance(raw, dict) else {}
             if needle and needle not in str(entry.get("question") or "").lower():
@@ -271,9 +314,26 @@ class PolymarketEngine:
                 remaining = market.time_left(now)
                 if remaining is None or remaining > closing_within:
                     continue
-            found.append(market)
-            if len(found) >= limit:
+            selected.append((entry, market))
+            if len(selected) >= limit:
                 break
+
+        tag_map = await self._event_tags(entry for entry, _ in selected)
+        found = [
+            replace(market, tags=_merge_event_tags(entry, tag_map))
+            for entry, market in selected
+        ]
+        if category is not None:
+            found = [
+                market
+                for market in found
+                if not market.tags
+                or any(tag.slug == category.slug for tag in market.tags)
+            ]
+        if sort is PredictionSort.NEWEST:
+            found.sort(key=_created_key, reverse=True)
+        elif sort is PredictionSort.TRENDING:
+            found.sort(key=_volume24h_key, reverse=True)
         return tuple(found)
 
     async def market(self, market_id: str) -> PredictionMarket:
@@ -289,7 +349,7 @@ class PolymarketEngine:
                 f"puede leer como mercado de predicción: puede estar cerrado, "
                 f"sin liquidez o sin precios publicados."
             )
-        return market
+        return await self._with_event_tags(payload, market)
 
     async def market_by_condition(self, condition_id: str) -> PredictionMarket:
         """El mercado de una posición, por el `conditionId` de su contrato.
@@ -313,12 +373,76 @@ class PolymarketEngine:
             entry = raw if isinstance(raw, dict) else {}
             market = self._to_market(entry, now)
             if market is not None:
-                return market
+                return await self._with_event_tags(entry, market)
         raise EngineNotFoundError(
             f"el mercado con condición «{condition_id}» no está en {SOURCE_NAME} "
             f"como mercado operativo: puede estar cerrado, resuelto o sin "
             f"liquidez publicada."
         )
+
+    async def _with_event_tags(
+        self, entry: Mapping[str, Any], market: PredictionMarket
+    ) -> PredictionMarket:
+        """El mismo mercado con las etiquetas de sus eventos.
+
+        Para un mercado suelto —el que se abre desde una posición, por ejemplo—
+        es una llamada más; para la lista, `markets` pide todos los eventos de
+        una vez. El modelo es inmutable, así que se reasigna con `replace`.
+        """
+        tag_map = await self._event_tags((entry,))
+        return replace(market, tags=_merge_event_tags(entry, tag_map))
+
+    async def _event_tags(
+        self, entries: Iterable[Mapping[str, Any]]
+    ) -> dict[str, tuple[MarketTag, ...]]:
+        """Las etiquetas de los eventos de estos mercados, por id de evento.
+
+        Hace falta esta llamada porque la fuente no publica las categorías en el
+        mercado sino en el **evento** que lo contiene (medido el 2026-10-09), y
+        el evento embebido en el mercado llega sin ellas. Es una lectura de
+        adorno: si un lote falla, se devuelve lo que haya y se registra el aviso
+        —una etiqueta que falta cuesta menos que una lista que no llega—.
+
+        Se piden varios eventos por llamada con `id` repetido —la coma la
+        rechaza la fuente— y el `limit` va explícito, porque el de por omisión no
+        está medido. La consulta va cosida en la URL porque un diccionario de
+        `params` no puede expresar una clave repetida.
+        """
+        ids: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            for event_id in _event_ids(entry):
+                if event_id not in seen:
+                    seen.add(event_id)
+                    ids.append(event_id)
+
+        tags: dict[str, tuple[MarketTag, ...]] = {}
+        for start in range(0, len(ids), _EVENT_BATCH):
+            batch = ids[start : start + _EVENT_BATCH]
+            query = "&".join(f"id={quote(event_id, safe='')}" for event_id in batch)
+            try:
+                payload = await self._source.get_json(
+                    f"{API_ROOT}/events?{query}&limit={len(batch)}"
+                )
+                events = as_sequence(payload, "events", SOURCE_NAME)
+            except Exception as error:
+                # Deliberadamente ancho: cualquier fallo de este adorno —red,
+                # formato, un lote que la fuente rechaza— se queda en un aviso y
+                # la lista sigue sin etiquetas. Lo que no puede pasar es que se
+                # caiga la búsqueda entera por una consulta que sólo decora.
+                _log.warning(
+                    "polymarket.event_tags_failed", events=len(batch), reason=str(error)
+                )
+                continue
+            for raw in events:
+                if not isinstance(raw, dict):
+                    continue
+                # Nombre distinto del `event_id` de arriba: aquí es `str | None`
+                # —la respuesta puede venir sin id— y allí siempre es `str`.
+                read_id = _id_text(raw.get("id"))
+                if read_id is not None:
+                    tags[read_id] = _to_tags(raw.get("tags"))
+        return tags
 
     # ----------------------------------------------------------------- #
     # Traducción
@@ -361,6 +485,16 @@ class PolymarketEngine:
                 neg_risk=_optional_bool(entry.get("negRisk")),
                 tick_size=optional_decimal(entry.get("orderPriceMinTickSize")),
                 min_order_size=optional_decimal(entry.get("orderMinSize")),
+                created_at=_parse_moment(entry.get("createdAt")),
+                volume=_non_negative(entry.get("volumeNum")),
+                volume_24h=_non_negative(entry.get("volume24hr")),
+                # La liquidez ya se leyó arriba para descartar el mercado; se
+                # reutiliza la misma cifra en vez de volver a leerla.
+                liquidity=liquidity,
+                spread=_non_negative(entry.get("spread")),
+                price_change_1h=_price_delta(entry.get("oneHourPriceChange")),
+                price_change_24h=_price_delta(entry.get("oneDayPriceChange")),
+                price_change_1w=_price_delta(entry.get("oneWeekPriceChange")),
             )
         except Exception as error:
             _log.debug("polymarket.market_skipped", market_id=market_id, reason=str(error))
@@ -1066,6 +1200,146 @@ def _parse_moment(value: Any) -> datetime | None:
     except ValueError:
         return None
     return moment if moment.tzinfo is not None else None
+
+
+def _non_negative(value: Any) -> Decimal | None:
+    """Una cifra de la fuente que no puede ser negativa, o `None`.
+
+    Un volumen o una liquidez negativos no existen: si llegan así es una fila
+    mal publicada, y se descarta **el dato**, no el mercado —estas cifras son
+    para mirar, y el mercado sigue sirviendo—.
+    """
+    cifra = optional_decimal(value)
+    if cifra is None or cifra < 0:
+        return None
+    return cifra
+
+
+def _price_delta(value: Any) -> Decimal | None:
+    """Un cambio de precio, o `None` si no es un delta creíble.
+
+    Medido el 2026-10-09: la fuente publica el cambio en **unidades de precio**
+    —un mercado cuyo «sí» pasó de 0.445 a 0.235 trae `oneDayPriceChange` de
+    -0.21, exactamente el delta—, así que un valor fuera de [-1, 1] no puede
+    venir de dos precios de [0, 1]. Se descarta el dato y no el mercado: la
+    tendencia es adorno.
+    """
+    delta = optional_decimal(value)
+    if delta is None or abs(delta) > 1:
+        return None
+    return delta
+
+
+def _order_params(
+    closing_within: timedelta | None, sort: PredictionSort | None
+) -> tuple[str, str]:
+    """El campo y la dirección con los que la fuente ordena la lista.
+
+    Devuelve `(order, ascending)` listos para el parámetro. `closing_within`
+    manda sobre `sort` —la vista de la ventana es la de lo que está
+    terminando— y un `sort` ausente o de los que ordena este lado cae en el
+    volumen de siempre.
+    """
+    if closing_within is not None:
+        return "endDate", "true"
+    if sort is PredictionSort.NEWEST:
+        return "createdAt", "false"
+    if sort is PredictionSort.TRENDING:
+        return "volume24hr", "false"
+    return "volumeNum", "false"
+
+
+def _created_key(market: PredictionMarket) -> datetime:
+    """La fecha de creación para ordenar: un mercado sin fecha va al final.
+
+    Se ordena con `reverse=True`, así que la clave vacía tiene que ser la
+    **mínima** para caer al final: no consta cuándo se creó, y ponerlo primero
+    sería afirmar que es el más nuevo de todos.
+    """
+    return market.created_at or datetime.min.replace(tzinfo=UTC)
+
+
+def _volume24h_key(market: PredictionMarket) -> Decimal:
+    """El volumen de 24 h para ordenar: un mercado sin dato va al final, no primero."""
+    return market.volume_24h if market.volume_24h is not None else Decimal(-1)
+
+
+def _event_ids(entry: Mapping[str, Any]) -> tuple[str, ...]:
+    """Los identificadores de los eventos que contienen este mercado.
+
+    Medido: el mercado trae sus eventos embebidos en `events`, y las etiquetas
+    sólo viven en el evento, no en el mercado.
+    """
+    events = entry.get("events")
+    if not isinstance(events, list):
+        return ()
+    ids: list[str] = []
+    for raw in events:
+        if not isinstance(raw, dict):
+            continue
+        event_id = _id_text(raw.get("id"))
+        if event_id is not None:
+            ids.append(event_id)
+    return tuple(ids)
+
+
+def _merge_event_tags(
+    entry: Mapping[str, Any], tags_by_event: Mapping[str, Sequence[MarketTag]]
+) -> tuple[MarketTag, ...]:
+    """Las etiquetas de los eventos del mercado, sin slug repetido.
+
+    Un mercado puede colgar de varios eventos y compartir etiqueta con más de
+    uno; se queda la primera aparición. Un evento sin etiquetas —o cuya consulta
+    falló— simplemente no aporta: no hay nada que inventar.
+    """
+    merged: list[MarketTag] = []
+    seen: set[str] = set()
+    for event_id in _event_ids(entry):
+        for tag in tags_by_event.get(event_id, ()):
+            if tag.slug not in seen:
+                seen.add(tag.slug)
+                merged.append(tag)
+    return tuple(merged)
+
+
+def _id_text(value: Any) -> str | None:
+    """Un identificador de la fuente, venga como cadena o como número.
+
+    Gamma publica el id del evento como número y el de la etiqueta como cadena
+    (medido), así que leerlo con `_optional_text` perdería la mitad.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value >= 0 else None
+    return _optional_text(value)
+
+
+def _to_tags(value: Any) -> tuple[MarketTag, ...]:
+    """Traduce las etiquetas de un evento, descartando lo ilegible.
+
+    Se enseñan **tal cual las publica la fuente**: junto a categorías de verdad
+    (`Politics`, `Crypto`) publica etiquetas suyas de organización (`Recurring`,
+    `Hide From New`), y elegir aquí cuáles son «categorías» sería decidir por el
+    usuario qué puede filtrar. El selector de la interfaz se ordena por número
+    de mercados, y con eso las que organizan la lista quedan arriba sin borrar
+    ninguna.
+    """
+    if not isinstance(value, list):
+        return ()
+    tags: list[MarketTag] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        tag_id = _id_text(raw.get("id"))
+        label = _optional_text(raw.get("label"))
+        slug = _optional_text(raw.get("slug"))
+        if tag_id is None or label is None or slug is None or slug in seen:
+            continue
+        seen.add(slug)
+        tags.append(MarketTag(tag_id=tag_id, label=label, slug=slug))
+    return tuple(tags)
 
 
 @dataclass(frozen=True, slots=True)

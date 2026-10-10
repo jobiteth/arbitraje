@@ -160,6 +160,12 @@ class MainWindow(QMainWindow):
         # pestaña seguiría mostrando la cartera anterior —o ninguna— con la
         # misma seguridad que si fuera la correcta.
         self._settings.credentials_changed.connect(self._wallet.refresh)
+        # Cambiar de cartera —o añadir, renombrar o borrar una— pasa dentro de la
+        # propia Cartera, y el dueño que firma cambia para toda la aplicación:
+        # los gates y los saldos de swap y de predicción se releen, que es lo
+        # mismo que ya hace un cambio de credencial.
+        self._wallet.wallet_changed.connect(self._prices.refresh_execution_state)
+        self._wallet.wallet_changed.connect(self._prediction.refresh_execution_state)
 
         # Status bar
         status = QStatusBar()

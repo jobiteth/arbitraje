@@ -56,6 +56,7 @@ def test_the_example_validates_against_the_real_settings_model() -> None:
     assert settings.active_engines["dex_quotes"] == (
         "uniswap_v3",
         "uniswap_v4",
+        "uniswap_v2",
         "geckoterminal",
     )
 
@@ -90,3 +91,6 @@ def test_the_example_declares_the_settings_it_documents() -> None:
     assert documento["watch_addresses"] == []
     assert documento["mode"] == "observation"
     assert documento["execution"]["enabled"] is False
+    # La sección de presentación se enseña sin comentar, con el valor por
+    # omisión: es la vista que ya trae el producto, no un ejemplo a ciegas.
+    assert documento["ui"]["hide_quote_only_routes"] is False

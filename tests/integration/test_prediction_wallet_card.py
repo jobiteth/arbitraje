@@ -1,4 +1,4 @@
-"""La tarjeta «Wallet de depósito»: ver el saldo, ver las posiciones y volver a operar.
+"""El panel «Wallet de depósito»: ver el saldo, ver las posiciones y volver a operar.
 
 Lo que se fija aquí es la pestaña, no el caso de uso: leer de verdad —con su
 emisor y sus peticiones— tiene pruebas propias, y lo que esta tarjeta tiene que
@@ -23,7 +23,7 @@ registro, la guarda de modo y los widgets de Qt.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -32,7 +32,13 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton, QTableWidget, QTableWidgetItem
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+)
 
 from amigocompora.app.container import Container, build_container
 from amigocompora.app.usecases.read_settlement_wallet import SettlementWalletView
@@ -42,9 +48,11 @@ from amigocompora.domain.models import (
     DepthLevel,
     MarketDepth,
     MarketOutcome,
+    MarketTag,
     PredictionMarket,
     PredictionPosition,
     PredictionSide,
+    PredictionSort,
     Token,
     Venue,
     VenueKind,
@@ -153,8 +161,10 @@ class MotorFalso:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
-        del search, closing_within
+        del search, closing_within, category, sort
         return tuple(_MERCADOS[:limit])
 
     async def market(self, market_id: str) -> PredictionMarket:
@@ -308,6 +318,21 @@ async def _ceder() -> None:
     await asyncio.sleep(0)
 
 
+async def _abrir(pagina: PredictionPage, fila: int = 0) -> None:
+    """Busca, elige una fila y deja la tarjeta del mercado cargada.
+
+    Se pulsan los botones de verdad —Buscar y la fila— porque lo que se prueba
+    es la cadena entera: la tarjeta se abre con el mercado y lanza sola la
+    lectura del saldo.
+    """
+    pagina._on_search()
+    while not pagina._btn.isEnabled():
+        await _ceder()
+    pagina._table.selectRow(fila)
+    for _ in range(20):
+        await _ceder()
+
+
 async def _leer(pagina: PredictionPage, lectura: LecturaFalsa) -> None:
     """Pulsa «Leer la wallet» y espera a que vuelva, como haría `spawn` en Qt.
 
@@ -402,6 +427,10 @@ async def test_vender_desde_una_posicion_carga_la_tarjeta_de_orden(
     lectura = LecturaFalsa(_vista(_posicion()))
     async with _pagina(monkeypatch, lectura) as (_, pagina, motor):
         await _leer(pagina, lectura)
+        # Al cerrarse el panel —si estuviera abierto— y saltar a la tarjeta se
+        # avisa con la señal de Qt, que es la verdad de «se cerró».
+        cerrados: list[int] = []
+        pagina._wallet_panel.finished.connect(cerrados.append)
         _accion(pagina, 0, "Vender").click()
         for _ in range(50):
             # Se espera también al libro: la carga lo pide en segundo plano, y
@@ -412,6 +441,10 @@ async def test_vender_desde_una_posicion_carga_la_tarjeta_de_orden(
 
         assert pagina._chosen_market is not None
         assert pagina._chosen_market.market_id == "con-posicion"
+        # La tarjeta sustituye a la lista: revisar y publicar pasa allí, y el
+        # panel de la wallet se cierra para no taparlo.
+        assert pagina._views.currentIndex() == 1
+        assert cerrados == [int(QDialog.DialogCode.Accepted)]
         assert pagina._side_value() is PredictionSide.SELL
         # La posición entera, sin redondear hacia arriba: se vende lo que hay.
         assert Decimal(str(pagina._shares.value())) == Decimal("12.5")
@@ -425,19 +458,33 @@ async def test_vender_desde_una_posicion_carga_la_tarjeta_de_orden(
 async def test_comprar_mas_propone_el_minimo_del_mercado(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """«Comprar más» no propone vender nada: propone el menor compromiso posible."""
+    """«Comprar más» no propone vender nada: propone el menor compromiso posible.
+
+    El mínimo del mercado se pone **en dinero** —el lado en el que se escribe la
+    compra— al precio propuesto, y las participaciones salen de ahí. Con el
+    libro a la vista ese precio es el mejor ask; si es más alto que el
+    publicado, el importe mínimo ya no llega al mínimo de participaciones y la
+    tarjeta lo dice con su motivo en vez de subir el dinero sola —subirlo sería
+    comprar más de lo que se escribió—.
+    """
     lectura = LecturaFalsa(_vista(_posicion()))
-    async with _pagina(monkeypatch, lectura) as (_, pagina, _):
+    async with _pagina(monkeypatch, lectura) as (_, pagina, motor):
         await _leer(pagina, lectura)
         _accion(pagina, 0, "Comprar más").click()
         for _ in range(50):
-            if pagina._chosen_market is not None:
+            if pagina._chosen_market is not None and motor.libros_pedidos:
                 break
             await _ceder()
 
         assert pagina._chosen_market is not None
         assert pagina._side_value() is PredictionSide.BUY
-        assert Decimal(str(pagina._shares.value())) == Decimal("5")
+        # El mínimo en dinero al precio publicado (0,60): 5 x 0,60 = 3,00 $.
+        assert Decimal(str(pagina._amount.value())) == Decimal("3.00")
+        # Con el ask del libro (0,62) son 4,83 participaciones: por debajo del
+        # mínimo, y eso se dice —en la línea de reglas del mercado, que es
+        # donde el mínimo vive ahora y se lee en las dos caras—.
+        assert Decimal(str(pagina._shares.value())) == Decimal("4.83")
+        assert "mínimo del mercado: 5" in pagina._market_limits.text()
 
 
 async def test_una_posicion_resuelta_se_apaga_con_el_motivo_escrito(
@@ -474,6 +521,81 @@ async def test_una_posicion_resuelta_se_apaga_con_el_motivo_escrito(
         assert "ya resolvió" in vender.toolTip()
         # La fila abierta sigue operativa: apagar es de la resuelta, no de la tabla.
         assert _accion(pagina, 0, "Vender").isEnabled()
+
+
+def _exec_de_mentira(abiertos: list[str]) -> Callable[[], int]:
+    """Un `exec` que no bloquea: anota la apertura y vuelve como «aceptado».
+
+    Se sustituye en la instancia —Shiboken no deja tocar la clase— para que el
+    modal no se quede esperando en una prueba sin pantalla.
+    """
+
+    def _exec() -> int:
+        abiertos.append("panel")
+        return int(QDialog.DialogCode.Accepted)
+
+    return _exec
+
+
+# --------------------------------------------------------------------------- #
+# El saldo en la tarjeta del mercado, y el panel que abre
+# --------------------------------------------------------------------------- #
+async def test_abrir_una_tarjeta_lee_el_saldo_y_lo_ensena_en_las_dos_caras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El saldo va junto al formulario de las dos caras, y se lee una vez.
+
+    La tarjeta lo lee sola al abrirse —es la cifra que decide si una compra
+    cabe—, y una sola vez por sesión: pasear por mercados no puede golpear la
+    fuente en cada fila.
+    """
+    lectura = LecturaFalsa(_vista(_posicion()))
+    async with _pagina(monkeypatch, lectura) as (_, pagina, _):
+        assert pagina._wallet_balance_buy.text() == "—"
+
+        await _abrir(pagina)
+        for _ in range(50):
+            if "0.95" in pagina._wallet_balance_buy.text():
+                break
+            await _ceder()
+
+        assert "0.95 pUSD" in pagina._wallet_balance_buy.text()
+        assert "0.95 pUSD" in pagina._wallet_balance_sell.text()
+        assert lectura.lecturas == 1
+
+        # Abrir otra vez —aunque sea el mismo mercado— no vuelve a leer.
+        await _abrir(pagina)
+        for _ in range(10):
+            await _ceder()
+        assert lectura.lecturas == 1
+
+
+async def test_el_saldo_de_las_dos_caras_abre_el_panel_de_la_wallet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El botón de al lado abre el panel: operar la wallet sin salir de la tarjeta.
+
+    `exec` se sustituye en la instancia —Shiboken no deja tocar la clase— para
+    que el modal no bloquee; lo que se comprueba es que las dos caras tienen su
+    botón y que las dos abren el mismo panel, el que enseña el saldo, las
+    posiciones, «Añadir saldo» y el QR.
+    """
+    lectura = LecturaFalsa(_vista(_posicion()))
+    async with _pagina(monkeypatch, lectura) as (_, pagina, _):
+        abiertos: list[str] = []
+        pagina._wallet_panel.exec = _exec_de_mentira(abiertos)  # type: ignore[method-assign]
+
+        pagina._wallet_open_btn_buy.click()
+        pagina._side.setCurrentIndex(pagina._side.findData(PredictionSide.SELL))
+        pagina._wallet_open_btn_sell.click()
+        for _ in range(50):
+            if lectura.lecturas >= 1:
+                break
+            await _ceder()
+
+        assert abiertos == ["panel", "panel"]
+        # El panel abierto sin lectura previa la lanza: se viene a mirarla.
+        assert lectura.lecturas >= 1
 
 
 # --------------------------------------------------------------------------- #

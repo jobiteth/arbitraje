@@ -297,6 +297,28 @@ async def test_the_container_wires_signing_and_broadcasting() -> None:
         await container.aclose()
 
 
+async def test_el_coste_de_red_se_estima_con_los_mismos_emisores_que_firman() -> None:
+    """El estimador y el firmante comparten **el mismo** mapa de emisores.
+
+    Un mapa propio para estimar sería un segundo sitio donde el pool de una red
+    puede quedar distinto del otro sin que nada lo diga, y aquí se está
+    enseñando una cifra que el usuario va a comparar contra el gas que de verdad
+    pague. La identidad —y no la igualdad— es la afirmación: dos mapas con el
+    mismo contenido hoy pueden separarse mañana.
+    """
+    container = await build_container(
+        Settings(),
+        secret_store=InMemorySecretStore(),
+        configure_logs=False,
+    )
+    try:
+        estimador = container.prepare_swap.estimate
+        assert estimador is not None, "sin estimador el panel nunca tendría cifra"
+        assert estimador.broadcasters is container.execute_swap.broadcasters
+    finally:
+        await container.aclose()
+
+
 @pytest.mark.parametrize("permitido", [True, False])
 async def test_the_env_fallback_flag_reaches_the_provider(
     permitido: bool,

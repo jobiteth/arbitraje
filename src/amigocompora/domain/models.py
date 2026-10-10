@@ -219,6 +219,103 @@ _MEASUREMENT_LABELS: Final[dict[Measurement, str]] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Rutas de un swap
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class RouteHop:
+    """Un tramo de un swap multi-salto: de `base` a `quote` por un pool.
+
+    Los tokens son los **del pool**, no los del par. La diferencia importa
+    cuando un lado es la moneda nativa: los AMM no operan con ella, así que un
+    tramo que la toca nombra a su envoltorio ERC-20 —el token que de verdad
+    cruza el pool—, y quien construye es quien traduce «nativo» a «envoltorio»
+    al pagar o al recibir. La ruta describe el camino real que se ejecuta.
+    """
+
+    base: Token
+    quote: Token
+    #: Comisión del pool de este tramo, cuando el protocolo la lleva en la ruta.
+    #: `None` cuando reconstruirla no la necesita —V2 la cobra fija dentro del
+    #: contrato— o cuando el protocolo no la pone ahí. No significa «gratis».
+    fee_bps: BasisPoints | None = None
+
+    def __post_init__(self) -> None:
+        if self.base.chain != self.quote.chain:
+            raise InvalidAmountError(
+                f"un tramo no puede cruzar de red: {self.base.symbol} está en "
+                f"«{self.base.chain}» y {self.quote.symbol} en «{self.quote.chain}»"
+            )
+        if self.base.is_same_asset(self.quote):
+            raise InvalidAmountError(
+                f"un tramo de {self.base.symbol} a {self.base.symbol} no es un "
+                f"tramo: el mismo token no tiene pool contra sí mismo"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class SwapRoute:
+    """El camino de un swap cuando cruza **más de un pool**, tramo a tramo.
+
+    Existe porque un swap no siempre es un solo pool. Cuando el par no tiene
+    pool propio —o lo tiene sin liquidez para ese tamaño— el camino pasa por
+    un token intermedio: vender A, comprar B, y con B comprar C. Eso es **un
+    solo swap atómico** para el usuario, pero no es un solo sitio, y el motor
+    que lo construye necesita saber por dónde iba para volver a cotizar el
+    mismo camino al firmar. Antes esto no se podía expresar: una `Quote` es de
+    un venue y punto.
+
+    `Quote.route is None` significa «fue un solo pool», que sigue siendo el
+    caso normal y el que no necesita representación ninguna. Una ruta exige
+    **dos tramos o más**: un único tramo no se describe, se ejecuta.
+
+    La contigüidad se valida aquí y no en cada motor: dos tramos sueltos que no
+    encajan son una ruta que no existe, y dejarla construir produciría un
+    calldata que nadie puede ejecutar.
+    """
+
+    hops: tuple[RouteHop, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.hops) < 2:
+            raise InvalidAmountError(
+                f"una ruta multi-salto necesita al menos dos tramos y llegaron "
+                f"{len(self.hops)}: un solo tramo se cotiza como un pool directo"
+            )
+        for index in range(len(self.hops) - 1):
+            earlier = self.hops[index]
+            later = self.hops[index + 1]
+            if not earlier.quote.is_same_asset(later.base):
+                raise InvalidAmountError(
+                    f"el tramo {index + 1} sale por {earlier.quote.symbol} y el "
+                    f"{index + 2} entra por {later.base.symbol}: una ruta cuyos "
+                    f"tramos no encadenan no llega a ningún sitio"
+                )
+
+    @property
+    def tokens(self) -> tuple[Token, ...]:
+        """Todos los tokens del camino, en orden: el de entrada primero.
+
+        De `n` tramos salen `n + 1` tokens, y es exactamente lo que piden los
+        codificadores: el `path[]` de V2, el camino empaquetado de V3 y la
+        lista de `PathKey` de V4 se construyen todos desde esta secuencia.
+        """
+        return (self.hops[0].base, *(hop.quote for hop in self.hops))
+
+    @property
+    def total_fee_bps(self) -> BasisPoints | None:
+        """La comisión de todo el camino, o `None` si algún tramo no la lleva.
+
+        Se **suma** y no se compone: con dos tramos del 0,05 % el precio de
+        ejecución baja un 0,1 % aproximadamente, y la suma es la cifra que un
+        usuario reconoce. Componerla al dígito —1 - 0,9995²— daría 9,998 bps
+        donde la suma da 10, una precisión que no cambia ninguna decisión.
+        """
+        if any(hop.fee_bps is None for hop in self.hops):
+            return None
+        return BasisPoints(sum(hop.fee_bps.value for hop in self.hops if hop.fee_bps))
+
+
 @dataclass(frozen=True, slots=True)
 class Quote:
     """Resultado de cotizar «vender `amount_in` de base por quote» en un venue.
@@ -308,6 +405,17 @@ class Quote:
     impact_basis: Measurement | None = Measurement.DERIVED
     #: Nota del motor sobre cómo se obtuvo la cifra, para mostrar junto al dato.
     source_note: str = ""
+    #: El camino por el que este swap se ejecuta, cuando cruza más de un pool.
+    #:
+    #: `None` es «un solo pool», que es el caso normal y el de casi todas las
+    #: cotizaciones. Cuando hay ruta, es la del motor que cotizó y **sólo él
+    #: sabe construirla**: el contrato de `DexQuoteEngine` que recupera el
+    #: payload re-cotiza y construye ese mismo camino, no «el mejor de ahora».
+    #: Se publica en la cotización, y no se guarda en el motor, porque la
+    #: cotización puede sobrevivir al motor que la produjo —se compara, se
+    #: guarda, se enseña en otra pantalla— y el payload tiene que corresponder
+    #: a lo que el usuario leyó.
+    route: SwapRoute | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
@@ -349,6 +457,15 @@ class Quote:
             raise InvalidAmountError("amount_in debe ser positivo")
         if self.amount_out.raw < 0:
             raise InvalidAmountError("amount_out no puede ser negativo")
+        # Una ruta se ejecuta en la red del par. No se comprueba que sus tokens
+        # sean los del par —el nativo se ejecuta por su envoltorio y comparar
+        # contra la base nativa daría un falso desajuste—, pero una ruta en otra
+        # red es un error del motor que la construyó, y se corta al publicarla.
+        if self.route is not None and self.route.hops[0].base.chain != self.pair.chain:
+            raise InvalidAmountError(
+                f"la ruta de la cotización va por «{self.route.hops[0].base.chain}» "
+                f"y el par {self.pair.symbol} está en «{self.pair.chain}»"
+            )
 
     @property
     def fee_is_known(self) -> bool:
@@ -891,6 +1008,43 @@ class MarketOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketTag:
+    """Una etiqueta del evento: la categoría con la que la fuente lo organiza.
+
+    Polymarket no publica categorías **en el mercado**: las publica en el
+    *evento* que lo contiene, y un mismo mercado puede llevar varias (medido el
+    2026-10-09: «Politics» junto a «Military Strikes»). El identificador es el
+    de la fuente —hace falta para pedirle que filtre por él— y el `slug` es la
+    clave con la que este lado vuelve a comprobar lo que llegó.
+    """
+
+    tag_id: str
+    label: str
+    slug: str
+
+    def __post_init__(self) -> None:
+        if not self.tag_id.strip() or not self.label.strip() or not self.slug.strip():
+            raise InvalidAmountError(
+                "una etiqueta necesita identificador, nombre y slug; llegó "
+                f"{self.tag_id!r}/{self.label!r}/{self.slug!r}"
+            )
+
+
+class PredictionSort(StrEnum):
+    """Con qué criterio se pide y se ordena la lista de mercados.
+
+    `VOLUME` (lo más negociado) y `COHERENCE` (lo que más se aparta del 100 %)
+    ya existían como comportamiento; `NEWEST` y `TRENDING` son los dos que la
+    fuente sabe ordenar con nombre propio (`createdAt` y `volume24hr`).
+    """
+
+    NEWEST = "newest"
+    TRENDING = "trending"
+    VOLUME = "volume"
+    COHERENCE = "coherence"
+
+
+@dataclass(frozen=True, slots=True)
 class PredictionMarket:
     """Un mercado de predicción con sus resultados mutuamente excluyentes.
 
@@ -899,6 +1053,12 @@ class PredictionMarket:
     mercado leído sin ellos siga siendo un mercado válido. Lo que no se puede es
     firmar una orden contra un mercado del que no constan: `is_tradeable` lo dice
     y `tradeability_blockers` explica cuál falta.
+
+    Los campos de actividad —fecha de creación, volumen, liquidez, diferencial y
+    cambios de precio— también valen `None` por omisión: son para **mirar** el
+    mercado (ordenarlo, pintar su tendencia), no para operarlo, y una fuente que
+    no los publique no invalida nada. `None` no se sustituye por cero en ningún
+    camino: un cero afirmaría un dato que nadie dio.
     """
 
     market_id: str
@@ -924,14 +1084,42 @@ class PredictionMarket:
     #: Salto mínimo de precio admitido. Fuera de él la orden se rechaza, así que
     #: es la tabla con la que hay que redondear antes de firmar.
     tick_size: Decimal | None = None
-    #: Participaciones mínimas por orden. Medido: en Polymarket son 5, y no es un
-    #: detalle de la interfaz —una orden por debajo se rechaza entera—.
+    #: Participaciones mínimas por orden. Medido: en Polymarket son 5 para las
+    #: órdenes que descansan en el libro —y para las ventas—; una compra que
+    #: cruza el libro se valida por importe (≥ 1 $), no por tamaño. No es un
+    #: detalle de la interfaz: una orden fuera de regla se rechaza entera.
     min_order_size: Decimal | None = None
+    #: Cuándo se creó el mercado en la fuente. Ordenar por «más nuevas» es
+    #: ordenar por esto.
+    created_at: datetime | None = None
+    #: Volumen negociado (total) y en las últimas 24 h, en unidades del colateral.
+    #: `volume_24h` es lo que mide la vista «Tendencia»: lo que se está moviendo
+    #: ahora, no lo que se movió alguna vez.
+    volume: Decimal | None = None
+    volume_24h: Decimal | None = None
+    #: Liquidez publicada: la misma cifra con la que el motor descarta los
+    #: mercados cuyo precio no significa nada.
+    liquidity: Decimal | None = None
+    #: Diferencial entre la mejor compra y la mejor venta, en unidades de precio.
+    spread: Decimal | None = None
+    #: Cuánto se ha movido el precio en la última hora / día / semana, en
+    #: **unidades de precio** —deltas por participación, no porcentajes—. Medido
+    #: contra el histórico del libro el 2026-10-09: un mercado cuyo «sí» pasó de
+    #: 0.445 a 0.235 publica `oneDayPriceChange = -0.21`, exactamente el delta.
+    price_change_1h: Decimal | None = None
+    price_change_24h: Decimal | None = None
+    price_change_1w: Decimal | None = None
+    #: Las etiquetas del evento que contiene al mercado, tal cual las publica la
+    #: fuente. Vacío no significa «sin categoría» sino «no consta»: la interfaz
+    #: enseña un guion, no una categoría inventada.
+    tags: tuple[MarketTag, ...] = ()
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
         if self.closes_at is not None:
             _require_aware(self.closes_at, "closes_at")
+        if self.created_at is not None:
+            _require_aware(self.created_at, "created_at")
         if len(self.outcomes) < 2:
             raise InvalidAmountError(
                 f"el mercado «{self.question}» necesita al menos dos resultados"
@@ -953,6 +1141,31 @@ class PredictionMarket:
                 f"el mínimo por orden de «{self.question}» debe ser positivo, "
                 f"llegó {self.min_order_size}"
             )
+        for nombre, cifra in (
+            ("el volumen", self.volume),
+            ("el volumen de 24 h", self.volume_24h),
+            ("la liquidez", self.liquidity),
+            ("el diferencial", self.spread),
+        ):
+            if cifra is not None and not (cifra.is_finite() and cifra >= 0):
+                raise InvalidAmountError(
+                    f"{nombre} de «{self.question}» no puede ser negativo, llegó {cifra}"
+                )
+        for nombre, delta in (
+            ("de una hora", self.price_change_1h),
+            ("de 24 h", self.price_change_24h),
+            ("de una semana", self.price_change_1w),
+        ):
+            # Es un delta entre dos precios de [0, 1]: fuera de [-1, 1] no puede
+            # estar, y dejarlo pasar sería pintar una tendencia imposible.
+            if delta is not None and not (delta.is_finite() and abs(delta) <= 1):
+                raise InvalidAmountError(
+                    f"el cambio de precio {nombre} de «{self.question}» debe ser un "
+                    f"delta en [-1, 1], llegó {delta}"
+                )
+        slugs = [tag.slug for tag in self.tags]
+        if len(set(slugs)) != len(slugs):
+            raise InvalidAmountError(f"etiquetas repetidas en «{self.question}»")
 
     @property
     def total_implied_probability(self) -> Decimal:

@@ -386,8 +386,8 @@ async def test_la_pantalla_dice_por_que_el_boton_esta_apagado() -> None:
         assert any("OBSERVACIÓN" in m for m in motivos)
 
         pagina._comparison = _comparacion()
-        pagina._fill_table(pagina._comparison)
-        pagina._table.selectRow(0)
+        pagina._fill_routes(pagina._comparison)
+        pagina._routes.select_row(0)
 
         assert pagina._exec_btn.isEnabled() is False
         nota = pagina._exec_note.text()

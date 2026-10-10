@@ -80,6 +80,35 @@ class KeyCustodyError(ExecutionError):
     """
 
 
+class WalletLockedError(ExecutionError):
+    """La cartera activa está cifrada y la sesión no está desbloqueada.
+
+    Es distinto de `NoWalletError` —sí hay cartera, y su clave existe— y de
+    `KeyCustodyError` —el almacén no falla—: aquí lo que falta es la contraseña,
+    que la escriba quien opera. El mensaje tiene que decir **dónde** se
+    desbloquea, porque quien lo lee acaba de pulsar «Ejecutar» y no sabe por qué
+    no pasa nada.
+    """
+
+
+class WrongPasswordError(ExecutionError):
+    """La contraseña no es la del almacén cifrado de carteras.
+
+    Ni el mensaje ni ningún log citan la contraseña ni material de clave: lo
+    único que se puede afirmar es que no abre este almacén.
+    """
+
+
+class WalletExistsError(AmigocomporaError):
+    """La cartera que se quiere añadir ya está en el libro.
+
+    No hereda de `ExecutionError` porque no falló ninguna operación: es que la
+    dirección ya está guardada, y la salida no es reintentar sino usar la que
+    hay o cambiar de clave. El mensaje dice **cuál** es, porque con varias
+    carteras un «ya existe» sin decir cuál obliga a buscarla a mano.
+    """
+
+
 class ExecutionLimitExceededError(ExecutionError):
     """La operación no cabe en los límites configurados.
 

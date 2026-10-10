@@ -10,6 +10,9 @@ Lo que se comprueba aquí, y por qué cada cosa importa:
 - Que un renglón roto no impida leer los demás. El registro lo lee la aplicación
   al arrancar, y un fichero que impide abrir el programa por su propio contenido
   es peor que el renglón perdido.
+- Que los asientos se puedan leer por token y por red, que es de donde sale
+  «Actividad» en el detalle de la cartera, y que un renglón viejo —de antes de
+  que existiera el campo de tokens— siga emparejándose por el texto del par.
 - Que no haya secretos dentro. Es un fichero de texto que crece, que se copia en
   las copias de seguridad y que acaba adjunto en un informe de fallo.
 """
@@ -24,7 +27,13 @@ from pathlib import Path
 import pytest
 from structlog.testing import capture_logs
 
-from amigocompora.app.execution_policy import ExecutionLedger, LedgerEntry
+from amigocompora.app.execution_policy import (
+    APPROVAL_KIND,
+    RECEIVE_KIND,
+    REDEEM_KIND,
+    ExecutionLedger,
+    LedgerEntry,
+)
 from amigocompora.domain.clock import FrozenClock
 from amigocompora.domain.models import (
     BroadcastReceipt,
@@ -418,3 +427,198 @@ def test_the_counted_statuses_are_the_two_that_spent_money(status: str) -> None:
         description="",
     )
     assert entry.counts_towards_limits
+
+
+# --------------------------------------------------------------------------- #
+# Los asientos que no gastan: lo que entra y los permisos
+# --------------------------------------------------------------------------- #
+def test_a_receive_is_written_down_but_does_not_consume_budget(tmp_path: Path) -> None:
+    """Una recepción es dinero que **entra**: contarla gastaría el tope del día
+    por recuperar lo propio.
+
+    Y lo que decide no es la cifra sino el tipo del asiento, que es lo que se
+    comprueba aquí anotando una recepción **con un importe grande**: si algún día
+    la recepción de un puente dejara de anotarse con importe cero —hoy lo hace
+    porque el mensaje de Circle no se decodifica—, el tope tiene que seguir sin
+    consumirse.
+    """
+    ledger, _ = _ledger(tmp_path)
+    entry = ledger.record_receipt(_receipt(), _intent(notional="1500"), kind=RECEIVE_KIND)
+
+    assert entry.kind == RECEIVE_KIND
+    assert entry.notional == "1500", "el importe se anota igual: es lo que entró"
+    assert not entry.counts_towards_limits
+    assert ledger.spent_today() == Decimal("0")
+    assert len(ledger.entries()) == 1
+
+
+def test_an_approval_is_written_down_but_does_not_consume_budget(tmp_path: Path) -> None:
+    """Aprobar no mueve valor, sólo concede permiso: sumar lo autorizado contaría
+    dos veces el mismo dinero —una al aprobarlo y otra al cambiarlo— y agotaría el
+    tope a la mitad de lo que dice.
+
+    El hecho queda, y con él el token, que es lo que hace que la aprobación salga
+    en la «Actividad» del token al que se le dio el permiso.
+    """
+    ledger, _ = _ledger(tmp_path)
+    entry = ledger.record_approval(
+        _receipt(),
+        pair="USDC/WETH",
+        engine_id="zeroex",
+        token_symbol="USDC",  # noqa: S106 - el nombre del argumento, no un secreto
+        spender="0x2222222222222222222222222222222222222222",
+        granted_raw=2**256 - 1,
+    )
+
+    assert entry.kind == APPROVAL_KIND
+    assert entry.tokens == ("USDC",)
+    assert entry.notional == "0"
+    assert not entry.counts_towards_limits
+    assert ledger.spent_today() == Decimal("0")
+    assert [asiento.tx_hash for asiento in ledger.for_token("USDC")] == [entry.tx_hash]
+
+
+@pytest.mark.parametrize("kind", [RECEIVE_KIND, APPROVAL_KIND, REDEEM_KIND])
+def test_the_incoming_and_permission_kinds_never_consume_budget(kind: str) -> None:
+    """El tipo manda sobre el desenlace: un `success` de estos no gasta tope."""
+    entry = LedgerEntry(
+        occurred_at=NOW,
+        chain="base",
+        pair="WETH/USDC",
+        engine_id="zeroex",
+        notional="1",
+        notional_symbol="USDC",
+        tx_hash="0x" + "ab" * 32,
+        status="success",
+        recipient="0x1111111111111111111111111111111111111111",
+        description="",
+        kind=kind,
+    )
+    assert not entry.counts_towards_limits
+
+
+# --------------------------------------------------------------------------- #
+# Los asientos de un token: lo que alimenta «Actividad»
+# --------------------------------------------------------------------------- #
+def _con_asiento(
+    ledger: ExecutionLedger,
+    *,
+    symbol: str,
+    chain: str = "base",
+    kind: str = "transaction",
+    pair: str | None = None,
+    when: datetime = NOW,
+    tx_hash: str = "0x" + "ab" * 32,
+    tokens: tuple[str, ...] | None = None,
+) -> LedgerEntry:
+    """Un asiento anotado a mano, con los campos que mira el filtro por token."""
+    entry = LedgerEntry(
+        occurred_at=when,
+        chain=chain,
+        pair=pair if pair is not None else f"{symbol}/USDC",
+        engine_id="zeroex",
+        notional="1",
+        notional_symbol="USDC",
+        tx_hash=tx_hash,
+        status="success",
+        recipient="0x1111111111111111111111111111111111111111",
+        description="",
+        kind=kind,
+        tokens=(symbol,) if tokens is None else tokens,
+    )
+    ledger.append(entry)
+    return entry
+
+
+def test_for_token_returns_only_that_token_and_newest_first(tmp_path: Path) -> None:
+    """La lista de movimientos de un token: suyos, de su red, y lo último arriba.
+
+    Es el filtro entero de «Actividad»: ni asientos de otro token ni los del
+    mismo símbolo en otra red —el USDC de base no es el de polygon— y en el orden
+    en que se lee una lista de movimientos, que es del más nuevo al más viejo.
+    """
+    ledger, _ = _ledger(tmp_path)
+    viejo = _con_asiento(ledger, symbol="RARO", when=NOW - timedelta(hours=2))
+    nuevo = _con_asiento(
+        ledger, symbol="RARO", kind=REDEEM_KIND, when=NOW, tx_hash="0x" + "cd" * 32
+    )
+    _con_asiento(ledger, symbol="OTRO", tx_hash="0x" + "ef" * 32)
+    otro_mismo_simbolo = _con_asiento(
+        ledger,
+        symbol="RARO",
+        chain="polygon",
+        when=NOW - timedelta(hours=1),
+        tx_hash="0x" + "12" * 32,
+    )
+
+    # Sin red, el símbolo es el que manda: los tres RARO, lo último arriba.
+    assert [entry.tx_hash for entry in ledger.for_token("RARO")] == [
+        nuevo.tx_hash,
+        otro_mismo_simbolo.tx_hash,
+        viejo.tx_hash,
+    ]
+    # Y con red, el mismo símbolo en otra cadena no se cuela en su lista.
+    assert [entry.tx_hash for entry in ledger.for_token("RARO", chain="polygon")] == [
+        otro_mismo_simbolo.tx_hash
+    ]
+
+
+def test_for_token_reads_entries_written_before_the_tokens_field(tmp_path: Path) -> None:
+    """Los renglones viejos se emparejan por palabra exacta del par.
+
+    En el registro real de antes de este campo, el par es una frase —«WETH/USDC»—
+    y el símbolo se busca como palabra entera: «USDC» encuentra «WETH/USDC», y
+    «USDC.e» **no** —una subcadena diría que un movimiento de USDC.e es de USDC,
+    y al revés—. Los dos pares de aquí salen del catálogo, que es de donde salen
+    los reales.
+    """
+    ledger, _ = _ledger(tmp_path)
+    plano = _con_asiento(ledger, symbol="", pair="WETH/USDC", tokens=())
+    con_sufijo = _con_asiento(
+        ledger, symbol="", pair="USDC.e/WETH", tokens=(), tx_hash="0x" + "cd" * 32
+    )
+
+    assert [entry.tx_hash for entry in ledger.for_token("USDC")] == [plano.tx_hash]
+    assert [entry.tx_hash for entry in ledger.for_token("USDC.e")] == [
+        con_sufijo.tx_hash
+    ]
+
+
+def test_the_tokens_of_an_entry_survive_a_restart(tmp_path: Path) -> None:
+    """Los tokens del asiento se releen del disco.
+
+    Es lo que hace que «Actividad» siga sabiendo de quién era cada movimiento
+    después de cerrar la aplicación: el filtro por token no se apoya en el texto
+    del par, que cambia, sino en el campo que el caso de uso escribió.
+    """
+    ledger, _ = _ledger(tmp_path)
+    pair = _pair()
+    ledger.record_receipt(_receipt(), _intent())
+
+    (read,) = ledger.entries()
+    assert read.tokens == (pair.base.symbol, pair.quote.symbol)
+    assert ledger.for_token(pair.base.symbol) == (read,)
+    assert ledger.for_token("NOEXISTE") == ()
+
+
+def test_a_line_without_the_tokens_field_reads_as_empty(tmp_path: Path) -> None:
+    """Un renglón de antes del campo no se descarta ni inventa tokens: se lee con
+    la lista vacía y el filtro cae al texto del par."""
+    ledger, _ = _ledger(tmp_path)
+    antiguo = {
+        "occurred_at": NOW.isoformat(),
+        "chain": "base",
+        "pair": "WETH/USDC",
+        "engine_id": "zeroex",
+        "notional": "1500",
+        "notional_symbol": "USDC",
+        "tx_hash": "0x" + "ab" * 32,
+        "status": "success",
+        "recipient": "0x1111111111111111111111111111111111111111",
+    }
+    ledger.path.parent.mkdir(parents=True, exist_ok=True)
+    ledger.path.write_text(json.dumps(antiguo) + "\n", encoding="utf-8")
+
+    (read,) = ledger.entries()
+    assert read.tokens == ()
+    assert ledger.for_token("USDC") == (read,)

@@ -51,6 +51,44 @@ moneda nativa directamente al destinatario. Es un camino más corto y con una
 transacción menos que el de V3, y sale del diseño del protocolo, no de una
 elección nuestra.
 
+### El segundo salto: cuando el par no tiene pool directo
+
+Muchos pares no tienen pool propio y sí una ruta evidente de dos saltos: vender
+el token por la stablecoin de la red y comprar con ella el otro lado. En V4 esa
+pregunta se le hace al cotizador de una sola vez —`quoteExactInput`, con el
+camino entero en una lista de `PathKey`—, y el contrato encadena los pools de
+verdad: el importe que devuelve no es la composición de dos lecturas sueltas,
+es el que la ejecución daría. Medido contra el V4Quoter de Base, en dos saltos
+WETH → USDC → WETH por los tramos 0,30 % y 0,05 %: devuelve
+`[993014236051103, 70983]` —el importe y una estimación de gas— y la cifra cae
+dentro de 6 partes por millón de la composición de dos cotizaciones del mismo
+bloque, con la diferencia explicada (la ruta artificial repite el mismo pool,
+así que el segundo salto ve el precio que ya movió el primero). Cada `PathKey`
+lleva la moneda **de llegada** del salto —no la de salida—, su comisión, su
+espaciado de ticks y sus ganchos; escribir la moneda al revés derivaría la clave
+de otro pool en cada salto.
+
+**Sólo cuando el par directo no da nada** —ni pool, ni salida, ni una
+cotización sin un impacto desmedido— se prueban rutas de dos saltos por los
+tokens que el catálogo conoce de la red (`hub_tokens`), se cotiza cada una con
+el mismo cotizador y se publica la que más da, con su camino dentro de la
+cotización (`Quote.route`) para poder reconstruirla al firmar. Al firmar, el
+camino se convierte en la acción `SWAP_EXACT_IN` (0x07), que es a la de un solo
+pool lo que la struct del camino a la del pool: el mismo bloqueo de tres pasos
+—intercambio, liquidación y cobro— con el camino dentro.
+
+Las tres reglas de esta búsqueda son las mismas que en V3, y por los mismos
+motivos:
+
+- **No se cambia un pool directo por una ruta que dé más.** Si el par directo
+  cotiza, ése es el resultado: elegir la ruta es una decisión con más comisión
+  de gas y más superficie de contrato, y no la toma el motor a espaldas del
+  usuario.
+- **Trabaja en cualquier red del catálogo sin tocar código**: los hubs salen de
+  la tabla del catálogo, no de una lista escrita por red.
+- **El impacto se compone, no se suma**: cada tramo se mide contra el marginal
+  de su pool y los dos se combinan (ver `combine_impact_bps`).
+
 ### El destinatario: la trampa que no se ve en la firma
 
 La acción natural para cobrar es `TAKE_ALL`, que no lleva destinatario. Medido
@@ -127,18 +165,22 @@ from amigocompora.domain.errors import (
 from amigocompora.domain.models import (
     Measurement,
     Quote,
+    RouteHop,
+    SwapRoute,
     Token,
     TokenApproval,
     TradingPair,
     UnsignedTransaction,
     Venue,
+    VenueKind,
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import EXACT, BasisPoints, TokenAmount
 from amigocompora.domain.protocols import EngineKind, EngineManifest
 from amigocompora.engines.amm_protocols import parse_dex_id, venue_for
+from amigocompora.engines.catalog import hub_tokens
 from amigocompora.engines.evm_rpc import ChainReader, rpc_hosts
-from amigocompora.engines.uniswap_math import impact_bps
+from amigocompora.engines.uniswap_math import combine_impact_bps, impact_bps
 from amigocompora.engines.uniswap_v4 import calldata as abi
 from amigocompora.engines.uniswap_v4.addresses import (
     DEPLOYMENTS,
@@ -248,6 +290,27 @@ class _PoolQuote:
     amount_out_raw: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RouteQuote:
+    """Una ruta cruda de dos saltos por un hub, antes de decidir nada.
+
+    Los dos tramos vienen ya decididos —el pool que más da de cada pata— porque
+    es lo que la búsqueda compara entre hubs: la salida del segundo tramo es la
+    cifra que compite, y para un hub fijo encadenar «el que más da» en la
+    primera pata maximiza la segunda: las salidas de un pool crecen con lo que
+    entra, así que más salida en la pata 1 nunca da menos en la 2.
+
+    El hub es un `Token` del catálogo y los tramos llevan el pool entero —con
+    su comisión y su espaciado—, porque en V4 la clave del pool del segundo
+    salto se deriva de esa pareja y sin ella no se puede ni leer su estado ni
+    codificar la `PathKey` que lo nombra.
+    """
+
+    hub: Token
+    first: _PoolQuote
+    second: _PoolQuote
+
+
 class UniswapV4Engine:
     """Cotizaciones y payloads de swap contra Uniswap V4, sin credenciales."""
 
@@ -293,7 +356,13 @@ class UniswapV4Engine:
         return tuple(_venue(chain_key, fee) for fee, _spacing in FEE_TIERS)
 
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
-        """Cotiza vender `amount_in` de la base contra el mejor pool disponible."""
+        """Cotiza vender `amount_in`: el pool directo o, si no lo hay, dos saltos.
+
+        El orden es deliberado. Primero el par directo —un pool, un tramo, la
+        ruta con menos superficie—, y **sólo si no da nada** se busca una ruta
+        de dos saltos por los hubs del catálogo. El docstring del módulo dice
+        por qué no se cambia un pool directo por una ruta que diera más.
+        """
         deployment = DEPLOYMENTS.get(pair.chain)
         if deployment is None or not amount_in.is_positive:
             return ()
@@ -310,17 +379,32 @@ class UniswapV4Engine:
             # cualquier otro y tiene su pool.
             return ()
 
+        direct = await self._direct_quote(pair, amount_in, deployment, token_in, token_out)
+        if direct is not None:
+            return (direct,)
+        routed = await self._hub_quote(pair, amount_in, deployment, token_in, token_out)
+        return () if routed is None else (routed,)
+
+    async def _direct_quote(
+        self,
+        pair: TradingPair,
+        amount_in: TokenAmount,
+        deployment: Deployment,
+        token_in: str,
+        token_out: str,
+    ) -> Quote | None:
+        """La mejor cotización del par directo, o `None` si no hay ninguna."""
         pools = await self._pools_for(pair.chain, deployment, token_in, token_out)
         if not pools:
             _log.debug("uniswap_v4.no_pool", pair=pair.symbol, chain=pair.chain)
-            return ()
+            return None
 
         candidates = await self._quotes_for(
             pair.chain, deployment, token_in, token_out, amount_in.raw, pools
         )
         if not candidates:
             _log.debug("uniswap_v4.no_liquidity", pair=pair.symbol, chain=pair.chain)
-            return ()
+            return None
 
         for candidate in sorted(candidates, key=lambda item: item.amount_out_raw, reverse=True):
             state = await self._pool_state(pair.chain, deployment, candidate.pool)
@@ -349,10 +433,152 @@ class UniswapV4Engine:
                     impact_bps=impact.value,
                 )
                 continue
-            return (self._to_quote(pair, amount_in, candidate, impact),)
+            return self._to_quote(pair, amount_in, candidate, impact)
 
         _log.debug("uniswap_v4.quote_unreadable_state", pair=pair.symbol, chain=pair.chain)
-        return ()
+        return None
+
+    async def _hub_quote(
+        self,
+        pair: TradingPair,
+        amount_in: TokenAmount,
+        deployment: Deployment,
+        token_in: str,
+        token_out: str,
+    ) -> Quote | None:
+        """La mejor ruta de dos saltos por un hub del catálogo, o `None`.
+
+        Los hubs se buscan **en paralelo** —son independientes y es la mitad
+        del tiempo de respuesta de un par sin pool directo— y compiten por la
+        salida del segundo tramo. El impacto de la ganadora se compone tramo a
+        tramo y, si pasa el umbral, se publica con su camino dentro.
+        """
+        candidates = [
+            token
+            for token in hub_tokens(pair.chain)
+            if self._is_hub_for(token, token_in, token_out)
+        ]
+        if not candidates:
+            _log.debug("uniswap_v4.no_hubs", pair=pair.symbol, chain=pair.chain)
+            return None
+
+        found = await asyncio.gather(
+            *(
+                self._route_via_hub(
+                    pair.chain, deployment, token_in, token_out, amount_in.raw, hub
+                )
+                for hub in candidates
+            )
+        )
+        routes = [route for route in found if route is not None]
+        if not routes:
+            _log.debug("uniswap_v4.no_route", pair=pair.symbol, chain=pair.chain)
+            return None
+
+        for route in sorted(routes, key=lambda item: item.second.amount_out_raw, reverse=True):
+            hub_address = _on_chain_address(route.hub)
+            # Los dos estados van en paralelo: son dos lecturas independientes y
+            # las dos hacen falta para medir el impacto de la ruta entera.
+            first_state, second_state = await asyncio.gather(
+                self._pool_state(pair.chain, deployment, route.first.pool),
+                self._pool_state(pair.chain, deployment, route.second.pool),
+            )
+            if first_state is None or second_state is None:
+                continue
+            first_impact = impact_bps(
+                amount_in_raw=amount_in.raw,
+                amount_out_raw=route.first.amount_out_raw,
+                sqrt_price_x96=first_state[0],
+                token_in_is_token0=abi.orient(
+                    token_in, hub_address, route.first.pool.fee, route.first.pool.tick_spacing
+                ).zero_for_one,
+                fee=BasisPoints(route.first.pool.fee // _V4_FEE_UNITS_PER_BPS),
+            )
+            second_impact = impact_bps(
+                amount_in_raw=route.first.amount_out_raw,
+                amount_out_raw=route.second.amount_out_raw,
+                sqrt_price_x96=second_state[0],
+                token_in_is_token0=abi.orient(
+                    hub_address,
+                    token_out,
+                    route.second.pool.fee,
+                    route.second.pool.tick_spacing,
+                ).zero_for_one,
+                fee=BasisPoints(route.second.pool.fee // _V4_FEE_UNITS_PER_BPS),
+            )
+            if first_impact is None or second_impact is None:
+                continue
+            impact = combine_impact_bps([first_impact, second_impact])
+            if impact.value > MAX_PRICE_IMPACT.value:
+                _log.debug(
+                    "uniswap_v4.route_skipped_impact",
+                    pair=pair.symbol,
+                    hub=route.hub.symbol,
+                    impact_bps=impact.value,
+                )
+                continue
+            _log.debug(
+                "uniswap_v4.route_found",
+                pair=pair.symbol,
+                chain=pair.chain,
+                hub=route.hub.symbol,
+                fee_first=route.first.pool.fee,
+                fee_second=route.second.pool.fee,
+                out_raw=route.second.amount_out_raw,
+            )
+            return self._to_route_quote(pair, amount_in, route, impact)
+
+        _log.debug("uniswap_v4.no_route", pair=pair.symbol, chain=pair.chain)
+        return None
+
+    async def _route_via_hub(
+        self,
+        chain_key: str,
+        deployment: Deployment,
+        token_in: str,
+        token_out: str,
+        amount_in_raw: int,
+        hub: Token,
+    ) -> _RouteQuote | None:
+        """La mejor ruta de dos saltos por ese hub, o `None` si no llega entera.
+
+        La segunda pata se cotiza **con lo que de verdad daría la primera**, no
+        con la entrada original: encadenar dos cotizaciones calculadas por
+        separado produciría un número que ninguna ejecución entrega.
+        """
+        hub_address = _on_chain_address(hub)
+        first_pools = await self._pools_for(chain_key, deployment, token_in, hub_address)
+        if not first_pools:
+            return None
+        first_quotes = await self._quotes_for(
+            chain_key, deployment, token_in, hub_address, amount_in_raw, first_pools
+        )
+        if not first_quotes:
+            return None
+        first = max(first_quotes, key=lambda item: item.amount_out_raw)
+
+        second_pools = await self._pools_for(chain_key, deployment, hub_address, token_out)
+        if not second_pools:
+            return None
+        second_quotes = await self._quotes_for(
+            chain_key, deployment, hub_address, token_out, first.amount_out_raw, second_pools
+        )
+        if not second_quotes:
+            return None
+        second = max(second_quotes, key=lambda item: item.amount_out_raw)
+        return _RouteQuote(hub=hub, first=first, second=second)
+
+    def _is_hub_for(self, token: Token, token_in: str, token_out: str) -> bool:
+        """Si ese token puede hacer de escala en este par.
+
+        No vale el propio token de entrada ni el de salida: un tramo de un
+        token a sí mismo no existe, y pasar por la salida para volver a ella
+        sería dos comisiones para nada. Se compara por dirección **de moneda**
+        —aquí el nativo es la dirección cero, que sí es un pool—, que es la
+        forma en que el token existe en la clave del pool.
+        """
+        address = _on_chain_address(token)
+        return address != token_in and address != token_out
 
     # --------------------------------------------------------------- construir #
     async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction:
@@ -366,6 +592,12 @@ class UniswapV4Engine:
         del usuario sería cambiar el venue después de que lo eligiera— y si el
         importe se ha movido más de lo tolerado, se **niega a construir**.
 
+        Con ruta de dos saltos, «el mismo sitio» es **el mismo camino**: se
+        vuelve a cotizar la ruta que la cotización publica —con
+        `quoteExactInput`, no una búsqueda nueva— y no se cambia un tramo por
+        otro que diera más. Lo que puede cambiar es el importe, y de eso avisa
+        la comprobación de deriva.
+
         La cotización fresca es la que fija el `amountOutMinimum`, así que el
         deslizamiento se calcula sobre el precio de ahora y no sobre el de la
         pantalla.
@@ -378,7 +610,6 @@ class UniswapV4Engine:
                 f"V4 no están medidos ahí. Cubre {', '.join(sorted(SWAP_CHAINS))}. "
                 f"Activa un motor que cubra esa red."
             )
-        fee, tick_spacing = _tier_from_venue(quote.venue.venue_id)
         token_in = _on_chain_address(quote.pair.base)
         token_out = _on_chain_address(quote.pair.quote)
         if token_in == token_out:
@@ -388,14 +619,42 @@ class UniswapV4Engine:
                 f"clave saldría con las dos iguales."
             )
 
-        fresh = await self._fresh_out(
-            chain_key, deployment, token_in, token_out, quote.amount_in.raw, fee, tick_spacing
-        )
-        if fresh is None:
-            raise NoQuotesError(
-                f"el pool de «{quote.pair.symbol}» al {_percent(fee)} % ya no cotiza "
-                f"ese tamaño: la liquidez que viste se agotó. Vuelve a cotizar."
+        # Los tramos del camino se fijan en un solo sitio —la clave del único
+        # pool cuando el swap es directo, y las claves del camino cuando no—,
+        # porque son lo que después necesitan la cotización fresca y el
+        # calldata: con dos `Optional` que nunca son `None` a la vez sería un
+        # lector de tipos, y no el código, quien decidiera por dónde se
+        # construye.
+        keys: tuple[abi.PathKey, ...]
+        fees: tuple[int, ...]
+        if quote.route is None:
+            fee, tick_spacing = _tier_from_venue(quote.venue.venue_id)
+            keys = (abi.PathKey(currency=token_out, fee=fee, tick_spacing=tick_spacing),)
+            fees = (fee,)
+            fresh = await self._fresh_out(
+                chain_key, deployment, token_in, token_out, quote.amount_in.raw, fee, tick_spacing
             )
+            if fresh is None:
+                raise NoQuotesError(
+                    f"el pool de «{quote.pair.symbol}» al {_percent(fee)} % ya no cotiza "
+                    f"ese tamaño: la liquidez que viste se agotó. Vuelve a cotizar."
+                )
+        else:
+            keys = self._route_path(quote.route, token_in=token_in, token_out=token_out)
+            fees = tuple(key.fee for key in keys)
+            fresh = await self._fresh_route_out(
+                chain_key,
+                deployment,
+                currency_in=token_in,
+                keys=keys,
+                amount_in_raw=quote.amount_in.raw,
+            )
+            if fresh is None:
+                camino = " → ".join(token.symbol for token in quote.route.tokens)
+                raise NoQuotesError(
+                    f"la ruta de «{quote.pair.symbol}» por {camino} ya no cotiza ese "
+                    f"tamaño: la liquidez que viste se agotó. Vuelve a cotizar."
+                )
         self._require_same_price(quote, fresh)
 
         spec = chain(chain_key)
@@ -419,15 +678,27 @@ class UniswapV4Engine:
                 f"transacción no sería el que se cree."
             )
 
-        calldata = self._calldata(
-            fee=fee,
-            tick_spacing=tick_spacing,
-            token_in=token_in,
-            token_out=token_out,
-            recipient=recipient,
-            amount_in_raw=quote.amount_in.raw,
-            minimum_raw=minimum.raw,
-        )
+        if quote.route is None:
+            # El camino de un solo tramo: la clave del único pool es la que se
+            # codifica en la acción de un salto.
+            (direct_key,) = keys
+            calldata = self._calldata(
+                fee=direct_key.fee,
+                tick_spacing=direct_key.tick_spacing,
+                token_in=token_in,
+                token_out=token_out,
+                recipient=recipient,
+                amount_in_raw=quote.amount_in.raw,
+                minimum_raw=minimum.raw,
+            )
+        else:
+            calldata = self._calldata_route(
+                currency_in=token_in,
+                keys=keys,
+                recipient=recipient,
+                amount_in_raw=quote.amount_in.raw,
+                minimum_raw=minimum.raw,
+            )
         approval = (
             None
             if pays_native
@@ -437,8 +708,7 @@ class UniswapV4Engine:
             "uniswap_v4.swap_planned",
             pair=quote.pair.symbol,
             chain=chain_key,
-            fee=fee,
-            tick_spacing=tick_spacing,
+            fees=fees,
             out_raw=fresh,
             minimum_raw=minimum.raw,
             router=deployment.universal_router,
@@ -463,7 +733,7 @@ class UniswapV4Engine:
             description=self._describe(
                 quote=quote,
                 deployment=deployment,
-                fee=fee,
+                fees=fees,
                 amount_out=amount_out,
                 minimum=minimum,
                 pays_native=pays_native,
@@ -671,6 +941,92 @@ class UniswapV4Engine:
         amount_out = abi.decode_quote(raw)
         return None if amount_out is None or amount_out <= 0 else amount_out
 
+    async def _fresh_route_out(
+        self,
+        chain_key: str,
+        deployment: Deployment,
+        *,
+        currency_in: str,
+        keys: Sequence[abi.PathKey],
+        amount_in_raw: int,
+    ) -> int | None:
+        """El importe de salida de **esa ruta entera**, ahora mismo.
+
+        `quoteExactInput` cotiza el camino completo en una lectura, igual que la
+        acción lo ejecutará: el número que da no es la composición de dos
+        lecturas sueltas —cada salto parte de lo que entregó el anterior dentro
+        de la misma llamada—, así que es el que de verdad corresponde a la ruta
+        publicada.
+        """
+        try:
+            raw = await self._reader.eth_call(
+                chain_key,
+                deployment.quoter,
+                abi.quote_exact_input(currency_in, keys, amount_in_raw),
+            )
+        except SourceResponseError:
+            # La ruta no puede dar salida a este tamaño ahora: se trata como «ya
+            # no hay cotización», que es lo que es.
+            return None
+        amount_out = abi.decode_quote(raw)
+        return None if amount_out is None or amount_out <= 0 else amount_out
+
+    def _route_path(
+        self, route: SwapRoute, *, token_in: str, token_out: str
+    ) -> tuple[abi.PathKey, ...]:
+        """Las claves del camino que esa ruta describe, tramo a tramo.
+
+        Se construyen **desde la ruta publicada**, no desde una búsqueda nueva:
+        el payload tiene que ejecutar el camino que el usuario leyó. Cada
+        `PathKey` nombra la moneda a la que **llega** su tramo —la de salida de
+        la ruta se incluye, la de entrada se queda fuera porque el contrato ya
+        la conoce—, y su espaciado de ticks se recupera de la tabla canónica
+        que este motor sondea: el `venue_id` sólo lleva la comisión, y sin el
+        espaciado la clave que deriva el contrato sería la de otro pool.
+
+        El contraste de los extremos contra el par es deliberado y no
+        decorativo: una ruta que no empiece donde el par y termine donde el par
+        ejecutaría un swap que nadie pidió, y se corta aquí, antes de codificar
+        nada. La contigüidad de los tramos la valida el propio `SwapRoute` al
+        construirse, así que aquí no se repite.
+
+        El tramo se nombra por la comisión que la cotización **publica**
+        (`fee_bps`), no por la que se crea recordar: es el número que el
+        usuario vio, y construir con otro apuntaría a un pool distinto.
+        """
+        keys: list[abi.PathKey] = []
+        tokens: list[str] = []
+        for index, hop in enumerate(route.hops):
+            if hop.fee_bps is None:
+                raise UnsupportedOperationError(
+                    "la ruta no lleva la comisión de sus tramos y este motor la "
+                    "necesita para derivar cada pool: no se puede construir."
+                )
+            address_in = _on_chain_address(hop.base)
+            address_out = _on_chain_address(hop.quote)
+            fee = hop.fee_bps.value * _V4_FEE_UNITS_PER_BPS
+            spacing = _TICK_SPACING_BY_FEE.get(fee)
+            if spacing is None:
+                raise UnsupportedOperationError(
+                    f"la ruta pasa por el tramo {hop.fee_bps.value} en puntos "
+                    f"básicos, que este motor no sondea: sondea "
+                    f"{', '.join(str(known) for known in sorted(_TICK_SPACING_BY_FEE))} "
+                    f"en unidades de V4. Sin espaciado de ticks no se puede derivar "
+                    f"la clave del pool."
+                )
+            if index == 0:
+                tokens.append(address_in)
+            tokens.append(address_out)
+            keys.append(abi.PathKey(currency=address_out, fee=fee, tick_spacing=spacing))
+        if tokens[0] != token_in or tokens[-1] != token_out:
+            raise UnsupportedOperationError(
+                f"la ruta de «{route.tokens[0].symbol} → "
+                f"{route.tokens[-1].symbol}» no corresponde al par de la "
+                f"cotización: no se construye un swap por un camino que el "
+                f"usuario no vio."
+            )
+        return tuple(keys)
+
     def _calldata(
         self,
         *,
@@ -726,6 +1082,43 @@ class UniswapV4Engine:
         )
         return abi.execute((abi.COMMAND_V4_SWAP,), (abi.v4_swap_input(actions, params),), deadline)
 
+    def _calldata_route(
+        self,
+        *,
+        currency_in: str,
+        keys: Sequence[abi.PathKey],
+        recipient: str,
+        amount_in_raw: int,
+        minimum_raw: int,
+    ) -> str:
+        """El calldata de un swap por un camino: las mismas tres acciones.
+
+        Lo único que cambia respecto al de un solo pool es la primera acción
+        —`SWAP_EXACT_IN` con las claves del camino en vez de
+        `SWAP_EXACT_IN_SINGLE` con una—, y no es un detalle de estilo: el
+        camino cotiza y ejecuta los mismos pools, y con la acción de un salto
+        se ejecutaría el primero y se ignoraría el resto. La liquidación y el
+        cobro son los mismos y por los mismos motivos: el bloqueo del
+        `PoolManager` no sobrevive a una transacción, así que las tres acciones
+        van juntas, y el mínimo viaja dentro del swap, que es donde el importe
+        de salida del camino se conoce.
+        """
+        deadline = int(self._clock.now().timestamp()) + DEADLINE_SECONDS
+        actions = (abi.ACTION_SWAP_EXACT_IN, abi.ACTION_SETTLE_ALL, abi.ACTION_TAKE)
+        params = (
+            abi.swap_exact_in_path(
+                currency_in,
+                keys,
+                amount_in_raw=amount_in_raw,
+                amount_out_min_raw=minimum_raw,
+            ),
+            abi.settle_all(currency_in, amount_in_raw),
+            # La moneda que sale del camino es la de **llegada** de su último
+            # tramo, que es la que `take` cobra.
+            abi.take(keys[-1].currency, recipient, abi.OPEN_DELTA),
+        )
+        return abi.execute((abi.COMMAND_V4_SWAP,), (abi.v4_swap_input(actions, params),), deadline)
+
     def _to_quote(
         self,
         pair: TradingPair,
@@ -776,6 +1169,69 @@ class UniswapV4Engine:
             ),
         )
 
+    def _to_route_quote(
+        self,
+        pair: TradingPair,
+        amount_in: TokenAmount,
+        route: _RouteQuote,
+        impact: BasisPoints,
+    ) -> Quote:
+        """La cotización de una ruta de dos saltos, con su camino dentro.
+
+        La comisión que se publica es la **suma** de los dos tramos —lo que de
+        verdad paga la orden—, y va `DERIVED` por el mismo motivo que en el
+        camino directo: nadie la publica, se deduce del tramo con el que se
+        derivó la clave de cada pool.
+
+        Los tokens de los tramos son los del par **tal cual**, sin sustituir el
+        nativo por ningún envoltorio: en V4 el nativo es una moneda con su
+        dirección —la cero— y hay pools de nativo, así que un camino que lo
+        tocara nombraría los mismos pools que se ejecutan. La ruta la valida el
+        propio `SwapRoute` al construirse —dos tramos que encajan—, así que
+        aquí sólo se describen los que ya se cotizaron.
+        """
+        hops = (
+            RouteHop(
+                base=pair.base,
+                quote=route.hub,
+                fee_bps=BasisPoints(route.first.pool.fee // _V4_FEE_UNITS_PER_BPS),
+            ),
+            RouteHop(
+                base=route.hub,
+                quote=pair.quote,
+                fee_bps=BasisPoints(route.second.pool.fee // _V4_FEE_UNITS_PER_BPS),
+            ),
+        )
+        return Quote(
+            venue=_route_venue(pair.chain, (route.first.pool.fee, route.second.pool.fee)),
+            engine_id=MANIFEST.engine_id,
+            pair=pair,
+            amount_in=amount_in,
+            amount_out=TokenAmount(
+                route.second.amount_out_raw, pair.quote.decimals, pair.quote.symbol
+            ),
+            fee_bps=BasisPoints(
+                (route.first.pool.fee + route.second.pool.fee) // _V4_FEE_UNITS_PER_BPS
+            ),
+            fee_basis=Measurement.DERIVED,
+            price_impact_bps=impact,
+            observed_at=self._clock.now(),
+            liquidity=None,
+            impact_basis=Measurement.DERIVED,
+            source_note=(
+                f"Ruta de dos saltos leída de {SOURCE_NAME} con el V4Quoter, "
+                f"contra el estado de la cadena en el bloque actual: "
+                f"{pair.base.symbol} → {route.hub.symbol} → {pair.quote.symbol}, "
+                f"por los tramos {_percent(route.first.pool.fee)} % y "
+                f"{_percent(route.second.pool.fee)} %. El par directo no tiene "
+                f"pool con liquidez, así que la orden pasa por {route.hub.symbol}; "
+                f"los dos tramos se ejecutan en una sola transacción. El impacto "
+                f"es la composición de los dos pools, medida contra el marginal de "
+                f"cada uno."
+            ),
+            route=SwapRoute(hops=hops),
+        )
+
     def _require_same_price(self, quote: Quote, fresh_raw: int) -> None:
         """Aborta si el precio se movió más de lo tolerado desde lo que se vio."""
         shown_raw = quote.amount_out.raw
@@ -808,7 +1264,7 @@ class UniswapV4Engine:
         *,
         quote: Quote,
         deployment: Deployment,
-        fee: int,
+        fees: tuple[int, ...],
         amount_out: TokenAmount,
         minimum: TokenAmount,
         pays_native: bool,
@@ -821,9 +1277,25 @@ class UniswapV4Engine:
             f"entregas {quote.amount_in} y recibes {amount_out} "
             f"—{minimum} como mínimo, con un {SLIPPAGE_PCT} % de deslizamiento "
             f"tolerado—.",
-            f"Se ejecuta contra el pool del tramo {_percent(fee)} % a través del "
-            f"Universal Router {deployment.universal_router}.",
         ]
+        if len(fees) == 1:
+            parts.append(
+                f"Se ejecuta contra el pool del tramo {_percent(fees[0])} % a través "
+                f"del Universal Router {deployment.universal_router}."
+            )
+        else:
+            tramos = " y ".join(f"{_percent(fee)} %" for fee in fees)
+            camino = (
+                " → ".join(token.symbol for token in quote.route.tokens)
+                if quote.route is not None
+                else ""
+            )
+            parts.append(
+                f"Se ejecuta en **un solo swap** de dos tramos —{tramos}— por el "
+                f"camino {camino}: el par directo no tiene pool con liquidez, así "
+                f"que la orden pasa por el token intermedio en la misma "
+                f"transacción. El Universal Router es {deployment.universal_router}."
+            )
         if pays_native:
             parts.append(
                 "El importe va con la transacción y se paga con la moneda nativa "
@@ -886,6 +1358,30 @@ def _venue(chain_key: str, fee: int) -> Venue:
     distintos donde operar y tienen que salir en dos filas.
     """
     return venue_for(PROTOCOL, BasisPoints(fee // _V4_FEE_UNITS_PER_BPS), chain_key)
+
+
+def _route_venue(chain_key: str, fees: Sequence[int]) -> Venue:
+    """El venue de una ruta: **la comisión del camino**, no la de un pool.
+
+    No se delega en `venue_for` porque ése construye el identificador de **un**
+    pool —`uniswap-v4@5` es el del 0,05 %— y una ruta no es un pool: es un
+    camino de varios, y su comisión total es lo que la distingue en la tabla.
+    El identificador lleva la lista de tramos (`uniswap-v4@30+5`) para que dos
+    rutas del mismo par por hubs distintos no se fundan en una fila: son sitios
+    de ejecución distintos, igual que dos tramos de comisión lo son.
+
+    Y por eso mismo este `venue_id` **no** se puede deshacer con
+    `_tier_from_venue`: no nombra un tramo, nombra un camino, y construir
+    contra él sólo tiene sentido por la rama de ruta de `plan_swap`, que sí
+    sabe leerlo.
+    """
+    pieces = [BasisPoints(fee // _V4_FEE_UNITS_PER_BPS) for fee in fees]
+    return Venue(
+        venue_id=f"{PROTOCOL.key}@{'+'.join(str(piece.value) for piece in pieces)}",
+        name=f"{PROTOCOL.label} " + " + ".join(f"{piece.as_percent():f} %" for piece in pieces),
+        kind=VenueKind.DEX,
+        chain=chain_key,
+    )
 
 
 def _tier_from_venue(venue_id: str) -> tuple[int, int]:

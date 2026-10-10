@@ -201,6 +201,24 @@ def token_by_symbol(symbol: str, chain_key: str) -> Token | None:
     return None
 
 
+def hub_tokens(chain_key: str) -> tuple[Token, ...]:
+    """Los tokens por los que este catálogo sabe **pasar de camino** a otro.
+
+    No es una lista nueva: son los mismos tokens de `tokens_for` —el envoltorio
+    nativo, la stablecoin de referencia y los extras medidos—, porque lo que
+    hace útil a un token como escala no es un rótulo sino tener liquidez medida
+    en la red. Un motor que busca una ruta de dos saltos los prueba en este
+    orden y se queda con el que más da; así la búsqueda funciona **en cualquier
+    red del catálogo sin tocar código**, que es la propiedad que se pedía.
+
+    Se filtran los que no tienen dirección: sin contrato no hay pool que
+    preguntar, y el nativo nunca cruza un pool —para eso está su envoltorio,
+    que ya va primero en la lista—. Excluir los tokens del par que se está
+    cotizando es trabajo de quien llama, que es quien los conoce.
+    """
+    return tuple(token for token in tokens_for(chain_key) if token.address is not None)
+
+
 def token_by_address(address: str, chain_key: str) -> Token | None:
     """Busca un token del catálogo por dirección, con la regla de su red.
 

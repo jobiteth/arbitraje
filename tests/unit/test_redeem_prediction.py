@@ -66,8 +66,10 @@ from amigocompora.domain.errors import (
 from amigocompora.domain.execution import ExecutionLimits, TriggerKind
 from amigocompora.domain.models import (
     MarketDepth,
+    MarketTag,
     PredictionMarket,
     PredictionPosition,
+    PredictionSort,
     Token,
     UnsignedTransaction,
     Venue,
@@ -216,8 +218,10 @@ class MotorQueCobra:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
-        del limit, search, closing_within
+        del limit, search, closing_within, category, sort
         return ()
 
     async def market(self, market_id: str) -> PredictionMarket:

@@ -4,10 +4,17 @@ Capacidad requerida: `PREPARE_TX`, que conceden `ASISTIDO` y `EJECUCIÓN`. Y aun
 concedida, pasa por `ConfirmationGateway`, así que el usuario ve el payload
 exacto y tiene que decir sí.
 
-Lo que devuelve es una `PlannedTransaction` —el payload de EVM o el de Solana,
-según la red del par—: un objeto para inspeccionar o exportar. Este caso de uso
-**no firma ni emite**, y por eso sigue siendo el camino seguro: sirve para mirar
-qué se haría sin que nada ocurra.
+Lo que devuelve es un `PreparedSwap` —el payload de EVM o el de Solana, según
+la red del par, más lo que se pudo saber de su coste de red—: un objeto para
+inspeccionar o exportar. Este caso de uso **no firma ni emite**, y por eso sigue
+siendo el camino seguro: sirve para mirar qué se haría sin que nada ocurra.
+
+El coste de red se estima aquí, y no al cotizar, porque es una llamada a la red
+**por ruta** y ninguna se va a firmar hasta que el usuario elija: hacerlo al
+cotizar convertiría cada comparación de precios en una ronda de estimaciones que
+nadie pidió. Una estimación que falle **no** frustra la preparación —un borrador
+no necesita coste para existir, y una transacción sin allowance revertiría ante
+el nodo sin que eso diga que el swap esté mal—: se anota el motivo y se sigue.
 
 Firmar y emitir es otra cosa, con otro caso de uso (`ExecuteSwap`), otra
 capacidad y otro modo. La separación no es de estilo: es lo que permite que
@@ -19,14 +26,35 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import structlog
+
 from amigocompora.app.confirmation import ConfirmationGateway
 from amigocompora.app.registry import EngineRegistry
+from amigocompora.app.usecases.estimate_cost import EstimateNetworkCost, NetworkCost
 from amigocompora.domain.addresses import require_evm_address, require_solana_address, shorten
 from amigocompora.domain.chains import AddressFormat, chain
 from amigocompora.domain.errors import NoActiveEngineError, UnsupportedOperationError
-from amigocompora.domain.models import PlannedTransaction, Quote
+from amigocompora.domain.models import PlannedTransaction, Quote, UnsignedTransaction
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.protocols import EngineKind, SwapPlanner
+
+_log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSwap:
+    """El borrador preparado, con lo que se supo de su coste de red.
+
+    `network_cost` y `cost_error` cuentan dos desenlaces que no se pueden
+    confundir con «coste cero»: la estimación salió (la cifra), o se intentó y
+    no salió (el motivo). Los dos en `None` significa que no se intentó —una
+    transacción de Solana, o quien llamó no dijo desde qué cartera se firmaría—,
+    y eso la interfaz lo enseña como «—», no como cero.
+    """
+
+    transaction: PlannedTransaction
+    network_cost: NetworkCost | None = None
+    cost_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +63,10 @@ class PrepareSwap:
 
     registry: EngineRegistry
     gateway: ConfirmationGateway
+    #: Sin estimador no se estima nada y todo sigue funcionando: es lo que usan
+    #: las pruebas que no van del coste, y es la razón de que el campo tenga
+    #: valor por omisión en vez de ser obligatorio.
+    estimate: EstimateNetworkCost | None = None
 
     def is_available(self, chain_key: str | None = None) -> bool:
         """Si hay algún motor activo capaz de construir un swap.
@@ -81,7 +113,9 @@ class PrepareSwap:
         # cotización que se le pasa: es él quien detecta la deriva de precio.
         return await engine.plan_swap(quote, recipient=destination)
 
-    async def __call__(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
+    async def __call__(
+        self, quote: Quote, *, recipient: str, sender: str | None = None
+    ) -> PreparedSwap:
         # 1. Descartar primero lo que el modo no permite: construir un payload
         #    que luego se va a rechazar es trabajo y red gastados en balde.
         self.gateway.precheck(Capability.PREPARE_TX)
@@ -91,22 +125,77 @@ class PrepareSwap:
         # 2. Construir. Sin efectos externos.
         transaction = await self.build(quote, recipient=recipient)
 
+        # 2b. El coste de red, con el payload ya construido: la estimación
+        #     necesita el calldata exacto, así que no puede ir antes. Y no
+        #     frustra la preparación si falla —ver `_estimate_cost`—.
+        coste, cost_error = await self._estimate_cost(transaction, quote, sender)
+
         # 3. Y ahora sí, pedir el sí explícito, con el payload real delante.
+        details = [
+            f"Entregas: {quote.amount_in}",
+            f"Recibes (estimado): {quote.amount_out}",
+            f"Precio de ejecución: {quote.price}",
+            f"Comisión del venue: {_fee_line(quote)}",
+            f"Impacto de precio: {_impact_line(quote)}",
+        ]
+        if coste is not None:
+            details.append(f"Coste de red: ≈ {coste.native} (estimación de gas)")
+        elif cost_error is not None:
+            # Decir un cero sería afirmar que es gratis, que es justo lo que no
+            # se sabe. Se dice lo que pasa y cuándo se sabrá.
+            details.append(
+                "Coste de red: la red no pudo estimarlo ahora mismo; se "
+                "reintenta al emitir."
+            )
+        details += [
+            f"Destino: {shorten(destination)}",
+            "Es un borrador: no se firma ni se emite nada.",
+        ]
         await self.gateway.authorize(
             Capability.PREPARE_TX,
             f"Preparar swap en {quote.venue.name}",
-            details=(
-                f"Entregas: {quote.amount_in}",
-                f"Recibes (estimado): {quote.amount_out}",
-                f"Precio de ejecución: {quote.price}",
-                f"Comisión del venue: {_fee_line(quote)}",
-                f"Impacto de precio: {_impact_line(quote)}",
-                f"Destino: {shorten(destination)}",
-                "Es un borrador: no se firma ni se emite nada.",
-            ),
+            details=tuple(details),
             transaction=transaction,
         )
-        return transaction
+        return PreparedSwap(
+            transaction=transaction, network_cost=coste, cost_error=cost_error
+        )
+
+    async def _estimate_cost(
+        self, transaction: PlannedTransaction, quote: Quote, sender: str | None
+    ) -> tuple[NetworkCost | None, str | None]:
+        """El coste de red, o el motivo por el que no lo hay. Nunca lanza.
+
+        Se estima **desde la cartera que firmaría** (`sender`), no desde el
+        destino: el gas depende de quién envía —un swap sin allowance revierte
+        y el nodo lo dice—. Por eso sin `sender` no se intenta: una cifra
+        medida desde otra dirección sería la de otra transacción.
+
+        Un fallo aquí no puede tumbar la preparación. Un borrador sirve para
+        mirar qué se haría aunque la red no conteste, y una transacción que hoy
+        revertiría —por ejemplo, porque el permiso del token aún no está dado—
+        es información para el usuario, no un motivo para no construir. El
+        motivo se guarda para poder enseñarlo en el panel.
+        """
+        if self.estimate is None or sender is None:
+            return None, None
+        if not isinstance(transaction, UnsignedTransaction):
+            # Una transacción de Solana no tiene `eth_estimateGas` que
+            # preguntar: no se intenta, y la interfaz lo enseña como «—».
+            return None, None
+        try:
+            coste = await self.estimate(
+                transaction, quote.pair.chain, from_address=sender
+            )
+        except Exception as error:
+            _log.warning(
+                "prepare_swap.cost_unavailable",
+                chain=quote.pair.chain,
+                engine=quote.engine_id,
+                error=str(error)[:200],
+            )
+            return None, str(error)
+        return coste, None
 
     def planner_for(self, quote: Quote) -> SwapPlanner:
         """El motor que **observó** esa cotización, de entre los que están activos.

@@ -37,11 +37,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -74,7 +72,6 @@ from amigocompora.domain.models import (
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import BasisPoints
-from amigocompora.ui import icons
 from amigocompora.ui.execution_gate import (
     cap_blockers,
     execution_blockers,
@@ -84,11 +81,8 @@ from amigocompora.ui.pages.bridges import BridgesSection
 from amigocompora.ui.pages.swap_card import SwapCard, position_of
 from amigocompora.ui.pages.token_picker import TokenPickerDialog
 from amigocompora.ui.receipt_dialog import SwapReceiptDialog
-from amigocompora.ui.theme import (
-    COLOR_DANGER,
-    COLOR_SUCCESS,
-    COLOR_WARNING,
-)
+from amigocompora.ui.route_list import RouteDetail, RouteList
+from amigocompora.ui.theme import COLOR_DANGER
 from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import (
     Card,
@@ -140,18 +134,33 @@ class PricesPage(QWidget):
         super().__init__(parent)
         self._container = container
         self._comparison: PriceComparison | None = None
+        #: Las cotizaciones **que la tabla está enseñando ahora mismo**, en el
+        #: mismo orden que sus filas. No siempre es `comparison.ranked`: con
+        #: `[ui] hide_quote_only_routes` las que no se pueden firmar no llegan a
+        #: la tabla, y la selección tiene que apuntar a lo que sí se ve.
+        self._shown_quotes: tuple[Quote, ...] = ()
         self._prepared: PlannedTransaction | None = None
+        #: La ruta de la que salió `_prepared`. El panel de detalle reinicia su
+        #: coste al cambiar de ruta —la estimación era de otra— salvo cuando la
+        #: ruta elegida es justo ésta, que es el caso que se da al volver de
+        #: `_do_prepare` con la cifra recién estimada.
+        self._prepared_quote: Quote | None = None
         #: La confirmación de la última operación emitida. Se guarda aquí para que no
         #: la recoja el recolector de basura antes de que se vea.
         self._recibo: SwapReceiptDialog | None = None
         #: Cotización automática: se lanza cuando el usuario deja de cambiar el importe
         #: o el par, no en cada tecla. `_quote_seq` marca cuál es la cotización vigente:
-        #: si llega otra antes de que acabe la anterior, la vieja se descarta.
+        #: si llega otra antes de que acabe la anterior, la vieja se descarta —y la
+        #: tarea en vuelo se cancela—, porque sus resultados ya no describen nada.
         self._quote_timer = QTimer(self)
         self._quote_timer.setSingleShot(True)
         self._quote_timer.setInterval(_PAUSA_COTIZACION_MS)
         self._quote_timer.timeout.connect(self._on_quote)
         self._quote_seq = 0
+        #: La cotización en vuelo, para poder cancelarla cuando se pide otra. Una
+        #: petición que ya no interesa no debe seguir gastando cuota de los motores
+        #: ni llegar tarde a pintar un par que el usuario ya cambió.
+        self._quote_task: asyncio.Task[None] | None = None
         #: Los saldos, compartidos con la lista de cartera. Una sola caché para
         #: las dos vistas: con dos, elegir un token dispararía dos peticiones al
         #: mismo nodo por el mismo dato, y en Solana el nodo es público y va
@@ -210,7 +219,7 @@ class PricesPage(QWidget):
         # las tarjetas que no saben usarlo.
         lay.addStretch(1)
 
-        self._table.itemSelectionChanged.connect(self._on_quote_selected)
+        self._routes.currentRowChanged.connect(self._on_quote_selected)
         self._chain.currentIndexChanged.connect(self._on_chain_changed)
         self._base.currentIndexChanged.connect(self._update_legs_labels)
         self._contra.currentIndexChanged.connect(self._update_legs_labels)
@@ -373,39 +382,33 @@ class PricesPage(QWidget):
 
         # Una tabla sin filas es un rectángulo gris grande que no dice nada: no se
         # distingue «todavía no has pedido nada» de «pediste y no hay ruta». El
-        # rótulo ocupa el sitio de la tabla mientras está vacía y lo explica.
+        # rótulo ocupa el sitio de la lista mientras está vacía y lo explica.
         self._routes_empty = QLabel("")
         self._routes_empty.setObjectName("empty")
         self._routes_empty.setWordWrap(True)
         self._routes_empty.setAlignment(Qt.AlignCenter)
         card.body().addWidget(self._routes_empty, stretch=1)
 
-        self._table = QTableWidget(0, 8)
-        self._table.setHorizontalHeaderLabels(
-            ["Venue", "Motor", "Recibes", "Precio", "Comisión", "Impacto", "Liquidez", "Nota"]
-        )
-        # Las cifras se ajustan a su contenido y el espacio sobrante lo reparten las
-        # dos columnas de texto (Venue y Nota). Antes, la de Venue también se ajustaba
-        # al contenido y la tabla se salía de la tarjeta con barra horizontal.
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
-        self._table.horizontalHeader().setMinimumSectionSize(72)
-        self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SingleSelection)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._table.setShowGrid(False)
-        self._table.verticalHeader().setVisible(False)
-        # Una fila por ruta y una línea por fila, con el texto largo recortado: es
-        # una tabla para comparar de un vistazo, no para leer prosa. Lo que no cabe
-        # se recupera en el tooltip de cada celda.
-        self._table.setWordWrap(False)
-        card.body().addWidget(self._table, stretch=1)
+        # Las rutas, como tarjetas de dos líneas en un listbox: lo que se compara
+        # —venue y lo que se recibe— arriba y el desglose debajo. La segunda línea
+        # se recorta antes que envolverse: una fila por ruta, para poder comparar
+        # de un vistazo, y lo que no cabe se recupera en el tooltip.
+        self._routes = RouteList()
+        card.body().addWidget(self._routes, stretch=1)
 
-        # La ruta elegida, escrita. Entre la tabla y los botones, porque es lo que
+        # Y debajo, la ruta elegida en filas de etiqueta y valor: es la que se va
+        # a preparar o firmar, y sus datos no compiten con los de las demás. El
+        # panel es también donde vive el coste de red estimado, que no se puede
+        # enseñar en la tarjeta porque no se conoce hasta preparar.
+        self._detail = RouteDetail()
+        # Nace oculto, como la lista: sin rutas que elegir, el rótulo que ocupa el
+        # sitio ya dice qué hacer y el panel repetiría la instrucción debajo.
+        self._detail.setVisible(False)
+        card.body().addWidget(self._detail)
+
+        # La ruta elegida, escrita. Entre la lista y los botones, porque es lo que
         # los botones van a usar: sin esta línea, «Ejecutar» actúa sobre una fila
-        # resaltada en una tabla de cifras y hay que deducir cuál.
+        # resaltada entre otras y hay que deducir cuál.
         self._chosen = QLabel("Selecciona una ruta para prepararla o firmarla.")
         self._chosen.setObjectName("hint")
         # De una línea, aunque el texto sea largo: una `QLabel` con `wordWrap`
@@ -471,8 +474,8 @@ class PricesPage(QWidget):
         card.add_row(note_row)
         # Nace plegada: sin cotización no hay nada que enseñar, y desplegada
         # empujaba el resto fuera de la pantalla en la primera visita —que es justo
-        # cuando el usuario viene a intercambiar, no a leer una tabla vacía—. Se
-        # abre sola en cuanto llega una cotización (`_fill_table`).
+        # cuando el usuario viene a intercambiar, no a leer una lista vacía—. Se
+        # abre sola en cuanto llega una cotización (`_fill_routes`).
         self._routes_card = card
         card.set_collapsible(expanded=False)
         return _hugs_content(card)
@@ -682,12 +685,32 @@ class PricesPage(QWidget):
         no hay operación que cotizar, y pedir precios igualmente gastaría peticiones
         a los motores. Cada llamada reinicia la cuenta atrás, así que sólo el último
         cambio se convierte en petición.
+
+        **Lo que había en pantalla se vacía aquí mismo**, en cuanto cambia algo:
+        rutas, panel, oportunidades, la línea de la ruta elegida y el borrador
+        preparado describían el importe o el par anteriores, y dejarlos mientras
+        llega la cotización nueva era enseñar como actual algo que ya no lo es
+        —o peor, ofrecer para firmar lo que ya no está en pantalla—. La
+        cotización en vuelo se cancela con lo demás: una petición que ya no
+        interesa no debe gastar cuota ni competir con la nueva.
         """
         entrega, recibe = self._legs()
-        if entrega is None or recibe is None or entrega.is_same_asset(recibe):
+        if entrega is None or recibe is None:
             self._quote_timer.stop()
+            self._invalidate_quote()
+            self._clear_results("Elige las dos patas del par para poder cotizar.")
+            return
+        if entrega.is_same_asset(recibe):
+            self._quote_timer.stop()
+            self._invalidate_quote()
+            self._clear_results(
+                f"«{entrega.symbol}» en las dos patas no es una operación: "
+                f"elige dos tokens distintos."
+            )
             return
         self._quote_timer.start()
+        self._invalidate_quote()
+        self._clear_results("Cotizando…")
 
     def _on_invert(self) -> None:
         """Da la vuelta al par, conservando lo elegido en cada pata.
@@ -721,7 +744,7 @@ class PricesPage(QWidget):
     # Cotizar
     # ------------------------------------------------------------------ #
     def _on_quote(self) -> None:
-        """Lanza una cotización nueva. La vieja, si sigue en vuelo, ya no se mostrará.
+        """Lanza una cotización nueva. La vieja, si sigue en vuelo, se cancela.
 
         No se desactiva el botón de cotizar: una cotización automática no debe impedir
         pedir otra cuando el usuario cambie algo mientras la anterior llega.
@@ -733,9 +756,26 @@ class PricesPage(QWidget):
             # Sin bucle asíncrono —una prueba síncrona, nunca la aplicación, que corre
             # sobre qasync— no hay dónde lanzar la petición. Se sale sin ruido.
             return
-        self._quote_seq += 1
+        self._invalidate_quote()
         self._card.set_status("Cotizando…")
-        spawn(self._do_quote(self._quote_seq))
+        self._quote_task = spawn(self._do_quote(self._quote_seq))
+
+    def _invalidate_quote(self) -> None:
+        """Da por vieja la cotización en vuelo y la detiene si sigue viva.
+
+        Sube el número de secuencia —lo que hace que sus resultados se descarten
+        aunque lleguen, ver `_do_quote`— y cancela la tarea: los motores se
+        preguntaron para el importe anterior, y dejarlos correr gastaba cuota de
+        las fuentes públicas y competía con la cotización nueva por el mismo
+        hueco de red. Cancelar una tarea es seguro aquí: los casos de uso no
+        dejan estado a medias, y el `finally` de `_do_quote` recalcula los
+        botones desde lo que haya en pantalla, se cancele o no.
+        """
+        self._quote_seq += 1
+        task = self._quote_task
+        self._quote_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _do_quote(self, seq: int | None = None) -> None:
         # Una llamada directa (sin `seq`) es la cotización vigente. Una lanzada desde
@@ -776,14 +816,19 @@ class PricesPage(QWidget):
             if seq != self._quote_seq:
                 return
             self._comparison = comparison
-            self._fill_table(comparison)
+            self._fill_routes(comparison)
             # La mejor ruta queda elegida. Obligar a pulsar una fila después de haber
             # pedido la comparación es pedir dos veces lo mismo, y deja los botones
             # apagados sin que se vea por qué.
-            if self._table.rowCount() > 0:
-                self._table.selectRow(0)
-            # También buscar oportunidades con el umbral por defecto.
-            opps = await self._container.scan_opportunities(pair, amount)
+            if self._routes.count() > 0:
+                self._routes.select_row(0)
+            # También buscar oportunidades con el umbral por defecto, sobre la
+            # comparación que ya está en pantalla: volver a pedirla a todos los
+            # motores era una segunda ronda completa de la misma cotización, y el
+            # mayor trozo del tiempo que se pasaba en «Cotizando…».
+            opps = await self._container.scan_opportunities(
+                pair, amount, comparison=comparison
+            )
             if seq != self._quote_seq:
                 return
             self._fill_opps(opps)
@@ -795,87 +840,67 @@ class PricesPage(QWidget):
             self._card.quote_btn.setEnabled(True)
             self._on_quote_selected()
 
-    def _fill_table(self, comp: PriceComparison) -> None:
+    def _fill_routes(self, comp: PriceComparison) -> None:
         # Se despliega **antes** de rellenar, no después: la tarjeta es la que dice
         # que la cotización llegó, y plegada el botón «Cotizar» parecería no haber
         # hecho nada.
         self._routes_card.set_expanded(True)
-        self._table.setRowCount(0)
-        self._route_count.setText(f"{len(comp.quotes)} ruta(s) de {comp.pair.base.symbol}")
-        for quote in comp.ranked:
-            row = self._table.rowCount()
-            self._table.insertRow(row)
-            fee = str(quote.fee_bps) if quote.fee_bps is not None else "— no desglosada"
-            fee_basis = quote.fee_basis.value if quote.fee_basis is not None else "—"
-            self._table.setItem(row, 0, QTableWidgetItem(quote.venue.name))
-            # Qué motor produjo la cifra. Con varios motores activos la tabla es una
-            # mezcla, y dos motores pueden cotizar el mismo par por caminos
-            # distintos: sin esta columna, dos filas del mismo venue parecerían un
-            # error de la vista en vez de dos fuentes que no coinciden.
-            motor = QTableWidgetItem(quote.engine_id)
-            motor.setIcon(icons.brand_icon(quote.engine_id))
-            self._table.setItem(row, 1, motor)
-            # El valor completo se guarda en la celda y el texto visible se decide en
-            # `_apply_decimales`: así la casilla no tiene que volver a consultar nada.
-            out = QTableWidgetItem()
-            out.setData(Qt.UserRole, str(quote.amount_out))
-            out.setToolTip(str(quote.amount_out))
-            if row == 0:
-                # La primera fila es la mejor ruta: se marca en verde para que se lea
-                # sin comparar las cifras una a una.
-                out.setForeground(QColor(COLOR_SUCCESS))
-            self._table.setItem(row, 2, out)
-            price = QTableWidgetItem()
-            price.setData(Qt.UserRole, str(quote.price))
-            price.setToolTip(str(quote.price))
-            self._table.setItem(row, 3, price)
-            item_fee = QTableWidgetItem(f"{fee} [{fee_basis}]")
-            if not quote.fee_is_known:
-                item_fee.setForeground(QColor(COLOR_WARNING))
-            self._table.setItem(row, 4, item_fee)
-            # Un impacto sin publicar no es un cero: se escribe igual que en el
-            # diálogo de confirmación, para que las dos vistas digan lo mismo de la
-            # misma cotización.
-            impact = (
-                str(quote.price_impact_bps)
-                if quote.price_impact_bps is not None
-                else "— no publicado"
+        # Qué es firmable se pregunta **una vez** por ruta y se guarda: lo piden el
+        # filtro del ajuste, la marca de la tarjeta y los botones, y tres llamadas
+        # al registro para el mismo dato serían tres sitios donde puede cambiar de
+        # respuesta a mitad de pintar.
+        pares = [(quote, self._container.prepare_swap.can_build(quote)) for quote in comp.ranked]
+        ocultas = 0
+        if self._container.settings.ui.hide_quote_only_routes:
+            # El ajuste pide una lista sin lo que no se puede firmar: se van
+            # enteras las rutas de motores que no construyen el swap —no se
+            # pueden firmar— en vez de quedarse marcadas en ámbar. Se cuentan
+            # para poder decir cuántas se ocultaron: una lista con menos filas
+            # de las que hay no puede parecer completa.
+            pares = [(quote, firmable) for quote, firmable in pares if firmable]
+            ocultas = len(comp.quotes) - len(pares)
+        quotes = tuple(quote for quote, _ in pares)
+        self._shown_quotes = quotes
+        simbolo = comp.pair.base.symbol
+        if ocultas:
+            self._route_count.setText(
+                f"{len(quotes)} de {len(comp.quotes)} ruta(s) de {simbolo} · "
+                f"{ocultas} de sólo cotización oculta(s)"
             )
-            impact_basis = (
-                quote.impact_basis.value if quote.impact_basis is not None else "—"
-            )
-            item_imp = QTableWidgetItem(f"{impact} [{impact_basis}]")
-            if not quote.impact_is_known or not quote.is_exact:
-                item_imp.setForeground(QColor(COLOR_WARNING))
-            self._table.setItem(row, 5, item_imp)
-            self._table.setItem(
-                row, 6, QTableWidgetItem(str(quote.liquidity) if quote.liquidity else "—")
-            )
-            nota = QTableWidgetItem(quote.source_note)
-            # La nota se recorta en pantalla —la fila tiene que seguir siendo de una
-            # línea— así que el texto entero se lee aquí. Sin esto, la columna que
-            # dice de dónde sale cada cifra sería la única que no se puede leer.
-            nota.setToolTip(quote.source_note)
-            self._table.setItem(row, 7, nota)
+        else:
+            self._route_count.setText(f"{len(comp.quotes)} ruta(s) de {simbolo}")
+        self._routes.set_quotes(quotes, firmables=tuple(f for _, f in pares))
         self._apply_decimales()
-        set_empty(
-            self._table,
-            self._routes_empty,
-            "Ningún motor activo devolvió una ruta para este par y este importe. "
-            "Cotizar no firma nada: se puede probar con otro importe o con otro par.",
-        )
-        _cap_height(self._table)
+        # El panel de detalle sólo tiene sentido cuando hay rutas que elegir: sin
+        # ninguna, el rótulo que ocupa el sitio de la lista ya dice qué hacer y el
+        # panel repetiría la instrucción debajo.
+        self._detail.setVisible(bool(quotes))
+        if not quotes and ocultas:
+            # La lista no está vacía porque nadie contestara: está vacía porque
+            # todo lo que contestó sólo cotiza y el ajuste lo oculta. Decir
+            # «ningún motor devolvió nada» sería falso, así que se dice la
+            # verdad y se nombra la salida —la clave de la configuración—, que
+            # es lo único que el usuario puede hacer al respecto.
+            motivo = (
+                f"Las {ocultas} ruta(s) disponibles sólo cotizan y no construyen el "
+                f"swap, así que este ajuste no las enseña. Sirven para comparar "
+                f"cifras, no para firmar; para verlas, pon hide_quote_only_routes = "
+                f"false en la sección [ui] de la configuración."
+            )
+        else:
+            motivo = (
+                "Ningún motor activo devolvió una ruta para este par y este importe. "
+                "Cotizar no firma nada: se puede probar con otro importe o con otro par."
+            )
+        set_empty(self._routes, self._routes_empty, motivo)
+        self._routes.cap_height()
 
     def _apply_decimales(self) -> None:
-        """Pone los importes de «Recibes» y «Precio» a 4 decimales, o completos."""
+        """Pone los importes de la lista y del panel a 4 decimales, o completos."""
         completos = self._todos_decimales.isChecked()
-        for row in range(self._table.rowCount()):
-            for column in (2, 3):
-                item = self._table.item(row, column)
-                if item is None:
-                    continue
-                completo = str(item.data(Qt.UserRole))
-                item.setText(completo if completos else _cifra_corta(completo))
+        for card in self._routes.cards():
+            card.set_completo(completos)
+        self._detail.set_completo(completos)
 
     def _fill_opps(self, opps: tuple[Opportunity, ...]) -> None:
         self._opps_card.set_expanded(True)
@@ -936,47 +961,67 @@ class PricesPage(QWidget):
         )
 
     def _clear_results(self, motivo: str) -> None:
-        """Deja las dos tablas vacías y **diciendo por qué** están vacías."""
-        self._table.setRowCount(0)
+        """Deja la lista y la tabla vacías y **diciendo por qué** están vacías."""
+        self._routes.set_quotes((), firmables=())
         self._opp_table.setRowCount(0)
+        self._shown_quotes = ()
         self._route_count.setText("")
-        set_empty(self._table, self._routes_empty, motivo)
+        # El panel de detalle se va con la lista: sin rutas que elegir, el rótulo
+        # que ocupa su sitio ya dice qué hacer y el panel sobraría.
+        self._detail.clear()
+        self._detail.setVisible(False)
+        # El borrador preparado era de lo anterior —otro importe, otro par—:
+        # dejarlo guardable sería ofrecer para firmar un swap que ya no está en
+        # pantalla. Se retira con lo demás y se vuelve a preparar cuando toque;
+        # la ruta de la que salió se olvida con él.
+        self._prepared = None
+        self._prepared_quote = None
+        self._save_btn.setEnabled(False)
+        set_empty(self._routes, self._routes_empty, motivo)
         set_empty(self._opp_table, self._opps_empty, motivo)
-        _cap_height(self._table)
+        self._routes.cap_height()
         _cap_height(self._opp_table)
+        # Y botones y línea de la ruta elegida se recalculan aquí mismo: con la
+        # lista vacía no hay nada que preparar ni firmar, y dejarlos encendidos
+        # apuntando a una ruta recién retirada es ofrecer un botón que no lleva
+        # a ninguna parte. Pasa en cada cambio de importe o de par, así que tiene
+        # que ser barato: `_on_quote_selected` sólo lee estado y pinta etiquetas.
+        self._on_quote_selected()
 
     # ------------------------------------------------------------------ #
     # La ruta elegida
     # ------------------------------------------------------------------ #
     def _selected_quote(self) -> Quote | None:
-        model = self._table.selectionModel()
-        rows = model.selectedRows() if model else []
-        if not rows or self._comparison is None:
+        if self._comparison is None:
             return None
-        ranked = self._comparison.ranked
-        index = rows[0].row()
-        return ranked[index] if 0 <= index < len(ranked) else None
+        # El índice es el de la fila visible, y la lista puede estar enseñando
+        # un subconjunto —las de sólo cotización ocultas—: por eso la fila
+        # apunta a lo que se enseña y no a la comparación entera, donde los
+        # índices no coincidirían.
+        index = self._routes.current_row()
+        mostradas = self._shown_quotes
+        return mostradas[index] if 0 <= index < len(mostradas) else None
 
     def _on_quote_selected(self) -> None:
         quote = self._selected_quote()
-        self._swap_btn.setEnabled(
-            quote is not None and self._container.prepare_swap.can_build(quote)
-        )
+        firmable = quote is not None and self._container.prepare_swap.can_build(quote)
+        self._swap_btn.setEnabled(firmable)
         motivos = self._execution_blockers(quote.pair if quote is not None else None, quote)
         self._exec_btn.setEnabled(quote is not None and not motivos)
 
         if quote is None:
-            # Con la tabla vacía el rótulo que ocupa su sitio ya dice qué hacer;
+            # Con la lista vacía el rótulo que ocupa su sitio ya dice qué hacer;
             # repetir aquí lo mismo sería la misma frase dos veces en la misma
             # tarjeta. La línea existe para cuando **sí** hay rutas y ninguna
             # elegida, que es cuando hace falta decir qué falta.
             self._chosen.setText(
                 "Selecciona una ruta para prepararla o firmarla."
-                if self._table.rowCount() > 0
+                if self._routes.count() > 0
                 else ""
             )
             self._chosen.setToolTip("")
             self._card.set_estimate("—", known=False)
+            self._detail.clear()
         else:
             resumen = (
                 f"{quote.venue.name} · motor {quote.engine_id} · "
@@ -988,6 +1033,18 @@ class PricesPage(QWidget):
             # Aquí está la misma frase entera, para que recortar no sea perder.
             self._chosen.setToolTip(f"Ruta elegida: {resumen}")
             self._card.set_estimate(f"≈ {quote.amount_out}")
+            self._detail.set_quote(
+                quote,
+                firmable=firmable,
+                owner=self._owner(),
+                slippage_bps=self._container.settings.execution.slippage_bps,
+            )
+            # Al cambiar de ruta el coste vuelve a «se estima al preparar»: la
+            # cifra que hubiera era de otra ruta. La excepción es la ruta recién
+            # preparada, que es el caso que se da al volver de `_do_prepare` con
+            # la estimación recién puesta.
+            if quote is not self._prepared_quote:
+                self._detail.reset_cost()
 
         # El motivo se enseña sólo cuando ya hay una cotización elegida: antes de eso
         # el botón apagado no dice nada que el usuario no sepa ya, y un aviso
@@ -1119,9 +1176,20 @@ class PricesPage(QWidget):
 
     async def _do_prepare(self, quote: Quote, recipient: str) -> None:
         try:
-            transaction = await self._container.prepare_swap(quote, recipient=recipient)
-            self._prepared = transaction
+            # El coste de red se estima desde la cartera que firmaría —y en este
+            # flujo la que firmaría es la misma que recibe— y **dentro** del caso
+            # de uso: es una llamada a la red por ruta y aquí ya hay una elegida.
+            # Un fallo de estimación no llega hasta aquí como excepción: viaja en
+            # `cost_error` y la preparación sigue.
+            prepared = await self._container.prepare_swap(
+                quote, recipient=recipient, sender=recipient
+            )
+            self._prepared = prepared.transaction
+            self._prepared_quote = quote
             self._save_btn.setEnabled(True)
+            # Tal cual salió: la cifra, el motivo del fallo o —en Solana— la raya
+            # de «no aplica», que no es lo mismo que un cero.
+            self._detail.set_cost(prepared.network_cost, prepared.cost_error)
             self._card.set_status(
                 "Transacción preparada y confirmada. Amigocompora NO la ha firmado ni "
                 "emitido: guárdala y fírmala en tu cartera."
@@ -1294,31 +1362,6 @@ def _hugs_content(card: Card) -> Card:
     """
     card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
     return card
-
-
-def _cifra_corta(texto: str, decimales: int = 4) -> str:
-    """Un importe como `«0.0265213038 UNI»` con `decimales` decimales.
-
-    Se **trunca**, no se redondea: `0,026521…` se lee como `0,0265`, y nunca como
-    algo mayor de lo que hay. Un valor distinto de cero que se volvería cero (un
-    `0,00002` a 4 decimales) se muestra con sus dos primeras cifras significativas,
-    porque un `0,0000` debajo de una cifra real también miente. Si el texto no es un
-    número, se devuelve tal cual.
-    """
-    numero, _, simbolo = texto.partition(" ")
-    try:
-        valor = Decimal(numero)
-    except InvalidOperation:
-        return texto
-    if valor == 0:
-        corto = Decimal(0).quantize(Decimal(1).scaleb(-decimales))
-    else:
-        corto = valor.quantize(Decimal(1).scaleb(-decimales), rounding=ROUND_DOWN)
-        if corto == 0:
-            # `adjusted()` es el exponente de la cifra más significativa: dos cifras
-            # significativas llegan hasta `adjusted() - 1`.
-            corto = valor.quantize(Decimal(1).scaleb(valor.adjusted() - 1), rounding=ROUND_DOWN)
-    return f"{corto:f} {simbolo}" if simbolo else f"{corto:f}"
 
 
 def _cap_height(table: QTableWidget, filas: int = 10) -> None:

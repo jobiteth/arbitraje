@@ -1,7 +1,7 @@
-"""Motor de Uniswap: unidades del impacto, destino del build y deriva de precio.
+"""Motor de Uniswap: impacto, destino del build, deriva de precio y el nativo.
 
-Los tres bloques de pruebas existen porque cada uno cubre algo que puede perder
-dinero o pintar un dato falso, y ninguno se detecta solo:
+Cada bloque existe porque cubre algo que puede perder dinero o pintar un dato
+falso, y ninguno se detecta solo:
 
 - **Las unidades de `priceImpact`.** El campo se llama igual que el de Jupiter
   salvo por `Pct`, y mide cosas distintas: allí es una fracción, aquí un
@@ -14,6 +14,10 @@ dinero o pintar un dato falso, y ninguno se detecta solo:
 - **La deriva de precio.** Medido: el endpoint de swap construye sobre la
   cotización que se le entregue sin recomprobar nada. Si la comprobación se
   rompe, nada más la echa de menos.
+- **La dirección cero del nativo.** El nativo no tiene contrato, y la API lo
+  nombra con la dirección cero —con el centinela de 0x responde
+  `NoRouteFoundError`—. Se afirma la dirección que viaja en la petición porque
+  equivocarla es dejar sin ruta justo a vender la moneda de la red.
 
 `plan_swap` va contra el `JsonSource` real con `respx` por debajo, así que se
 ejercitan de verdad la lista blanca de hosts, la caché por `cache_key`, el mapeo
@@ -42,7 +46,7 @@ from amigocompora.domain.errors import (
 )
 from amigocompora.domain.models import Measurement, Quote, Token, TradingPair, Venue, VenueKind
 from amigocompora.domain.money import BasisPoints, TokenAmount
-from amigocompora.engines.catalog import quote_token, wrapped_native
+from amigocompora.engines.catalog import native_token, quote_token, wrapped_native
 from amigocompora.engines.uniswap.engine import (
     CONFIG_API_KEY,
     MANIFEST,
@@ -78,6 +82,88 @@ def _sin_red() -> Iterator[None]:
     """
     with respx.mock:
         yield
+
+
+# --------------------------------------------------------------------------- #
+# El nativo: la dirección cero
+# --------------------------------------------------------------------------- #
+async def test_cotiza_el_nativo_con_la_direccion_cero() -> None:
+    """Medido el 2026-10-09: sin el centinela la API no busca ruta al nativo.
+
+    Es el caso que dejaba «1 POL → pUSD» sin ninguna cotización —el motor se
+    rendía antes de preguntar—, así que se afirma la dirección concreta que
+    viaja en la petición, que es el contrato entero de este arreglo, y no una
+    constante del módulo: el valor tiene que ser «todo ceros» aunque alguien
+    cambie la constante.
+    """
+    stable = _pair("polygon").base
+    native = native_token("polygon")
+    pair = TradingPair(base=native, quote=stable)
+    amount = TokenAmount(10**18, native.decimals, native.symbol)
+    route = _mock_quote(in_raw=str(10**18))
+
+    async with _engine() as engine:
+        quotes = await engine.quote(pair, amount)
+
+    assert len(quotes) == 1
+    assert quotes[0].amount_out.raw == int(_OUT_RAW)
+    body = _body_of(route.calls[-1].request)
+    assert body["tokenIn"] == "0x0000000000000000000000000000000000000000"
+
+
+async def test_recibir_el_nativo_tambien_usa_la_direccion_cero() -> None:
+    """La otra dirección del par: comprar nativo se nombra igual."""
+    stable = _pair("polygon").base
+    native = native_token("polygon")
+    pair = TradingPair(base=stable, quote=native)
+    amount = TokenAmount(int(_IN_RAW), stable.decimals, stable.symbol)
+    route = _mock_quote()
+
+    async with _engine() as engine:
+        quotes = await engine.quote(pair, amount)
+
+    assert len(quotes) == 1
+    body = _body_of(route.calls[-1].request)
+    assert body["tokenOut"] == "0x0000000000000000000000000000000000000000"
+
+
+async def test_el_build_del_nativo_lleva_el_value() -> None:
+    """Al vender nativo el importe viaja como `value` y el router lo envuelve.
+
+    Medido: la transacción que la API devuelve para 1 POL trae
+    `value = 0x0de0b6b3a7640000` (10¹⁸) contra el router medido de la red. El
+    lector del `value` ya existía; lo que faltaba era llegar hasta aquí.
+    """
+    native = native_token("polygon")
+    stable = _pair("polygon").base
+    pair = TradingPair(base=native, quote=stable)
+    amount = TokenAmount(10**18, native.decimals, native.symbol)
+    quote = Quote(
+        venue=Venue(
+            venue_id="uniswap@polygon",
+            name="Uniswap (agregado, polygon)",
+            kind=VenueKind.DEX,
+            chain="polygon",
+        ),
+        engine_id=MANIFEST.engine_id,
+        pair=pair,
+        amount_in=amount,
+        amount_out=TokenAmount(int(_OUT_RAW), stable.decimals, stable.symbol),
+        fee_bps=None,
+        fee_basis=None,
+        price_impact_bps=BasisPoints(1),
+        observed_at=NOW,
+        impact_basis=Measurement.REPORTED,
+    )
+    _mock_quote(in_raw=str(10**18))
+    _mock_swap(to=ROUTERS["polygon"], value="0x0de0b6b3a7640000")
+
+    async with _engine() as engine:
+        transaction = await engine.plan_swap(quote, recipient=_RECIPIENT)
+
+    assert transaction.value.raw == 10**18
+    assert transaction.value.symbol == native.symbol
+    assert transaction.to_address == ROUTERS["polygon"]
 
 
 # --------------------------------------------------------------------------- #

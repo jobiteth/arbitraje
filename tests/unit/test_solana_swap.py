@@ -165,10 +165,15 @@ def test_rechaza_una_transaccion_incompleta(
 # --------------------------------------------------------------------------- #
 async def test_acepta_un_destino_de_solana_para_un_par_de_solana() -> None:
     prepare, planner = await _prepare(OperationMode.ASSISTED, answer=True)
-    tx = await prepare(_solana_quote(), recipient=WSOL)
+    prepared = await prepare(_solana_quote(), recipient=WSOL)
     assert [recipient for _, recipient in planner.planned] == [WSOL]
+    tx = prepared.transaction
     assert isinstance(tx, UnsignedSolanaTransaction)
     assert tx.fee_payer == WSOL
+    # En Solana no hay coste de red que estimar con `eth_estimateGas`, así que
+    # ni se intenta: sin coste y sin motivo, que la interfaz enseña como «—».
+    assert prepared.network_cost is None
+    assert prepared.cost_error is None
 
 
 async def test_rechaza_un_destino_evm_para_un_par_de_solana() -> None:

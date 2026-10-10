@@ -279,8 +279,11 @@ class TokenPickerDialog(QDialog):
             self._table.selectRow(fila)
 
     def _allowed(self, token: Token) -> bool:
-        permitidos = self._container.policy.limits.allowed_tokens
-        return not permitidos or token.symbol in permitidos
+        limites = self._container.policy.limits
+        # Vacía no marca nada —está a medio configurar, no roto—; con lista,
+        # decide `allows_token`, que es lo que decidirá el caso de uso al firmar:
+        # así un `pUSD` con la lista diciendo `PUSD` no sale en gris.
+        return not limites.allowed_tokens or limites.allows_token(token.symbol)
 
     def _refresh_import(self, filtro: str) -> None:
         """Ofrece importar lo pegado cuando es una dirección que no está en la lista.

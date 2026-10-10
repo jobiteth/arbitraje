@@ -8,6 +8,7 @@ y las claves de nodo se mezclaban con las de motor sin que se viera cuál era cu
 from __future__ import annotations
 
 import re
+from typing import Protocol
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -21,7 +22,6 @@ from PySide6.QtWidgets import (
 )
 
 from amigocompora.app.container import Container
-from amigocompora.domain.errors import KeyCustodyError
 from amigocompora.infra.config import Settings
 from amigocompora.infra.secrets import (
     AUTONOMY_PASSPHRASE_SECRET,
@@ -31,9 +31,7 @@ from amigocompora.infra.secrets import (
     POLYMARKET_RELAYER_ADDRESS_SECRET,
     POLYMARKET_RELAYER_KEY_SECRET,
     PRIVATE_KEY_SECRET,
-    AutonomyPassphraseProvider,
     SecretStoreError,
-    SpendingKeyProvider,
     app_env_var_name,
     app_secret_key,
     env_var_name,
@@ -49,6 +47,19 @@ from amigocompora.ui.widgets import Card
 #: el llavero, pero ninguna URL podría llamarlo nunca — una credencial que no se
 #: puede usar es peor que no tenerla, porque parece configurada.
 NOMBRE_VALIDO = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class _SecretSource(Protocol):
+    """Lo mínimo que esta pantalla necesita de un proveedor de secretos.
+
+    Es la pregunta «¿el valor que falta llegaría por el entorno?», y se le hace
+    al proveedor de verdad —el que firmará, o el que armará la autonomía— y no a
+    `os.environ` por nuestra cuenta. La cartera multi-cartera añade un matiz que
+    sólo ella sabe contestar: con una cartera cifrada activa no hay variable que
+    sirva, porque una clave cifrada no se lee del entorno.
+    """
+
+    def env_lookup(self) -> str | None: ...
 
 
 def rpc_secret_usage(settings: Settings) -> dict[str, tuple[str, ...]]:
@@ -91,7 +102,7 @@ class CredentialsCard(QWidget):
         self._secret_fields: dict[str, QLineEdit] = {}
         self._secret_states: dict[str, QLabel] = {}
         self._secret_notes: dict[str, str] = {}
-        self._secret_sources: dict[str, SpendingKeyProvider | AutonomyPassphraseProvider] = {
+        self._secret_sources: dict[str, _SecretSource] = {
             app_secret_key(PRIVATE_KEY_SECRET): container.keys,
             app_secret_key(AUTONOMY_PASSPHRASE_SECRET): container.passphrase,
         }
@@ -245,7 +256,9 @@ class CredentialsCard(QWidget):
                 app_secret_key(PRIVATE_KEY_SECRET),
                 "Clave privada de la cartera",
                 "Con ella se firma. Se lee sólo en el momento de firmar y no se "
-                "guarda en ningún objeto.",
+                "guarda en ningún objeto. Es la clave de la cartera heredada —la "
+                "del llavero—; las demás carteras, cifradas o en modo observación, "
+                "se gestionan en la pestaña Cartera.",
                 True,
             ),
             (
@@ -412,7 +425,10 @@ class CredentialsCard(QWidget):
         Se pregunta al **proveedor de verdad** —el mismo que usará el caso de uso
         al firmar— y no al entorno por nuestra cuenta: mirar `os.environ` diría
         que hay una clave ahí aunque el respaldo estuviera apagado y el proveedor
-        fuera a negarse, que es prometer una firma que no va a ocurrir.
+        fuera a negarse, que es prometer una firma que no va a ocurrir. Con
+        varias carteras hay un matiz más que sólo el proveedor sabe: una cartera
+        cifrada no se lee del entorno, así que con ella activa no hay variable
+        que ofrecer.
 
         Sólo devuelve algo cuando el almacén ya ha fallado —es donde se llama—,
         así que un valor aquí significa necesariamente que vino del entorno.
@@ -420,12 +436,7 @@ class CredentialsCard(QWidget):
         proveedor = self._secret_sources.get(key)
         if proveedor is None:
             return None
-        try:
-            return proveedor.env_var if proveedor.get() else None
-        except KeyCustodyError:
-            # El respaldo está apagado: no hay nada por otra vía, y nombrar una
-            # variable que el proveedor no va a leer sería mentir.
-            return None
+        return proveedor.env_lookup()
 
     def _refresh_secrets(self) -> None:
         """Repinta el estado de cada credencial. **Nunca el valor.**

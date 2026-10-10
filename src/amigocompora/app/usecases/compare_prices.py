@@ -11,10 +11,16 @@ frente en la misma tabla en vez de tener que elegir uno y perder al otro.
 Un motor que falla no detiene la comparación —ésa es la razón de tener
 respaldos— pero tampoco desaparece sin dejar rastro: su id viaja en
 `failed_engines` y la interfaz lo dice. Ver `PriceComparison`.
+
+Los motores se consultan **en paralelo**: el tiempo de la comparación es el del
+motor más lento, no la suma de todos. En secuencia, cinco motores activos eran
+varios segundos de espera antes de enseñar la primera cifra, y el más lento
+retrasaba también a los que ya habían respondido.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import structlog
@@ -54,23 +60,40 @@ class ComparePrices:
         failed: list[str] = []
         first_error: BaseException | None = None
 
-        for engine in engines:
+        # Los motores se preguntan **a la vez**, no uno tras otro: en secuencia el
+        # tiempo de la comparación era la suma de las latencias de todos —con
+        # cinco motores activos, varios segundos antes de la primera cifra— y un
+        # motor lento retrasaba también a los que ya habían respondido. En
+        # paralelo manda el más lento, que es lo mejor que se puede hacer sin
+        # dejar de preguntarles a todos.
+        respuestas = await asyncio.gather(
+            *(engine.quote(pair, amount_in) for engine in engines),
+            return_exceptions=True,
+        )
+        # El pliegue va en el orden de la pila aunque las respuestas lleguen al
+        # revés: de ese orden dependen los desempates de `_keep_one` —«se queda la
+        # primera»— y cuál de los fallos se propaga cuando fallan todos. Por eso
+        # no vale procesar según vayan llegando.
+        for engine, found in zip(engines, respuestas, strict=True):
             engine_id = engine.manifest.engine_id
-            try:
-                found = await engine.quote(pair, amount_in)
-            except Exception as error:
+            if isinstance(found, BaseException):
+                if not isinstance(found, Exception):
+                    # Cancelaciones y cierres no se tragan: `gather` los captura
+                    # como un resultado más y aquí se devuelven a su cauce, igual
+                    # que cuando la consulta era secuencial.
+                    raise found
                 # Se sigue con los demás. Que una fuente se caiga, agote su cuota
                 # o cambie de formato no puede dejar al usuario sin comparación:
                 # para eso están los respaldos. Se registra y se dice.
                 failed.append(engine_id)
                 if first_error is None:
-                    first_error = error
+                    first_error = found
                 _log.warning(
                     "compare.engine_failed",
                     engine_id=engine_id,
                     pair=pair.symbol,
                     chain=pair.chain,
-                    error=str(error),
+                    error=str(found),
                 )
                 continue
             for quote in found:

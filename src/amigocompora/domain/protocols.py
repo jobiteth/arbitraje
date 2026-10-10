@@ -27,11 +27,13 @@ from amigocompora.domain.models import (
     BridgeQuote,
     BridgeRequest,
     MarketDepth,
+    MarketTag,
     PlannedTransaction,
     PredictionMarket,
     PredictionOrder,
     PredictionPosition,
     PredictionSide,
+    PredictionSort,
     Quote,
     SignedPredictionOrder,
     SubmittedPredictionOrder,
@@ -510,6 +512,8 @@ class PredictionMarketEngine(Engine, Protocol):
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
         """Mercados abiertos, por volumen; o los que cierran dentro de una ventana.
 
@@ -518,6 +522,14 @@ class PredictionMarketEngine(Engine, Protocol):
         pide lo que antes cierra, que es la vista de «lo que está terminando», y
         un mercado sin fecha de cierre legible se queda fuera: no se puede
         afirmar que cierre pronto quien no dice cuándo cierra.
+
+        `sort` elige el criterio —lo recién creado, lo más movido en 24 h, el
+        volumen de siempre— y `category` limita a una etiqueta, tal cual la
+        publica la fuente. Los dos se piden a la fuente **y** se vuelven a
+        aplicar de este lado, como el orden de la ventana: un motor que ignore
+        el parámetro —o una fuente que no lo entienda— no puede contestar con
+        algo que no se pidió. Y una etiqueta es información de adorno: si no se
+        puede averiguar, el mercado se devuelve sin ella, nunca se cae por ella.
         """
         ...
 

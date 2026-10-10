@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -89,6 +90,22 @@ ORDER_KIND: Final = "order"
 #: posición gastaría presupuesto del día y podría dejar al usuario sin poder
 #: operar por haber recuperado su propio dinero.
 REDEEM_KIND: Final = "redeem"
+
+#: Tipo de asiento de la **recepción** en destino de un puente (`receiveMessage`
+#: de CCTP). Entra dinero, como el cobro de una predicción, y por eso tiene
+#: nombre propio: como `transaction`, un `SUCCESS` lo daría por bueno y recibir
+#: lo que ya se quemó y autorizó empezaría a gastar el presupuesto del día. Hoy
+#: el importe anotado es cero —el mensaje de Circle no trae el importe
+#: decodificado—, así que la cifra del tope no cambiaría de suma; se dice por
+#: tipo para que tampoco cambie el día que se sepa el importe.
+RECEIVE_KIND: Final = "receive"
+
+#: Tipo de asiento de una **aprobación** de ERC-20. No mueve valor —concede un
+#: permiso a un router— y se anota con importe cero, pero es un hecho que hay
+#: que poder leer: sin él, el registro no podría explicar por qué un router tuvo
+#: autorización sobre el token de alguien. Se separa del gasto para que el hecho
+#: de contar o no dependa del tipo y no del estado del recibo.
+APPROVAL_KIND: Final = "approval"
 
 #: Motivo con el que se anota una ejecución que no pasó por el diálogo. Aparece
 #: tal cual en la traza de auditoría y en el registro.
@@ -228,6 +245,42 @@ class MultiChainIntent(Protocol):
 # --------------------------------------------------------------------------- #
 # Registro de ejecuciones
 # --------------------------------------------------------------------------- #
+#: Trozos de palabra para el emparejado **heredado** —el de los renglones
+#: escritos antes de que existiera el campo `tokens`—: letras, dígitos y el
+#: punto. El punto entra a propósito: es lo que mantiene «USDC.e» entero, y si
+#: partiera la palabra, buscar «USDC» encontraría asientos del «USDC.e», que es
+#: otro token.
+_WORD: Final = re.compile(r"[A-Za-z0-9.]+")
+
+
+def _tokens_of(raw: object) -> tuple[str, ...]:
+    """Los símbolos del renglón, saneados: una lista de cadenas o nada.
+
+    Un `tokens` que no sea lista —un fichero retocado a mano— no puede tumbar la
+    lectura entera: se descarta el campo, no el asiento, porque el asiento sigue
+    contando para el tope del día.
+    """
+    if isinstance(raw, (list, tuple)) and all(isinstance(item, str) for item in raw):
+        return tuple(raw)
+    return ()
+
+
+def _mentions(entry: LedgerEntry, symbol: str) -> bool:
+    """Si el asiento toca ese símbolo.
+
+    Con el campo `tokens` manda él. Los renglones anteriores al campo no lo
+    tienen, y ésos se emparejan por **palabra exacta** dentro de `pair`: partido
+    el texto por lo que no sea letra, dígito o punto, se compara la palabra
+    entera, para que «USDC» no dé por suyo un movimiento de «USDC.e» —ni un
+    «pUSD» el de un «USD»—, que enseñaría en la actividad de un token cosas de
+    otro.
+    """
+    if entry.tokens:
+        return symbol.upper() in {token.upper() for token in entry.tokens}
+    needle = symbol.upper()
+    return any(word.upper() == needle for word in _WORD.findall(entry.pair))
+
+
 @dataclass(frozen=True, slots=True)
 class LedgerEntry:
     """Un hecho económico ya ocurrido. Sin secretos, por construcción.
@@ -250,11 +303,18 @@ class LedgerEntry:
     status: str
     recipient: str
     description: str
-    #: `transaction`, `order` o `redeem`. Por omisión `transaction`, que es lo
-    #: que eran todos los renglones escritos antes de que existiera este campo:
-    #: los ficheros de registro que ya hay en disco se siguen leyendo igual, y su
-    #: significado no cambia.
+    #: `transaction`, `order`, `redeem`, `receive` o `approval`. Por omisión
+    #: `transaction`, que es lo que eran todos los renglones escritos antes de
+    #: que existiera este campo: los ficheros de registro que ya hay en disco se
+    #: siguen leyendo igual, y su significado no cambia.
     kind: str = TRANSACTION_KIND
+    #: Símbolos que el asiento toca. Una retirada toca uno; un swap, los dos
+    #: lados del par; un puente, los de origen y destino. Es lo que permite
+    #: pedir «la actividad de este token» sin adivinarla por el texto de la
+    #: descripción, que es lo que haría falta sin este campo. Los renglones
+    #: escritos antes de que existiera quedan como `()`: quien los lea por token
+    #: cae al emparejado por palabra sobre `pair` (ver `_mentions`).
+    tokens: tuple[str, ...] = ()
 
     @property
     def notional_value(self) -> Decimal:
@@ -277,8 +337,16 @@ class LedgerEntry:
         cobrarse— sería la que más acercara al usuario a quedarse sin poder
         operar. Se dice por tipo y no por estado porque incluso un cobro fallido
         no ha movido nada hacia fuera: lo único que costó fue el gas.
+
+        La recepción de un puente y la aprobación de un ERC-20 siguen la misma
+        regla por la misma razón: la primera trae lo que ya salió —contarla
+        gastaría dos veces el mismo dinero— y la segunda no mueve nada, sólo
+        concede permiso. También por tipo: una aprobación `SUCCESS` es lo normal,
+        y dejarla contar sería agotar el tope con permisos de importe cero.
         """
-        if self.kind == REDEEM_KIND:
+        # Los tres que no van en la dirección del gasto no cuentan **nunca**, y
+        # se decide por tipo y no por estado para que un `SUCCESS` no los cuele.
+        if self.kind in (REDEEM_KIND, RECEIVE_KIND, APPROVAL_KIND):
             return False
         if self.kind == ORDER_KIND:
             return True
@@ -298,6 +366,7 @@ class LedgerEntry:
                 "recipient": self.recipient,
                 "description": self.description,
                 "kind": self.kind,
+                "tokens": list(self.tokens),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -328,6 +397,9 @@ class LedgerEntry:
                 # todos transacciones, así que el valor por omisión no es una
                 # suposición: es lo que eran.
                 kind=str(record.get("kind", TRANSACTION_KIND)),
+                # Igual con `tokens`: los renglones viejos no lo traen y quedan
+                # como `()`, que es la verdad —no se sabe— y no inventa nada.
+                tokens=_tokens_of(record.get("tokens")),
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -395,6 +467,35 @@ class ExecutionLedger:
     def entries(self) -> tuple[LedgerEntry, ...]:
         return tuple(self._read())
 
+    def for_token(self, symbol: str, *, chain: str | None = None) -> tuple[LedgerEntry, ...]:
+        """Los asientos que tocan ese token, del más nuevo al más viejo.
+
+        Es la lectura que alimenta la actividad de un token: lo que la
+        aplicación ejecutó con él —envíos, swaps, puentes y sus recepciones,
+        cobros y permisos—. Lo que llegó de **fuera** no está aquí y no puede
+        estarlo: este fichero sólo anota lo que la aplicación emitió, así que
+        una transferencia que alguien mande a la cartera no pasa por él. Quien
+        lo enseñe tiene que decirlo con esas palabras, en vez de dejar creer que
+        la lista es el histórico de la cadena.
+
+        `chain` acota a una red, y hace falta cuando el mismo símbolo vive en
+        varias —USDC en polygon y en base— y el detalle es el de una red
+        concreta. El orden es del más nuevo al más viejo porque es el de una
+        lista de movimientos: lo último es lo que se quiere ver primero.
+        """
+        return tuple(
+            sorted(
+                (
+                    entry
+                    for entry in self._read()
+                    if (chain is None or entry.chain == chain)
+                    and _mentions(entry, symbol)
+                ),
+                key=lambda entry: entry.occurred_at,
+                reverse=True,
+            )
+        )
+
     def spent_since(self, moment: datetime) -> Decimal:
         """Cuánto se ejecutó desde `moment`, en unidades del token de referencia.
 
@@ -459,6 +560,8 @@ class ExecutionLedger:
         self,
         receipt: BroadcastReceipt,
         intent: ExecutableIntent,
+        *,
+        kind: str = TRANSACTION_KIND,
     ) -> LedgerEntry:
         """Anota el desenlace de una ejecución y devuelve lo anotado.
 
@@ -472,6 +575,10 @@ class ExecutionLedger:
         un asiento que dijera «0,014» sin decir de qué token no serviría para
         reconstruir nada, y el número que decide si se puede seguir operando tiene
         que estar en una sola unidad para que la suma del día signifique algo.
+
+        `kind` se pide sólo para el caso que no es una transacción cualquiera:
+        hoy, la **recepción** en destino de un puente (`RECEIVE_KIND`). Por
+        omisión, `transaction`, que es lo que era antes de existir el parámetro.
         """
         measured = intent.measured
         valorado = (
@@ -493,6 +600,8 @@ class ExecutionLedger:
             status=receipt.status.value,
             recipient=intent.recipient,
             description=f"{receipt.reason}{valorado}",
+            kind=kind,
+            tokens=intent.tokens,
         )
         self.append(entry)
         return entry
@@ -543,6 +652,7 @@ class ExecutionLedger:
                 f"transacción): {order_id} — {reason}"
             ),
             kind=ORDER_KIND,
+            tokens=intent.tokens,
         )
         self.append(entry)
         return entry
@@ -595,6 +705,7 @@ class ExecutionLedger:
                 f"mercado {position.condition_id}"
             ),
             kind=REDEEM_KIND,
+            tokens=intent.tokens,
         )
         self.append(entry)
         return entry
@@ -629,6 +740,11 @@ class ExecutionLedger:
         líneas con el mismo token y el mismo importe, una contra Permit2 y otra
         contra el router, se confunden con una aprobación directa al router, que
         es justo lo que este permiso **no** es.
+
+        El asiento lleva su propio tipo (`APPROVAL_KIND`) además del importe
+        cero: que no cuente para los topes queda así dicho por lo que el asiento
+        **es** y no por la cifra, que un día podría dejar de ser cero sin que
+        nadie repare en lo que eso cambiaría.
         """
         via_text = "" if via is None else f"vía Permit2 {via} "
         entry = LedgerEntry(
@@ -651,6 +767,8 @@ class ExecutionLedger:
                 f"aprobación de {token_symbol} por {granted_raw} en unidad mínima "
                 f"{via_text}— {receipt.reason}"
             ),
+            kind=APPROVAL_KIND,
+            tokens=(token_symbol,),
         )
         self.append(entry)
         return entry

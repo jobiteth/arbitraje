@@ -253,6 +253,23 @@ async def test_con_las_dos_redes_declaradas_no_falta_nada() -> None:
         assert seccion._blockers(None) == ()
 
 
+async def test_el_comodin_de_redes_permite_cruzar_a_cualquiera() -> None:
+    """`allowed_chains = ["*"]` es «cualquiera», no una lista vacía.
+
+    El caso medido: pedir un cruce y encontrarse ««base» no está entre las
+    redes habilitadas» una y otra vez. El comodín es la decisión contraria
+    —escrita a propósito— y tiene la misma semántica que el de
+    `allowed_tokens`; la comprobación de verdad es la del caso de uso, así que
+    la pantalla tiene que leerla igual.
+    """
+    async with _seccion(cadenas=("*",)) as (_, seccion):
+        _elegir(seccion._origin_token, ORIGEN, "USDC")
+        _elegir(seccion._destination_token, DESTINO, "USDC")
+        seccion._amount.setValue(0.5)
+
+        assert seccion._blockers(None) == ()
+
+
 async def test_sin_cartera_no_hay_con_que_firmar_y_se_dice() -> None:
     async with _seccion(con_cartera=False) as (_, seccion):
         _elegir(seccion._origin_token, ORIGEN, "USDC")
@@ -314,6 +331,32 @@ async def test_el_boton_de_firmar_sigue_a_la_red_de_destino(
             # El aviso va escrito con el motivo completo: un botón apagado sin
             # explicación es lo que empuja a buscar la forma de saltárselo.
             assert DESTINO in seccion._exec_note.text()
+
+
+async def test_la_pata_que_no_es_la_moneda_de_los_topes_avisa_sin_apagar() -> None:
+    """El caso medido: cruzar un token que no es la stablecoin de su red.
+
+    Valorar el importe es una petición de red que el repintado no puede hacer, y
+    la fibra que separa las dos cosas importa: bloquear aquí haría imposible
+    **empezar** el cruce de medio catálogo, porque el tope lo aplica
+    `ExecuteBridge` valorando al firmar y negándose si no puede medir. La pantalla
+    avisa en ámbar y deja el botón encendido.
+    """
+    async with _seccion(tokens=("USDC", "USDT")) as (_, seccion):
+        _elegir(seccion._origin_token, ORIGEN, "USDT")
+        _elegir(seccion._destination_token, DESTINO, "USDC")
+        seccion._amount.setValue(0.5)
+        request, _ = seccion._request()
+        assert request is not None
+
+        seccion._comparison = _comparacion(request)
+        seccion._fill_table(seccion._comparison)
+        seccion._table.selectRow(0)
+
+        assert seccion._blockers(seccion._selected_quote()) == ()
+        assert seccion._exec_btn.isEnabled() is True
+        assert seccion._exec_note.text().startswith("Aviso:")
+        assert "se valorará al firmar" in seccion._exec_note.text()
 
 
 async def test_la_mejor_ruta_es_la_primera_fila_y_la_que_se_ejecuta() -> None:

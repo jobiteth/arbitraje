@@ -644,14 +644,19 @@ class SwapCard(QWidget):
         vacía significa «no hay nada permitido», y pintar todo de gris describiría
         una aplicación rota en vez de una a medio configurar.
         """
-        permitidos = self._container.policy.limits.allowed_tokens
+        limites = self._container.policy.limits
+        permitidos = limites.allowed_tokens
         # Vacía o con el comodín «*», no hay nada que marcar: todo se puede operar.
         if not permitidos or ANY_TOKEN in permitidos:
             return
         for combo in (self._base, self._contra, self._send_token):
             for index in range(combo.count()):
                 token = combo.itemData(index)
-                if not isinstance(token, Token) or token.symbol in permitidos:
+                # Quién pasa lo decide `allows_token`, no una comparación en
+                # crudo: el catálogo tiene símbolos en caja mixta (`pUSD`) y
+                # marcarlos en gris cuando la lista sí los permite describiría
+                # una aplicación rota.
+                if not isinstance(token, Token) or limites.allows_token(token.symbol):
                     continue
                 combo.setItemData(index, QColor(COLOR_MUTED), Qt.ItemDataRole.ForegroundRole)
                 combo.setItemData(

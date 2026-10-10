@@ -301,6 +301,22 @@ def test_an_unknown_chain_in_the_whitelist_is_refused() -> None:
         ExecutionSettings.model_validate({"allowed_chains": ["base", "marte"]})
 
 
+def test_the_chain_wildcard_is_not_an_unknown_chain() -> None:
+    """`["*"]` es «cualquiera»: pasa la validación como cualquier otra entrada.
+
+    Sin esta excepción, `allowed_chains = ["*"]` no cargaría y la decisión de
+    abrir las redes no tendría forma de escribirse. Se comprueba solo y
+    mezclado con una red real: el comodín no estorba a la comprobación de los
+    demás nombres —`marte` sigue rechazándose—.
+    """
+    assert ExecutionSettings.model_validate({"allowed_chains": ["*"]}).allowed_chains == (
+        "*",
+    )
+    assert ExecutionSettings.model_validate(
+        {"allowed_chains": ["base", "*"]}
+    ).allowed_chains == ("base", "*")
+
+
 def test_an_unknown_key_under_a_pinned_operation_is_refused() -> None:
     """Un error de escritura en la cadencia no puede cambiar el significado."""
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):

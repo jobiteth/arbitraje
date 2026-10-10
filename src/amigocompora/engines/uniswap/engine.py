@@ -28,6 +28,13 @@ directo queda de respaldo.
   se resuelve al 100 % por **V4** y Optimism con una ruta **mixta**. Arc queda
   fuera, como en las demás fuentes EVM: cobra el gas en USDC y no tiene
   envoltorio nativo que cotizar.
+- **El nativo se nombra con la dirección cero.** Medido el 2026-10-09: con el
+  centinela que usan otros agregados (`0xEeee…`) la API responde
+  `NoRouteFoundError`; con la dirección cero cotiza y construye el nativo en
+  las dos direcciones —1 POL contra pUSD salió por el pool V2 de WPOL, y USDC
+  contra POL por el Universal Router—. Al vender nativo la transacción lleva el
+  `value` con el importe y el router lo envuelve él mismo; al comprarlo, el
+  `value` va a cero y es el router quien lo desenvuelve. Ver `_api_address`.
 - **`priceImpact` es un porcentaje, no una fracción.** El campo homónimo de
   Jupiter —`priceImpactPct`— sí es una fracción, así que reutilizar aquel lector
   habría metido un error de cien veces en cada cotización. La prueba: 1 WETH
@@ -84,6 +91,7 @@ from amigocompora.domain.errors import (
 from amigocompora.domain.models import (
     Measurement,
     Quote,
+    Token,
     TradingPair,
     UnsignedTransaction,
     Venue,
@@ -142,6 +150,15 @@ SWAP_CHAINS: Final = frozenset(ROUTERS)
 #: centinela la caché se comparte entre usuarios en vez de tener una entrada por
 #: destinatario. El `swapper` real se usa al construir, que es cuando importa.
 QUOTE_SWAPPER: Final = "0x1111111111111111111111111111111111111111"
+
+#: Dirección con la que la API nombra la **moneda nativa**. Medido el 2026-10-09:
+#: con el centinela que usan otros agregados (`0xEeee…`) la API responde
+#: `NoRouteFoundError`; con la dirección cero cotiza y construye el nativo en
+#: las dos direcciones —1 POL contra pUSD salió por el pool V2 de WPOL, y USDC
+#: contra POL por el Universal Router—, con el `value` puesto al vender y a cero
+#: al comprar, porque el router envuelve y desenvuelve él mismo. Cada API nombra
+#: al nativo como quiere, y este archivo usa la de esta.
+NATIVE_ADDRESS: Final = "0x0000000000000000000000000000000000000000"
 
 #: Tolerancia de deslizamiento que se pide. No se ejecuta nada, así que no
 #: protege de nada: es un parámetro obligatorio y afecta al mínimo garantizado
@@ -241,11 +258,6 @@ class UniswapEngine:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         if pair.chain not in SWAP_CHAINS:
             return ()
-        if pair.base.address is None or pair.quote.address is None:
-            # La API identifica los tokens por dirección de contrato. El nativo
-            # se cotiza envuelto, que `catalog.wrapped_native` ya devuelve con
-            # su dirección. Sin dirección no hay nada que preguntar.
-            return ()
 
         payload = await self._quote_payload(pair, amount_in, swapper=QUOTE_SWAPPER)
         if payload is None:
@@ -318,9 +330,9 @@ class UniswapEngine:
         amount = amount_in.raw
         body = {
             "tokenInChainId": chain_id,
-            "tokenIn": pair.base.address,
+            "tokenIn": _api_address(pair.base),
             "tokenOutChainId": chain_id,
-            "tokenOut": pair.quote.address,
+            "tokenOut": _api_address(pair.quote),
             "amount": str(amount),
             "type": "EXACT_INPUT",
             "swapper": swapper,
@@ -529,16 +541,30 @@ def _cache_key(
     amount_in: TokenAmount,
     swapper: str,
 ) -> str:
-    """Clave de caché de una cotización: todo lo que la respuesta depende de."""
+    """Clave de caché de una cotización: todo lo que la respuesta depende de.
+
+    Las direcciones se normalizan como en la petición (`_api_address`): la misma
+    moneda nativa tiene que dar la misma entrada se nombre como se nombre.
+    """
     return "|".join(
         (
             chain_key,
-            str(pair.base.address),
-            str(pair.quote.address),
+            _api_address(pair.base),
+            _api_address(pair.quote),
             str(amount_in.raw),
             swapper.lower(),
         )
     )
+
+
+def _api_address(token: Token) -> str:
+    """La dirección con la que la API nombra al token; el nativo tiene la suya.
+
+    El nativo no tiene contrato, y esta API lo nombra con la **dirección cero**
+    (ver `NATIVE_ADDRESS`). Traducirlo aquí y no en cada llamada deja una sola
+    regla: la petición, su clave de caché y el build hablan el mismo idioma.
+    """
+    return token.address if token.address is not None else NATIVE_ADDRESS
 
 
 def _require_known_router(chain_key: str, returned: Any) -> str:

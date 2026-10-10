@@ -29,6 +29,7 @@ from amigocompora.domain.addresses import is_evm_address, is_solana_address
 from amigocompora.domain.chains import CHAINS, ChainSpec, chain
 from amigocompora.domain.errors import AmigocomporaError
 from amigocompora.domain.execution import (
+    ANY_CHAIN,
     GasPolicy,
     GasStrategy,
     TriggerKind,
@@ -374,7 +375,12 @@ class ExecutionSettings(BaseModel):
     @field_validator("allowed_chains")
     @classmethod
     def _known_chains(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        unknown = sorted({item.strip().lower() for item in value} - set(CHAINS))
+        # El comodín no es una red: es «cualquiera», y por eso se excluye de la
+        # comprobación de nombres —igual que `allowed_tokens = ["*"]`— sin
+        # dejar de pasar por la validación del resto de la lista.
+        unknown = sorted(
+            {item.strip().lower() for item in value} - set(CHAINS) - {ANY_CHAIN}
+        )
         if unknown:
             raise ValueError(
                 f"redes desconocidas en execution.allowed_chains: {', '.join(unknown)}. "
@@ -427,6 +433,28 @@ class ExecutionSettings(BaseModel):
         return self
 
 
+class UiSettings(BaseModel):
+    """Preferencias de **presentación**: cambian lo que se enseña, no lo que se hace.
+
+    Ninguna opción de aquí firma, permite ni desbloquea nada: son vistas. Y
+    viven en la configuración —con `extra="forbid"` como el resto del
+    modelo— porque decidirlas es del usuario: una clave mal escrita se dice al
+    arrancar en vez de perderse en silencio, y no hace falta tocar código para
+    cambiar lo que se ve.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    #: Quita de la tabla de rutas las que **no se pueden firmar** —las de
+    #: motores que sólo cotizan, como GeckoTerminal o DexScreener—. Apagado por
+    #: omisión: la cifra es un precio real y sirve para comparar contra las
+    #: rutas firmables, que es para lo que la fila se queda. Quien las tenga
+    #: por ruido lo enciende y la tabla se queda con lo que tiene constructor
+    #: detrás; la marca ámbar «· sólo cotiza» sigue siendo la defensa de quien
+    #: las deja encendidas.
+    hide_quote_only_routes: bool = False
+
+
 class Settings(BaseSettings):
     """Configuración efectiva. Inmutable una vez cargada."""
 
@@ -470,6 +498,10 @@ class Settings(BaseSettings):
     #: Pares que el barrido periódico vigila. Cada uno se cotiza en el motor DEX
     #: activo y, si el diferencial neto supera su umbral, se publica una alerta.
     watch_pairs: tuple[WatchPairSettings, ...] = ()
+
+    #: Qué se enseña en las tablas. Sólo presentación: ninguna opción de aquí
+    #: cambia lo que la aplicación puede hacer.
+    ui: UiSettings = UiSettings()
 
     #: Qué se ejecuta sin preguntar, cuánto y disparado por qué. Apagado por
     #: omisión: firmar y emitir es siempre un acto explícito del usuario.

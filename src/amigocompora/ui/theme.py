@@ -405,6 +405,28 @@ QPushButton#rowAction {{
 }}
 QPushButton#rowAction:hover {{ background: {COLOR_ELEVATED}; border-color: {COLOR_ACCENT}; }}
 QPushButton#rowAction:disabled {{ border-color: {COLOR_BORDER}; color: {COLOR_MUTED}; }}
+/* Los mandos de una cabecera de tarjeta —la lupa, el «+», el de releer—: sólo
+   el icono, sin texto. El fondo y el borde aparecen al pasar por encima y al
+   estar pulsados, para que una cabecera con tres mandos se siga leyendo como
+   un título y no como una barra de botones. */
+QToolButton#iconAction {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {RADIUS_SM}px;
+    padding: 3px;
+}}
+QToolButton#iconAction:hover {{ background: {COLOR_ELEVATED}; border-color: {COLOR_BORDER_STRONG}; }}
+QToolButton#iconAction:checked {{ border-color: {COLOR_ACCENT}; background: {COLOR_ELEVATED}; }}
+/* La fila de un token en la cartera: la fila **entera** es el botón que abre su
+   detalle. El fondo y el borde sólo aparecen al pasar por encima o al enfocar,
+   para que la lista se lea como una lista y no como una rejilla de botones. */
+QFrame#tokenRow {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {RADIUS_SM}px;
+}}
+QFrame#tokenRow:hover {{ background: {COLOR_ELEVATED}; border-color: {COLOR_BORDER_STRONG}; }}
+QFrame#tokenRow:focus {{ border-color: {COLOR_ACCENT}; }}
 QPushButton:focus {{ outline: none; border-color: {COLOR_ACCENT_HOVER}; }}
 
 /* ---------------------------------------------------------------- campos -- */
@@ -494,6 +516,51 @@ QHeaderView::section {{
 }}
 QHeaderView::section:last {{ border-right: none; }}
 QTableCornerButton::section {{ background: {COLOR_ELEVATED}; border: none; }}
+
+/* ------------------------------------------------------------ rutas swap -- */
+/* La lista de rutas: un listbox sin cromo —fondo transparente, sin borde— porque
+   cada fila ya la dibuja su tarjeta (#routeCard). Con el marco propio de la
+   tabla saldrían dos marcos, uno dentro del otro. */
+QListWidget#routeList {{
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0;
+}}
+/* La tarjeta de una ruta. El estado —elegida, con el ratón encima— llega como
+   propiedad dinámica y no como `::item:selected`: con `setItemWidget` la
+   tarjeta queda encima del resaltado que pinta la lista para el item, así que
+   el resaltado del item no se vería. El fondo del elegido es el mismo azul
+   tenue que el de una fila de tabla seleccionada, para que «elegido» signifique
+   lo mismo en toda la aplicación. */
+QFrame#routeCard {{
+    background: {COLOR_CARD};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: {RADIUS_SM}px;
+}}
+QFrame#routeCard[hover="true"] {{
+    border-color: {COLOR_BORDER_STRONG};
+}}
+QFrame#routeCard[selected="true"] {{
+    background: {COLOR_ACCENT_SOFT};
+    border-color: {COLOR_ACCENT};
+}}
+QLabel#routeName {{ font-weight: 700; }}
+QLabel#routeMark {{ color: {COLOR_WARNING}; font-size: 11px; font-weight: 600; }}
+QLabel#routeAmount {{ font-weight: 700; }}
+QLabel#routeLine {{ color: {COLOR_MUTED}; font-size: 11px; }}
+/* El panel de detalle: filas de etiqueta y valor sobre el fondo de la tarjeta
+   que lo contiene. Sin marco propio, que sería una caja dentro de otra caja. */
+QWidget#routeDetail {{ background: transparent; }}
+QLabel#detailLabel {{ color: {COLOR_MUTED}; font-size: 11px; }}
+QLabel#detailValue {{ font-size: 12px; }}
+/* El importe que se recibe es la cifra de la que va todo esto: en verde y más
+   grande que el resto de los valores, como el «recibes» de la tarjeta. */
+QLabel#detailAmount {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {COLOR_SUCCESS};
+}}
 
 /* ------------------------------------------------------------ desplazar -- */
 QScrollBar:vertical {{

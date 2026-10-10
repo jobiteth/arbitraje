@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLayout,
+    QListWidget,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -215,22 +216,27 @@ def token_labels(tokens: tuple[Token, ...]) -> tuple[str, ...]:
     )
 
 
-def set_empty(table: QTableWidget, placeholder: QLabel, texto: str) -> None:
-    """Enseña la tabla o su rótulo, nunca los dos.
+def set_empty(widget: QTableWidget | QListWidget, placeholder: QLabel, texto: str) -> None:
+    """Enseña la tabla —o la lista— o su rótulo, nunca los dos.
 
-    Vive aquí, y no en la página que lo estrenó, porque lo usan ya dos: una
+    Vive aquí, y no en la página que lo estrenó, porque lo usan ya tres: una
     tabla vacía **no es pequeña** —ocupa su `stretch` entero—, así que un
     rótulo encima del rectángulo gris dejaría las dos cosas a la vez. Lo que se
     quiere es que el sitio de la tabla lo ocupe la explicación, que es lo que
     además distingue «todavía no has pedido nada» de «pediste y no hay nada».
 
+    La lista de rutas cuenta sus filas de otra manera que la tabla —`count()` y
+    `rowCount()`, por herencias distintas—, y es lo único que cambia: la
+    decisión de qué se enseña es la misma para las dos.
+
     El texto entra por parámetro porque cada tabla tiene su propio «por qué está
     vacía», y ese es justamente el dato que no se puede generalizar.
     """
-    vacia = table.rowCount() == 0
+    filas = widget.rowCount() if isinstance(widget, QTableWidget) else widget.count()
+    vacia = filas == 0
     placeholder.setText(texto)
     placeholder.setVisible(vacia)
-    table.setVisible(not vacia)
+    widget.setVisible(not vacia)
 
 
 def needed_width(control: QWidget) -> int:

@@ -20,7 +20,7 @@ justamente lo que la vista le pasa al motor.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -30,7 +30,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QTableWidgetItem
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QApplication, QDialog, QTableWidgetItem
 
 from amigocompora.app.container import build_container
 from amigocompora.app.usecases.analyze_prediction_market import MarketReport
@@ -39,7 +40,9 @@ from amigocompora.domain.models import (
     DepthLevel,
     MarketDepth,
     MarketOutcome,
+    MarketTag,
     PredictionMarket,
+    PredictionSort,
     Venue,
     VenueKind,
 )
@@ -47,6 +50,7 @@ from amigocompora.domain.money import BasisPoints
 from amigocompora.domain.protocols import EngineKind, EngineManifest
 from amigocompora.infra.config import Settings
 from amigocompora.ui.pages.prediction import PredictionPage
+from amigocompora.ui.theme import COLOR_DANGER, COLOR_SUCCESS
 
 AHORA = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
@@ -89,20 +93,32 @@ class MotorFalso:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
         self.llamadas.append(
-            {"limit": limit, "search": search, "closing_within": closing_within}
+            {
+                "limit": limit,
+                "search": search,
+                "closing_within": closing_within,
+                "category": category,
+                "sort": sort,
+            }
         )
         if self.falla:
             raise RuntimeError("la fuente no contesta")
         encontrados = [m for m in _MERCADOS if search is None or search in m.question]
         if closing_within is not None:
-            # Como haría el motor de verdad: lo que antes cierra, primero, y sin
-            # fecha o ya cerrado fuera.
+            # Como el motor de verdad: lo que antes cierra primero, sin fecha o
+            # ya cerrado fuera, y **fuera de la ventana también fuera** —sin el
+            # tope, una ventana de cinco minutos devolvería mercados de dentro
+            # de un mes y la prueba diría que el filtro del servidor no filtra—.
             vivos = [
                 (m.closes_at, m)
                 for m in encontrados
-                if m.closes_at is not None and m.closes_at > AHORA
+                if m.closes_at is not None
+                and m.closes_at > AHORA
+                and m.closes_at - AHORA <= closing_within
             ]
             vivos.sort(key=lambda par: par[0])
             encontrados = [m for _, m in vivos]
@@ -161,7 +177,22 @@ class MotorFalso:
         raise AssertionError(token_id)
 
 
-def _mercado(market_id: str, *, horas: float | None, pregunta: str) -> PredictionMarket:
+def _mercado(
+    market_id: str,
+    *,
+    horas: float | None,
+    pregunta: str,
+    creado: str | None = None,
+    volumen_24h: str | None = None,
+    cambio_24h: str | None = None,
+    etiquetas: tuple[MarketTag, ...] = (),
+) -> PredictionMarket:
+    """Un mercado con fecha de cierre conocida y los datos de actividad que se pidan.
+
+    Todo lo de actividad es opcional a propósito: la mitad de las pruebas de aquí
+    van de que un dato que la fuente no publica se enseña con un guion, y eso no
+    se puede probar con mercados que lo traen todo.
+    """
     return PredictionMarket(
         market_id=market_id,
         venue=VENUE,
@@ -176,6 +207,10 @@ def _mercado(market_id: str, *, horas: float | None, pregunta: str) -> Predictio
         ),
         observed_at=AHORA,
         closes_at=None if horas is None else AHORA + timedelta(hours=horas),
+        created_at=None if creado is None else datetime.fromisoformat(creado),
+        volume_24h=None if volumen_24h is None else Decimal(volumen_24h),
+        price_change_24h=None if cambio_24h is None else Decimal(cambio_24h),
+        tags=etiquetas,
     )
 
 
@@ -186,13 +221,49 @@ _TOKEN = count(1000)
 #: El salto de precio de estos mercados, para que el libro del doble sea válido.
 _SALTO = Decimal("0.01")
 
+#: Dos etiquetas con la forma que publica Polymarket, para comprobar que la lista
+#: las enseña tal cual y ordena las más frecuentes primero.
+_POLITICA = MarketTag(tag_id="2", label="Politics", slug="politics")
+_DEPORTES = MarketTag(tag_id="1", label="Sports", slug="sports")
+
 
 #: Cuatro mercados que caen uno en cada tramo del selector, más uno sin fecha.
+#: Llevan fecha de creación y volumen de 24 h para poder comprobar los órdenes:
+#: el más nuevo es «90d» y el que más se mueve, «3d». El mercado sin fecha no
+#: lleva ningún dato de actividad —es el que prueba los guiones— y por eso
+#: tampoco lleva etiquetas.
 _MERCADOS = (
-    _mercado("2h", horas=2, pregunta="¿Ocurre en dos horas?"),
-    _mercado("3d", horas=72, pregunta="¿Ocurre en tres días?"),
-    _mercado("20d", horas=480, pregunta="¿Ocurre en veinte días?"),
-    _mercado("90d", horas=2160, pregunta="¿Ocurre en noventa días?"),
+    _mercado(
+        "2h",
+        horas=2,
+        pregunta="¿Ocurre en dos horas?",
+        creado="2026-05-01T00:00:00+00:00",
+        volumen_24h="100",
+        etiquetas=(_POLITICA,),
+    ),
+    _mercado(
+        "3d",
+        horas=72,
+        pregunta="¿Ocurre en tres días?",
+        creado="2026-05-03T00:00:00+00:00",
+        volumen_24h="300",
+        cambio_24h="0.12",
+        etiquetas=(_POLITICA, _DEPORTES),
+    ),
+    _mercado(
+        "20d",
+        horas=480,
+        pregunta="¿Ocurre en veinte días?",
+        creado="2026-05-02T00:00:00+00:00",
+        volumen_24h="200",
+        cambio_24h="-0.23",
+    ),
+    _mercado(
+        "90d",
+        horas=2160,
+        pregunta="¿Ocurre en noventa días?",
+        creado="2026-05-04T00:00:00+00:00",
+    ),
     _mercado("sin", horas=None, pregunta="¿Ocurre algún día?"),
 )
 
@@ -260,6 +331,22 @@ def _select(pagina: PredictionPage, etiqueta: str) -> None:
     combo.setCurrentIndex(indice)
 
 
+def _select_category(pagina: PredictionPage, etiqueta: str) -> None:
+    """Elige una categoría por el **principio** de su texto.
+
+    El ítem lleva el número de mercados detrás —«Politics (2)»—, y ese número
+    cambia con lo que se haya traído; buscar por prefijo deja las pruebas
+    hablando de la categoría y no del recuento del día.
+    """
+    combo = pagina._category
+    indice = next(
+        (i for i in range(combo.count()) if combo.itemText(i).startswith(etiqueta)),
+        -1,
+    )
+    assert indice >= 0, etiqueta
+    combo.setCurrentIndex(indice)
+
+
 def _celda(pagina: PredictionPage, row: int, column: int) -> QTableWidgetItem:
     """La celda, exigiendo que exista.
 
@@ -279,7 +366,7 @@ def _celda(pagina: PredictionPage, row: int, column: int) -> QTableWidgetItem:
 async def test_the_close_column_is_a_countdown() -> None:
     async with _pagina() as (pagina, _):
         await _buscar(pagina)
-        celdas = [_celda(pagina, row, 5).text() for row in range(pagina._table.rowCount())]
+        celdas = [_celda(pagina, row, 7).text() for row in range(pagina._table.rowCount())]
         assert "en 2 h" in celdas
         assert "en 3 días" in celdas
         # El mercado sin fecha no se inventa un tiempo.
@@ -291,7 +378,7 @@ async def test_the_exact_date_stays_available() -> None:
     async with _pagina() as (pagina, _):
         await _buscar(pagina)
         for row in range(pagina._table.rowCount()):
-            assert _celda(pagina, row, 5).toolTip()
+            assert _celda(pagina, row, 7).toolTip()
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +449,27 @@ async def test_a_search_carries_the_window_to_the_engine() -> None:
         assert motor.llamadas[-1]["closing_within"] is None
 
 
+async def test_las_ventanas_de_cinco_y_diez_minutos_viajan_al_motor() -> None:
+    """Las ventanas cortas son para lo que cierra ya —los mercados de minutos—.
+
+    Y viajan a la petición como las demás: sin la ventana en la petición, el
+    motor traería por volumen, donde esos mercados recién abiertos no están.
+    """
+    async with _pagina() as (pagina, motor):
+        assert pagina._window.findText("5 minutos") >= 0
+        assert pagina._window.findText("10 minutos") >= 0
+
+        _select(pagina, "5 minutos")
+        await _buscar(pagina)
+        assert motor.llamadas[-1]["closing_within"] == timedelta(minutes=5)
+        # Ningún mercado de prueba cierra tan pronto: la tabla queda vacía.
+        assert _questions(pagina) == []
+
+        _select(pagina, "10 minutos")
+        await _buscar(pagina)
+        assert motor.llamadas[-1]["closing_within"] == timedelta(minutes=10)
+
+
 async def test_the_selection_still_points_at_the_visible_market() -> None:
     """Filtrar y luego elegir una fila no puede hablar de otro mercado.
 
@@ -376,6 +484,171 @@ async def test_the_selection_still_points_at_the_visible_market() -> None:
         pagina._table.selectRow(0)
         # La fila visible y el informe que el detalle va a leer son el mismo.
         assert pagina._reports[0].question == _questions(pagina)[0]
+
+
+# --------------------------------------------------------------------------- #
+# Categorías, orden y tendencia
+# --------------------------------------------------------------------------- #
+async def test_la_lista_por_omision_es_la_de_las_mas_nuevas() -> None:
+    """El orden por omisión es «más nuevas», y un mercado sin fecha va al final.
+
+    Va al final y no al principio porque de un mercado del que la fuente no
+    publicó la fecha no consta que sea nuevo: ponerlo primero afirmaría lo que no
+    se sabe.
+    """
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        assert _questions(pagina) == [
+            "¿Ocurre en noventa días?",
+            "¿Ocurre en tres días?",
+            "¿Ocurre en veinte días?",
+            "¿Ocurre en dos horas?",
+            "¿Ocurre algún día?",
+        ]
+        assert "las más nuevas primero" in pagina._status.text()
+
+
+async def test_la_busqueda_lleva_categoria_y_orden_al_motor() -> None:
+    """Los selectores recortan en cliente, pero la búsqueda los pide al motor.
+
+    Sin esto, «Categoría: Politics» sólo escondería lo ya traído —y lo que no se
+    trajo no está—, y el límite de treinta se gastaría en mercados que la
+    categoría va a descartar.
+    """
+    async with _pagina() as (pagina, motor):
+        await _buscar(pagina)
+        sin_filtro = motor.llamadas[-1]
+        assert sin_filtro["category"] is None
+        assert sin_filtro["sort"] is PredictionSort.NEWEST
+
+        _select_category(pagina, "Politics")
+        await _buscar(pagina)
+        con_categoria = motor.llamadas[-1]
+        assert con_categoria["category"] == _POLITICA
+        assert con_categoria["sort"] is PredictionSort.NEWEST
+
+        _select_category(pagina, "Tendencia")
+        await _buscar(pagina)
+        # «Tendencia» no filtra por etiqueta: pide lo que más se mueve.
+        tendencia = motor.llamadas[-1]
+        assert tendencia["category"] is None
+        assert tendencia["sort"] is PredictionSort.TRENDING
+        assert "lo que más se mueve" in pagina._status.text()
+
+
+async def test_elegir_categoria_filtra_sin_volver_a_preguntar() -> None:
+    """Cambiar de categoría es gratis, como cambiar de ventana.
+
+    Y descarta a quien **consta** que no es de la categoría: de los mercados sin
+    etiquetas no consta, así que se quedan —esconderlos sería afirmar que no son
+    de «Sports» cuando nadie lo ha dicho—.
+    """
+    async with _pagina() as (pagina, motor):
+        await _buscar(pagina)
+        assert len(motor.llamadas) == 1
+
+        _select_category(pagina, "Sports")
+        assert len(motor.llamadas) == 1
+        assert _questions(pagina) == [
+            "¿Ocurre en noventa días?",
+            "¿Ocurre en tres días?",
+            "¿Ocurre en veinte días?",
+            "¿Ocurre algún día?",
+        ]
+
+        _select_category(pagina, "Todas")
+        assert len(_questions(pagina)) == len(_MERCADOS)
+
+
+async def test_tendencia_ordena_por_lo_que_mas_se_mueve_y_apaga_el_orden() -> None:
+    """«Tendencia» no filtra: ordena. Y por eso el selector de orden se apaga.
+
+    Un selector encendido que no hace nada es peor que uno apagado: el apagado
+    con su motivo escrito dice que el orden lo manda la categoría.
+    """
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        _select_category(pagina, "Tendencia")
+
+        assert pagina._sort.isEnabled() is False
+        assert "Tendencia" in pagina._sort.toolTip()
+        # Volumen de 24 h: 3d (300) > 20d (200) > 2h (100) > los que no lo traen.
+        assert _questions(pagina) == [
+            "¿Ocurre en tres días?",
+            "¿Ocurre en veinte días?",
+            "¿Ocurre en dos horas?",
+            "¿Ocurre en noventa días?",
+            "¿Ocurre algún día?",
+        ]
+
+        _select_category(pagina, "Todas")
+        assert pagina._sort.isEnabled() is True
+
+
+async def test_la_categoria_que_deja_la_lista_vacia_lo_dice() -> None:
+    """Un filtro que esconde todo tiene que decir cuál es, no parecer un fallo."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        # «Sports» sólo la lleva el mercado de tres días, y con «24 h» de ventana
+        # tampoco cae ninguno de los que no llevan etiquetas: la lista queda
+        # vacía por la categoría, y ese es el motivo que hay que leer.
+        _select_category(pagina, "Sports")
+        _select(pagina, "24 h")
+
+        assert pagina._table.rowCount() == 0
+        motivo = pagina._markets_empty.text()
+        assert "Sports" in motivo
+        assert "Todas" in motivo
+
+
+async def test_la_columna_24h_ensena_el_cambio_con_signo_y_color() -> None:
+    """El delta en céntimos, verde si subió y rojo si bajó; guion si no consta."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+
+        subida = _celda(pagina, _questions(pagina).index("¿Ocurre en tres días?"), 3)
+        assert subida.text() == "+12 ¢"
+        assert subida.foreground().color() == QColor(COLOR_SUCCESS)
+
+        bajada = _celda(pagina, _questions(pagina).index("¿Ocurre en veinte días?"), 3)
+        # En escapado porque el signo es el menos tipográfico (U+2212) y no el
+        # guion: así se lee que la comparación es contra ese carácter exacto.
+        assert bajada.text() == "\u221223 ¢"
+        assert bajada.foreground().color() == QColor(COLOR_DANGER)
+
+        sin_dato = _celda(pagina, _questions(pagina).index("¿Ocurre en noventa días?"), 3)
+        assert sin_dato.text() == "—"
+
+
+async def test_la_columna_de_categorias_ensena_las_etiquetas_o_un_guion() -> None:
+    """Tal cual las publica la fuente; sin etiquetas, un guion y no un hueco."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+
+        ambas = _celda(pagina, _questions(pagina).index("¿Ocurre en tres días?"), 1)
+        assert ambas.text() == "Politics · Sports"
+
+        sin = _celda(pagina, _questions(pagina).index("¿Ocurre en noventa días?"), 1)
+        assert sin.text() == "—"
+        assert "no publica categorías" in sin.toolTip()
+
+
+async def test_la_tarjeta_ensena_cuanto_paga_una_participacion() -> None:
+    """El multiplicador y el porcentaje al precio escrito.
+
+    Se recalcula al cambiar el precio —de eso se encarga `_refresh_order_state`,
+    por el que pasan la edición del precio y el cambio de resultado— y sale del
+    precio **límite**, que es el que se va a firmar.
+    """
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        fila = _questions(pagina).index("¿Ocurre en dos horas?")
+        pagina._table.selectRow(fila)
+        assert pagina._views.currentIndex() == 1
+
+        pagina._price.setValue(0.62)
+        assert "\u00d71.61" in pagina._payout_label.text()
+        assert "+61.3 %" in pagina._payout_label.text()
 
 
 # --------------------------------------------------------------------------- #
@@ -499,3 +772,96 @@ async def test_la_ventana_que_deja_la_lista_vacia_lo_dice_y_ofrece_la_salida() -
         motivo = pagina._markets_empty.text()
         assert str(len(pagina._all_reports)) in motivo
         assert "todas" in motivo
+
+
+# --------------------------------------------------------------------------- #
+# La navegación: la lista, y la tarjeta del mercado
+# --------------------------------------------------------------------------- #
+async def test_elegir_una_fila_abre_la_tarjeta_del_mercado() -> None:
+    """La pestaña enseña la lista; el mercado se abre al pulsar su fila.
+
+    El contenedor de esta prueba no tiene cartera, así que la lectura de saldo
+    que la tarjeta lanza sola falla al instante —sin salir a la red— y no hay
+    nada que falsear aquí.
+    """
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        assert pagina._views.currentIndex() == 0
+
+        fila = _questions(pagina).index("¿Ocurre en dos horas?")
+        pagina._table.selectRow(fila)
+
+        assert pagina._views.currentIndex() == 1
+        assert pagina._chosen_market is not None
+        assert pagina._chosen_market.market_id == pagina._reports[fila].market.market_id
+        assert "¿Ocurre en dos horas?" in pagina._order_market.text()
+        # Y la cabecera lleva hasta cuándo se puede operar ese mercado: la misma
+        # cuenta atrás de la fila, para no decidir sin el dato delante.
+        assert "cierra" in pagina._order_market.text()
+
+
+async def test_volver_a_la_lista_no_vacia_la_tarjeta() -> None:
+    """Volver es mirar la lista, no tirar el borrador que hubiera en la tarjeta."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        pagina._table.selectRow(0)
+        pagina._back_btn.click()
+
+        assert pagina._views.currentIndex() == 0
+        # La selección se limpia —si la fila siguiera elegida, volver a pulsarla
+        # no dispararía `itemSelectionChanged`—, pero el mercado sigue cargado.
+        selection = pagina._table.selectionModel()
+        assert selection is not None
+        assert selection.selectedRows() == []
+        assert pagina._chosen_market is not None
+
+        # Con la misma fila: abrir, volver, y abrir otra vez.
+        pagina._table.selectRow(0)
+        assert pagina._views.currentIndex() == 1
+        pagina._back_btn.click()
+        pagina._table.selectRow(0)
+        assert pagina._views.currentIndex() == 1
+
+
+async def test_una_busqueda_nueva_desde_la_tarjeta_vuelve_a_la_lista() -> None:
+    """Buscar reemplaza la lista: quedarse en la tarjeta sería mirar lo que ya no está."""
+    async with _pagina() as (pagina, _):
+        await _buscar(pagina)
+        pagina._table.selectRow(0)
+        assert pagina._views.currentIndex() == 1
+
+        await _buscar(pagina)
+        assert pagina._views.currentIndex() == 0
+
+
+def _exec_de_mentira(abiertos: list[str], nombre: str) -> Callable[[], int]:
+    """Un `exec` que no bloquea: anota la apertura y vuelve como «aceptado».
+
+    Devuelve `int` porque es lo que devuelve `QDialog.exec`; sustituirlo en la
+    instancia es lo único que Shiboken deja —la clase es intocable—, y así el
+    modal no se queda esperando en una prueba sin pantalla.
+    """
+
+    def _exec() -> int:
+        abiertos.append(nombre)
+        return int(QDialog.DialogCode.Accepted)
+
+    return _exec
+
+
+# --------------------------------------------------------------------------- #
+# Cestas y cobro: de tarjetas apiladas a paneles que se abren
+# --------------------------------------------------------------------------- #
+async def test_los_botones_de_cestas_y_cobro_abren_sus_paneles() -> None:
+    """Los dos paneles se abren desde su botón, y no se apilan en la pestaña."""
+    async with _pagina() as (pagina, _):
+        abiertos: list[str] = []
+        pagina._baskets_panel.exec = _exec_de_mentira(abiertos, "cestas")  # type: ignore[method-assign]
+        pagina._redeem_panel.exec = _exec_de_mentira(abiertos, "cobro")  # type: ignore[method-assign]
+
+        # La pestaña sigue teniendo dos vistas: los paneles son ventanas aparte.
+        assert pagina._views.count() == 2
+        pagina._baskets_open_btn.click()
+        pagina._redeem_open_btn.click()
+
+        assert abiertos == ["cestas", "cobro"]

@@ -36,7 +36,12 @@ from amigocompora.app.registry import EngineRegistry
 from amigocompora.app.usecases.read_settlement_wallet import ReadSettlementWallet
 from amigocompora.domain.clock import FrozenClock
 from amigocompora.domain.errors import EngineError, ExecutionError
-from amigocompora.domain.models import MarketDepth, PredictionMarket
+from amigocompora.domain.models import (
+    MarketDepth,
+    MarketTag,
+    PredictionMarket,
+    PredictionSort,
+)
 from amigocompora.domain.modes import OperationMode
 from amigocompora.domain.protocols import EngineKind, EngineManifest
 from amigocompora.engines.polymarket.engine import PolymarketEngine
@@ -161,8 +166,10 @@ class MotorQueSoloLee:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
-        del limit, search, closing_within
+        del limit, search, closing_within, category, sort
         return ()
 
     async def market(self, market_id: str) -> PredictionMarket:

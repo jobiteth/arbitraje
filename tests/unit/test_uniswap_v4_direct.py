@@ -37,6 +37,13 @@ una cifra falsa, y en V4 casi todo tiene una forma distinta de la de V3:
    Sustituirlo por WETH llevaría al pool equivocado, que es exactamente lo que V3
    hace a propósito y aquí sería un error.
 
+7. **El segundo salto se cotiza entero.** Cuando el par no tiene pool directo, el
+   camino se le pide al cotizador de una vez —`quoteExactInput`, con los
+   `PathKey` del camino— y el importe que devuelve es el que la ejecución daría,
+   no la composición de dos lecturas sueltas. Cada `PathKey` nombra la moneda
+   **de llegada** de su tramo —escribirla al revés deriva la clave de otro
+   pool—, y el array va con sus propios desplazamientos.
+
 ## El vector de oro, y de qué está respaldado
 
 `test_el_vector_de_oro_no_cambia_sin_que_alguien_se_entere` fija el `keccak256`
@@ -55,6 +62,14 @@ cualquiera de los tres desplazamientos habría dado `UnsupportedAction`,
 para que no se pierda en el próximo cambio; no pretende ser la demostración. Y no
 coincide con la del día de la medición porque el `deadline` sale del reloj: la de
 aquí es la del reloj congelado.
+
+El camino tiene su propio vector medido, y del mismo tipo:
+`test_el_camino_reproduce_el_calldata_medido_en_la_cadena` fija los bytes exactos
+que se mandaron por `eth_call` al `V4Quoter` de Base el 2026-10-09 —WETH → USDC →
+WETH, los dos tramos del 0,30 %, 10¹⁵ wei— y que devolvieron
+`[993014236051103, 70983]`: el importe y una estimación de gas. Si el contrato
+decodificó eso y contestó, los desplazamientos del `PathKey[]`, el `0xa0` del
+`hookData` y la moneda de llegada de cada tramo son los que lee.
 
 Las cifras de pool están **medidas** contra Base el 2026-10-06 con lecturas: los
 cuatro `poolId` de WETH/USDC, su liquidez, su `sqrtPriceX96` y la salida del
@@ -81,9 +96,17 @@ from amigocompora.domain.errors import (
     SourceResponseError,
     UnsupportedOperationError,
 )
-from amigocompora.domain.models import Measurement, Quote, Token, TradingPair
-from amigocompora.domain.money import BasisPoints, TokenAmount
-from amigocompora.engines.uniswap_math import impact_bps
+from amigocompora.domain.models import (
+    Measurement,
+    Quote,
+    RouteHop,
+    SwapRoute,
+    Token,
+    TradingPair,
+)
+from amigocompora.domain.money import EXACT, BasisPoints, TokenAmount
+from amigocompora.engines.catalog import hub_tokens
+from amigocompora.engines.uniswap_math import combine_impact_bps, impact_bps
 from amigocompora.engines.uniswap_v4 import calldata as abi
 from amigocompora.engines.uniswap_v4 import engine as v4
 from amigocompora.engines.uniswap_v4.addresses import (
@@ -147,6 +170,22 @@ def _palabra_addr(address: str) -> str:
     return address.lower().removeprefix("0x").rjust(64, "0")
 
 
+def _palabra_de(data: str, selector: str, index: int) -> str:
+    """La palabra `index` del cuerpo de ese calldata.
+
+    El contador empieza **después del selector**: el `0x` y sus cuatro bytes
+    ocupan sitio, y saltárselos leería una ventana desplazada que ya no es una
+    palabra, con lo que la respuesta sería la de otro campo.
+    """
+    inicio = len(selector) + index * 64
+    return data[inicio : inicio + 64]
+
+
+def _direccion_de(data: str, selector: str, index: int) -> str:
+    """La dirección de la palabra `index` del cuerpo de ese calldata."""
+    return "0x" + _palabra_de(data, selector, index)[24:]
+
+
 def _sqrt_para(
     amount_in_raw: int, amount_out_raw: int, *, token_in_is_token0: bool
 ) -> int:
@@ -160,6 +199,11 @@ def _sqrt_para(
     ratio = Decimal(amount_out_raw) / Decimal(amount_in_raw)
     precio = ratio if token_in_is_token0 else Decimal(1) / ratio
     return int(precio.sqrt() * Decimal(1 << 96))
+
+
+def _sqrt_de(precio: Decimal) -> int:
+    """`sqrtPriceX96` de un precio marginal, para no escribir el entero a mano."""
+    return int(EXACT.multiply(precio.sqrt(), Decimal(1 << 96)))
 
 
 def _slot0(sqrt_price_x96: int, lp_fee: int) -> str:
@@ -180,8 +224,15 @@ def _slot0(sqrt_price_x96: int, lp_fee: int) -> str:
 
 
 def _respuesta_quoter(amount_out: int) -> str:
-    """El `V4Quoter` devuelve cinco palabras y la que interesa es la primera."""
-    return "0x" + "".join(_palabra_uint(value) for value in (amount_out, 0, 0, 0, 0))
+    """El `V4Quoter` devuelve **dos** palabras: el importe y una estimación de gas.
+
+    Medido contra el contrato desplegado; el docstring que decía «cinco» describía
+    el retorno del `QuoterV2` de V3, que es otro contrato y otro número. La
+    segunda palabra lleva la estimación que devolvió el control del camino medido
+    —70.983—, distinta del importe a propósito: si el decodificador leyera la
+    palabra equivocada, la prueba lo vería.
+    """
+    return "0x" + _palabra_uint(amount_out) + _palabra_uint(70_983)
 
 
 def _token(direccion: str, simbolo: str, decimales: int, chain_key: str = "base") -> Token:
@@ -266,6 +317,37 @@ class _PoolFalso:
     lp_fee: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PoolDeRuta:
+    """Un pool de mentira en uno de los pares que forma la búsqueda de ruta.
+
+    Sólo lleva lo que el motor consulta de un pool dentro de una ruta: su
+    liquidez —que decide si el par existe— y su precio —contra el que se compone
+    el impacto—. La salida **no** vive aquí a propósito: está en la tabla
+    `hub_salidas`, indexada por el importe de entrada, porque la segunda pata se
+    cotiza con lo que de verdad dio la primera y una tabla que ignorara el
+    importe devolvería la misma salida a cualquier entrada, que es justo el error
+    que la prueba no debe dejar pasar.
+    """
+
+    liquidez: int
+    sqrt_price_x96: int
+
+
+def _hubs_de(par: tuple[str, str]) -> tuple[str, ...]:
+    """Las direcciones de los hubs con los que ese par puede formar ruta.
+
+    Se leen del **catálogo** —el mismo `hub_tokens` que consulta el motor— y no
+    de una lista escrita aquí: si el catálogo gana un hub, el doble y las pruebas
+    tienen que ganarlo con él, o medirían un mundo que ya no es el del motor.
+    """
+    return tuple(
+        v4._on_chain_address(token)
+        for token in hub_tokens("base")
+        if v4._on_chain_address(token) not in par
+    )
+
+
 class _Escenario(_Lector):
     """Un `PoolManager` de mentira, indexado por el `poolId` **derivado**.
 
@@ -275,6 +357,13 @@ class _Escenario(_Lector):
     manifestó como `PoolNotInitialized`—, el `poolId` que preguntara no sería
     ninguno de los del par y la lectura se denunciaría como no prevista, en vez de
     devolver un cero que parecería un pool vacío y dejaría pasar el fallo.
+
+    También conoce los pares que el motor puede formar con los hubs del catálogo
+    —`_hubs_de`—, que es lo que hace falta desde que hay búsqueda de ruta: un
+    `poolId` de ésos que ningún escenario declare contesta liquidez cero, que es
+    lo que contesta la cadena para una clave que nadie inicializó. La denuncia
+    queda para un `poolId` que no se derive de ninguno de esos pares, que es
+    donde de verdad hay un error.
     """
 
     def __init__(
@@ -282,61 +371,124 @@ class _Escenario(_Lector):
         *,
         pools: dict[int, _PoolFalso] | None = None,
         par: tuple[str, str] = (WETH, USDC),
+        hub_pools: dict[tuple[str, str, int], _PoolDeRuta] | None = None,
+        hub_salidas: dict[tuple[str, str, int, int], int] | None = None,
+        caminos: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         self._pools = pools if pools is not None else {500: _pool(500)}
-        self._comision_de = {
-            fee: pool.lp_fee if pool.lp_fee is not None else fee
-            for fee, pool in self._pools.items()
-        }
+        self._par = frozenset(par)
         self._tramo_por_id = {
             abi.pool_id(par[0], par[1], fee, espaciado): fee
             for fee, espaciado in FEE_TIERS
         }
+        # La pareja se guarda en su orden **canónico** para poder declararla en
+        # cualquier orden: la clave de un pool no depende de cómo se escriba, y
+        # la tabla del doble tampoco debe.
+        self._hub_pools = {
+            (*abi.sorted_currencies(a, b), fee): pool
+            for (a, b, fee), pool in (hub_pools or {}).items()
+        }
+        self._hub_salidas = hub_salidas or {}
+        self._caminos = caminos or {}
+        self._hub_por_id: dict[str, tuple[str, str, int]] = {}
+        for hub in _hubs_de(par):
+            for fee, espaciado in FEE_TIERS:
+                for a, b in ((par[0], hub), (hub, par[1])):
+                    self._hub_por_id[abi.pool_id(a, b, fee, espaciado)] = (
+                        *abi.sorted_currencies(a, b),
+                        fee,
+                    )
 
-    def _tramo_de(self, data: str, pregunta: str) -> int:
-        """El tramo al que se refiere una lectura, o se denuncia el desconocido."""
+    def _pool_de(
+        self, data: str, pregunta: str
+    ) -> tuple[_PoolFalso | _PoolDeRuta | None, int]:
+        """El pool al que se refiere una lectura, y el tramo que lo nombra.
+
+        Un `None` como pool es una clave que no se ha inicializado —lo que la
+        cadena contesta con un cero—, y una clave que no se deriva de ningún par
+        del escenario se denuncia: ésa sólo puede venir de ordenar al revés o de
+        preguntar por un par que no toca.
+        """
         pool_id = "0x" + data[10 : 10 + 64]
         tramo = self._tramo_por_id.get(pool_id)
-        if tramo is None:
-            raise AssertionError(
-                f"se preguntó {pregunta} por el pool {pool_id}, que no se deriva del "
-                f"par del escenario. La clave se calcula ordenando las monedas por "
-                f"su valor, así que esto significa que se ordenaron al revés."
-            )
-        return tramo
+        if tramo is not None:
+            return self._pools.get(tramo), tramo
+        clave = self._hub_por_id.get(pool_id)
+        if clave is not None:
+            return self._hub_pools.get(clave), clave[2]
+        raise AssertionError(
+            f"se preguntó {pregunta} por el pool {pool_id}, que no se deriva de "
+            f"ninguno de los pares del escenario —el del par ni los que forma con "
+            f"los hubs del catálogo—. La clave se calcula ordenando las monedas "
+            f"por su valor, así que esto significa que se ordenaron al revés o "
+            f"que se preguntó por un par que no era."
+        )
 
-    @staticmethod
-    def _tramo_del_cotizador(data: str) -> int:
-        """El tramo que pregunta el cotizador, leído de la cuarta palabra.
+    def _cotiza_tramo(self, data: str) -> object:
+        """La salida de una pata, despachada por la terna **direccional**.
 
-        El contador empieza **después del selector**: saltarse sus cuatro bytes y
-        el `0x` leería una ventana desplazada que ya no es una palabra, y el doble
-        devolvería la salida de un tramo que el motor no preguntó.
+        En el par directo sale del pool del tramo, como siempre. En un par de
+        hub la clave lleva además el **importe**: la segunda pata se cotiza con lo
+        que de verdad dio la primera, y una tabla que lo ignorara devolvería la
+        misma salida a cualquier entrada. Un importe que no esté en la tabla es un
+        tramo que no puede dar salida a ese tamaño, que es una respuesta del
+        mercado y no una caída.
+
+        El sentido del intercambio viene dentro del calldata (`zeroForOne`), así
+        que la pareja direccional se reconstruye de ahí: preguntar los dos
+        argumentos invertidos produciría una lectura distinta que el motor no
+        hace nunca.
         """
-        inicio = len(abi.SELECTOR_QUOTE_EXACT_INPUT_SINGLE) + 3 * 64
-        return int(data[inicio : inicio + 64], 16)
+        selector = abi.SELECTOR_QUOTE_EXACT_INPUT_SINGLE
+        c0 = _direccion_de(data, selector, 1)
+        c1 = _direccion_de(data, selector, 2)
+        tramo = int(_palabra_de(data, selector, 3), 16)
+        cero_a_uno = int(_palabra_de(data, selector, 6), 16) == 1
+        importe = int(_palabra_de(data, selector, 7), 16)
+        entrada, salida = (c0, c1) if cero_a_uno else (c1, c0)
+        if frozenset((entrada, salida)) == self._par:
+            pool = self._pools.get(tramo)
+            return None if pool is None else _respuesta_quoter(pool.salida_raw)
+        cantidad = self._hub_salidas.get((entrada, salida, tramo, importe))
+        if cantidad is None:
+            raise SourceResponseError("execution reverted")
+        return _respuesta_quoter(cantidad)
+
+    def _cotiza_camino(self, data: str) -> object:
+        """La salida del camino publicado, o se denuncia que no es el publicado.
+
+        Se indexa por el calldata **entero** —el `PathKey[]` con sus
+        desplazamientos y la moneda de entrada incluidos— y no por un resumen:
+        construir con otro camino, o con la moneda de llegada de un tramo al
+        revés, es el fallo que esta tabla existe para ver, y una tabla que lo
+        aceptara mediría un mundo donde el camino da igual.
+        """
+        cantidad = self._caminos.get(data)
+        if cantidad is None:
+            raise AssertionError(f"se cotizó un camino que no es el publicado: {data}")
+        return _respuesta_quoter(cantidad)
 
     def _por_defecto(self, to: str, data: str) -> object:
         if data.startswith(abi.SELECTOR_GET_LIQUIDITY):
-            tramo = self._tramo_de(data, "la liquidez")
-            pool = self._pools.get(tramo)
-            # Un tramo sin pool devuelve cero, que es lo que devuelve la cadena
+            pool, _tramo = self._pool_de(data, "la liquidez")
+            # Un par sin pool devuelve cero, que es lo que devuelve la cadena
             # para una clave que no se ha inicializado nunca.
             return "0x" + _palabra_uint(0 if pool is None else pool.liquidez)
         if data.startswith(abi.SELECTOR_GET_SLOT0):
-            tramo = self._tramo_de(data, "el estado")
-            if tramo not in self._pools:
+            pool, tramo = self._pool_de(data, "el estado")
+            if pool is None:
                 raise AssertionError(
-                    f"se pidió el estado del tramo {tramo}, que en el escenario no "
-                    f"tiene pool: el motor sólo debe leer el precio de un pool que "
-                    f"haya pasado el filtro de liquidez."
+                    f"se pidió el estado del pool del tramo {tramo}, que en el "
+                    f"escenario no tiene pool: el motor sólo debe leer el precio "
+                    f"de un pool que haya pasado el filtro de liquidez."
                 )
-            pool = self._pools[tramo]
-            return _slot0(pool.sqrt_price_x96, self._comision_de[tramo])
+            declarada = pool.lp_fee if isinstance(pool, _PoolFalso) else None
+            return _slot0(pool.sqrt_price_x96, tramo if declarada is None else declarada)
         if data.startswith(abi.SELECTOR_QUOTE_EXACT_INPUT_SINGLE):
-            pool = self._pools.get(self._tramo_del_cotizador(data))
-            return None if pool is None else _respuesta_quoter(pool.salida_raw)
+            return self._cotiza_tramo(data)
+        if data.startswith(abi.SELECTOR_QUOTE_EXACT_INPUT):
+            return self._cotiza_camino(data)
         return None
 
 
@@ -437,6 +589,10 @@ def test_cada_firma_produce_el_selector_que_se_buscó_en_la_cadena() -> None:
     """
     assert abi.SELECTOR_EXECUTE == "0x3593564c"
     assert abi.SELECTOR_QUOTE_EXACT_INPUT_SINGLE == "0xaa9d21cb"
+    # La firma del camino **no** es la que se recordaba —`0xcdca1753` no existe
+    # en el contrato desplegado—: ésta salió de leer los `PUSH4` del
+    # despachador, y es la que separa cotizar un camino entero de no cotizarlo.
+    assert abi.SELECTOR_QUOTE_EXACT_INPUT == "0xca253dc9"
     assert abi.SELECTOR_GET_SLOT0 == "0xc815641c"
     assert abi.SELECTOR_GET_LIQUIDITY == "0xfa6793d5"
 
@@ -471,6 +627,8 @@ def test_la_tabla_de_acciones_es_la_del_contrato_y_estaba_mal() -> None:
     ejecutarse y la deuda quedaría a medias.
     """
     assert abi.ACTION_SWAP_EXACT_IN_SINGLE == 0x06
+    #: La del camino: misma familia que la de un solo pool, un número más.
+    assert abi.ACTION_SWAP_EXACT_IN == 0x07
     assert abi.ACTION_SETTLE_ALL == 0x0C
     assert abi.ACTION_TAKE == 0x0E
     assert abi.COMMAND_V4_SWAP == 0x10
@@ -606,6 +764,9 @@ def test_una_respuesta_truncada_es_sin_dato_y_no_un_cero() -> None:
     assert abi.decode_uint("0x1234") is None
     assert abi.decode_uint("0x") is None
     assert abi.decode_quote("0x" + _palabra_uint(9)) == 9
+    # El retorno medido son **dos** palabras —el importe y una estimación de
+    # gas—: el importe va primero, y la segunda no se lee ni se confunde con él.
+    assert abi.decode_quote("0x" + _palabra_uint(3) + _palabra_uint(70_983)) == 3
     assert abi.decode_quote("0x") is None
     assert abi.decode_slot0(_slot0(1234, 500)) == (1234, 500)
     # Tres palabras: el precio llega, la comisión contra la que se contrasta no.
@@ -694,11 +855,21 @@ async def test_el_filtro_es_la_liquidez_y_no_el_precio() -> None:
 
 
 async def test_sin_ningun_pool_con_liquidez_no_se_cotiza_ni_se_lee_un_precio() -> None:
-    """Ninguno de los cuatro tramos tiene liquidez: no hay nada que cotizar."""
+    """Ninguno de los cuatro tramos tiene liquidez: no hay nada que cotizar.
+
+    Y «ninguno» es también el veredicto de cada par que el par forma con los
+    hubs del catálogo, porque desde que hay búsqueda de ruta se cotizan los dos
+    caminos: se les pregunta la liquidez —cuatro tramos por par— y el cero corta
+    **antes del precio**, que es lo que fija la última comprobación: no se pidió
+    ni un `slot0`. Tampoco se llegó a la segunda pata de ningún hub: sin primera
+    pata no hay ruta que cotizar.
+    """
     lector = _Escenario(pools={})
     assert not await _motor(lector).quote(_par(), _usdc().amount("1"))
     leidas = lector.calls_to(BASE.state_view)
-    assert len(leidas) == 4
+    assert sum(data.startswith(abi.SELECTOR_GET_LIQUIDITY) for data in leidas) == 4 * (
+        1 + len(_hubs_de((WETH, USDC)))
+    )
     assert not any(data.startswith(abi.SELECTOR_GET_SLOT0) for data in leidas)
 
 
@@ -1146,7 +1317,526 @@ async def test_la_descripcion_dice_lo_que_el_usuario_tiene_que_saber_antes_de_fi
 
 
 # --------------------------------------------------------------------------- #
-# 9. El impacto
+# 9. El segundo salto: la ruta por un hub
+# --------------------------------------------------------------------------- #
+#: El token que abre el caso. No está en el catálogo de ninguna red, así que su
+#: par con USDC no tiene pool directo en ningún tramo y la única vía es pasar
+#: por un hub. Su dirección es **mayor** que la de WETH —y que la de cbBTC—, y
+#: eso decide el sentido (`zeroForOne`) de sus tramos: es la mitad del contrato
+#: de este escenario.
+NEW = "0x" + "9" * 40
+ENTRADA_NEW = 10**18
+#: Lo que da cada pata del camino: 1 NEW → 0,5 WETH → 1.000 USDC.
+PATA_WETH = 5 * 10**17
+PATA_USDC = 1_000 * 10**6
+#: Los marginales de las dos patas. El de NEW/WETH sale de 1/0,51 WETH por NEW
+#: —un precio por encima de lo que dio la pata, que es la dirección en la que la
+#: orden se paga— y el de WETH/USDC, de 2,02·10⁻⁹.
+SQRT_NEW_WETH = _sqrt_de(Decimal(1) / Decimal("0.51"))
+SQRT_WETH_USDC = _sqrt_de(Decimal("2.02e-9"))
+#: El camino que el motor publica: por WETH al 0,30 %, y de ahí a USDC al 0,05 %.
+LLAVES_NEW_USDC = (
+    abi.PathKey(currency=WETH, fee=3_000, tick_spacing=60),
+    abi.PathKey(currency=USDC, fee=500, tick_spacing=10),
+)
+CAMINO_NEW_USDC = abi.quote_exact_input(NEW, LLAVES_NEW_USDC, ENTRADA_NEW)
+#: El segundo hub del catálogo que compite, con sus cifras: 0,05 cbBTC por la
+#: primera pata y 1.100 USDC por la segunda —más que los 1.000 del WETH—.
+CBBTC = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
+PATA_CBBTC = 5 * 10**6
+PATA_CBBTC_USDC = 1_100 * 10**6
+
+
+def _new() -> Token:
+    """El token del escenario: uno que no está en el catálogo de ninguna red."""
+    return _token(NEW, "NEW", 18)
+
+
+def _hub(simbolo: str) -> Token:
+    """El token del catálogo de Base que hace de escala.
+
+    Se busca en el **catálogo** —el mismo que consulta la búsqueda de ruta— y
+    no se copia a mano: una dirección copiada aquí describiría un mundo que la
+    búsqueda no visita, y la prueba mediría el doble en vez del motor.
+    """
+    for token in hub_tokens("base"):
+        if token.symbol == simbolo:
+            return token
+    raise AssertionError(f"el catálogo de Base ya no tiene «{simbolo}»")
+
+
+def _par_new_usdc() -> TradingPair:
+    return TradingPair(base=_new(), quote=_usdc())
+
+
+def _escenario_del_camino() -> _Escenario:
+    """El caso: NEW no tiene pool directo con USDC y la ruta pasa por WETH.
+
+    La segunda pata se declara por el importe que dio la primera —`PATA_WETH`,
+    no la entrada original—: si el motor la cotizara con otro tamaño, la tabla
+    no la encontraría y no habría ruta, que es exactamente lo que hay que
+    distinguir.
+    """
+    return _Escenario(
+        par=(NEW, USDC),
+        pools={},
+        hub_pools={
+            (NEW, WETH, 3_000): _PoolDeRuta(LIQUIDEZ_3000, SQRT_NEW_WETH),
+            (WETH, USDC, 500): _PoolDeRuta(LIQUIDEZ_500, SQRT_WETH_USDC),
+        },
+        hub_salidas={
+            (NEW, WETH, 3_000, ENTRADA_NEW): PATA_WETH,
+            (WETH, USDC, 500, PATA_WETH): PATA_USDC,
+        },
+        caminos={CAMINO_NEW_USDC: PATA_USDC},
+    )
+
+
+def _escenario_de_dos_hubs() -> _Escenario:
+    """Dos hubs compiten: el WETH da 1.000 USDC y el cbBTC, 1.100.
+
+    El cbBTC va **después** del WETH en el catálogo, así que la ganadora no es
+    la primera que se sondea: es la que más da por la segunda pata, que es lo
+    que de verdad recibe el usuario.
+    """
+    return _Escenario(
+        par=(NEW, USDC),
+        pools={},
+        hub_pools={
+            (NEW, WETH, 3_000): _PoolDeRuta(LIQUIDEZ_3000, SQRT_NEW_WETH),
+            (WETH, USDC, 500): _PoolDeRuta(LIQUIDEZ_500, SQRT_WETH_USDC),
+            (NEW, CBBTC, 10_000): _PoolDeRuta(
+                LIQUIDEZ_3000,
+                _sqrt_para(ENTRADA_NEW, PATA_CBBTC, token_in_is_token0=True),
+            ),
+            (CBBTC, USDC, 10_000): _PoolDeRuta(
+                LIQUIDEZ_500,
+                _sqrt_para(PATA_CBBTC, PATA_CBBTC_USDC, token_in_is_token0=False),
+            ),
+        },
+        hub_salidas={
+            (NEW, WETH, 3_000, ENTRADA_NEW): PATA_WETH,
+            (WETH, USDC, 500, PATA_WETH): PATA_USDC,
+            (NEW, CBBTC, 10_000, ENTRADA_NEW): PATA_CBBTC,
+            (CBBTC, USDC, 10_000, PATA_CBBTC): PATA_CBBTC_USDC,
+        },
+    )
+
+
+def test_las_direcciones_del_escenario_son_las_del_catalogo() -> None:
+    """Si el catálogo cambia una dirección, el escenario tiene que cambiar con él.
+
+    Los hubs se buscan por nombre en el catálogo, así que esta prueba no repite
+    esa búsqueda: fija que los nombres existen y que las direcciones que el
+    escenario escribe a mano son las que el motor va a visitar.
+    """
+    assert v4._on_chain_address(_hub("WETH")) == WETH
+    assert v4._on_chain_address(_hub("USDC")) == USDC
+    assert v4._on_chain_address(_hub("cbBTC")) == CBBTC
+
+
+async def test_si_el_par_directo_cotiza_no_se_buscan_rutas() -> None:
+    """La ruta no compite con el pool directo: sólo entra cuando no hay ninguno."""
+    lector = _Escenario()
+    cotizaciones = await _motor(lector).quote(_par(), _usdc().amount("1"))
+
+    assert len(cotizaciones) == 1
+    assert cotizaciones[0].route is None
+    # Cuatro lecturas de liquidez, las del par directo: ninguna pareja de hub
+    # llegó a preguntarse.
+    leidas = lector.calls_to(BASE.state_view)
+    assert sum(data.startswith(abi.SELECTOR_GET_LIQUIDITY) for data in leidas) == 4
+
+
+async def test_una_ruta_de_dos_saltos_cotiza_el_camino_entero() -> None:
+    """El par sin pool directo cae a la ruta por hub, y la publica dentro."""
+    lector = _escenario_del_camino()
+    par = _par_new_usdc()
+    cotizaciones = await _motor(lector).quote(par, _new().amount("1"))
+
+    assert len(cotizaciones) == 1
+    cotizacion = cotizaciones[0]
+    assert cotizacion.venue.venue_id == "uniswap-v4@30+5"
+    assert cotizacion.venue.name == "Uniswap V4 0.3 % + 0.05 %"
+    assert cotizacion.fee_bps == BasisPoints(35)
+    assert cotizacion.fee_basis is Measurement.DERIVED
+    assert cotizacion.impact_basis is Measurement.DERIVED
+    assert cotizacion.liquidity is None
+    assert cotizacion.amount_out.raw == PATA_USDC
+    assert cotizacion.amount_out.symbol == "USDC"
+
+    assert cotizacion.route is not None
+    assert [token.symbol for token in cotizacion.route.tokens] == ["NEW", "WETH", "USDC"]
+    assert [hop.fee_bps for hop in cotizacion.route.hops] == [
+        BasisPoints(30),
+        BasisPoints(5),
+    ]
+    assert cotizacion.route.total_fee_bps == BasisPoints(35)
+
+    # El impacto es la composición de los dos tramos, con los marginales que el
+    # doble dio a cada pata —incluida la segunda, cotizada con lo que dio la
+    # primera— y no la suma ni el impacto de un solo pool.
+    primera = impact_bps(
+        amount_in_raw=ENTRADA_NEW,
+        amount_out_raw=PATA_WETH,
+        sqrt_price_x96=SQRT_NEW_WETH,
+        # NEW es mayor que WETH, así que la moneda 0 es WETH y la que entra no
+        # lo es: el precio divide.
+        token_in_is_token0=False,
+        fee=BasisPoints(30),
+    )
+    segunda = impact_bps(
+        amount_in_raw=PATA_WETH,
+        amount_out_raw=PATA_USDC,
+        sqrt_price_x96=SQRT_WETH_USDC,
+        # Aquí WETH sí es la moneda 0 —es menor que USDC—: el precio multiplica.
+        token_in_is_token0=True,
+        fee=BasisPoints(5),
+    )
+    assert primera is not None
+    assert segunda is not None
+    assert cotizacion.price_impact_bps == combine_impact_bps([primera, segunda])
+    assert cotizacion.price_impact_bps.value < primera.value + segunda.value
+    assert 0 < cotizacion.price_impact_bps.value < 500
+
+    assert "dos saltos" in cotizacion.source_note
+    assert "NEW → WETH → USDC" in cotizacion.source_note
+
+
+async def test_gana_la_ruta_que_mas_da_aunque_su_hub_no_sea_el_primero() -> None:
+    """Las rutas compiten por la salida del segundo tramo, no por el orden."""
+    cotizaciones = await _motor(_escenario_de_dos_hubs()).quote(
+        _par_new_usdc(), _new().amount("1")
+    )
+
+    assert len(cotizaciones) == 1
+    cotizacion = cotizaciones[0]
+    assert cotizacion.amount_out.raw == PATA_CBBTC_USDC
+    assert cotizacion.venue.venue_id == "uniswap-v4@100+100"
+    assert cotizacion.venue.name == "Uniswap V4 1 % + 1 %"
+    assert cotizacion.route is not None
+    assert [token.symbol for token in cotizacion.route.tokens] == ["NEW", "cbBTC", "USDC"]
+
+
+async def test_la_ruta_se_ejecuta_en_un_solo_swap_con_el_camino_publicado() -> None:
+    """Construir vuelve a cotizar **ese** camino, no busca otro que diera más.
+
+    El doble sólo contesta al camino exacto que el motor publicó y con el
+    importe exacto: si al construir se buscara de nuevo, o se cambiara un tramo
+    o el tamaño, la lectura no casaría y la prueba lo vería. La comparación del
+    calldata es entera porque es lo que se firma: las mismas tres acciones
+    dentro de un comando, con la del camino (`SWAP_EXACT_IN`) en vez de la de
+    un salto.
+    """
+    lector = _escenario_del_camino()
+    motor = _motor(lector)
+    par = _par_new_usdc()
+    cotizacion = (await motor.quote(par, _new().amount("1")))[0]
+    payload = await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+    minimo = (Decimal(PATA_USDC) * (Decimal(1) - Decimal("0.005"))).to_integral_value(
+        rounding=ROUND_DOWN
+    )
+    assert payload.calldata == abi.execute(
+        (abi.COMMAND_V4_SWAP,),
+        (
+            abi.v4_swap_input(
+                (abi.ACTION_SWAP_EXACT_IN, abi.ACTION_SETTLE_ALL, abi.ACTION_TAKE),
+                (
+                    abi.swap_exact_in_path(
+                        NEW,
+                        LLAVES_NEW_USDC,
+                        amount_in_raw=ENTRADA_NEW,
+                        amount_out_min_raw=int(minimo),
+                    ),
+                    abi.settle_all(NEW, ENTRADA_NEW),
+                    abi.take(USDC, DESTINATARIO, abi.OPEN_DELTA),
+                ),
+            ),
+        ),
+        int(AHORA.timestamp()) + v4.DEADLINE_SECONDS,
+    )
+    assert payload.to_address == BASE.universal_router
+    assert payload.value.raw == 0
+    assert payload.approval is not None
+    assert payload.approval.spender == BASE.universal_router
+    assert payload.approval.via == PERMIT2
+
+
+async def test_la_descripcion_de_una_ruta_dice_por_donde_pasa() -> None:
+    """Lo que el usuario tiene que leer antes de firmar: el camino y los tramos."""
+    motor = _motor(_escenario_del_camino())
+    par = _par_new_usdc()
+    cotizacion = (await motor.quote(par, _new().amount("1")))[0]
+    payload = await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+    texto = payload.description
+    assert "un solo swap" in texto
+    assert "dos tramos" in texto
+    assert "0.3 % y 0.05 %" in texto
+    assert "NEW → WETH → USDC" in texto
+    assert BASE.universal_router in texto
+
+
+async def test_si_el_camino_se_movio_mas_de_lo_tolerado_no_se_construye() -> None:
+    """La deriva se mide contra la cotización fresca del mismo camino."""
+    lector = _escenario_del_camino()
+    motor = _motor(lector)
+    par = _par_new_usdc()
+    cotizacion = (await motor.quote(par, _new().amount("1")))[0]
+    lector.handlers[CAMINO_NEW_USDC] = _respuesta_quoter(int(PATA_USDC * 1.05))
+
+    with pytest.raises(QuoteMovedError):
+        await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+
+async def test_si_el_camino_ya_no_cotiza_se_dice_por_donde_iba() -> None:
+    """La liquidez se agota entre la tabla y el botón, también en una ruta."""
+    lector = _escenario_del_camino()
+    lector.handlers[CAMINO_NEW_USDC] = SourceResponseError("execution reverted")
+    motor = _motor(lector)
+    par = _par_new_usdc()
+    cotizacion = (await motor.quote(par, _new().amount("1")))[0]
+
+    with pytest.raises(NoQuotesError, match="NEW → WETH → USDC"):
+        await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+
+async def test_una_ruta_que_no_corresponde_al_par_no_se_construye() -> None:
+    """Un camino que no empiece o no termine donde el par ejecutaría otro swap."""
+    motor = _motor(_Escenario(par=(NEW, USDC)))
+    ajena = SwapRoute(
+        hops=(
+            RouteHop(base=_new(), quote=_weth(), fee_bps=BasisPoints(30)),
+            RouteHop(base=_weth(), quote=_hub("cbBTC"), fee_bps=BasisPoints(5)),
+        )
+    )
+    cotizacion = Quote(
+        venue=v4._route_venue("base", (3_000, 500)),
+        engine_id="uniswap_v4",
+        pair=_par_new_usdc(),
+        amount_in=_new().amount("1"),
+        amount_out=TokenAmount(PATA_USDC, 6, "USDC"),
+        fee_bps=BasisPoints(35),
+        fee_basis=Measurement.DERIVED,
+        price_impact_bps=BasisPoints(5),
+        impact_basis=Measurement.DERIVED,
+        observed_at=AHORA,
+        route=ajena,
+    )
+    with pytest.raises(UnsupportedOperationError, match="no corresponde al par"):
+        await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+
+def test_el_camino_de_la_ruta_va_en_claves_de_v4() -> None:
+    """De la ruta publicada a las claves: la moneda es la de **llegada**.
+
+    Cada `PathKey` nombra la moneda a la que llega su tramo, y escribirla al
+    revés deriva la clave de otro pool —o de ninguno— sin que nada chirríe
+    hasta el revert. El espaciado sale de la tabla canónica que el motor
+    sondea, porque el `venue_id` sólo lleva la comisión.
+    """
+    ruta = SwapRoute(
+        hops=(
+            RouteHop(base=_new(), quote=_weth(), fee_bps=BasisPoints(30)),
+            RouteHop(base=_weth(), quote=_usdc(), fee_bps=BasisPoints(5)),
+        )
+    )
+    claves = _motor(_Escenario(par=(NEW, USDC)))._route_path(
+        ruta, token_in=NEW, token_out=USDC
+    )
+
+    assert claves == LLAVES_NEW_USDC
+    assert claves[0].currency == WETH  # la de llegada del primer tramo
+    assert claves[0].tick_spacing == 60
+    assert claves[1].currency == USDC
+    assert claves[1].tick_spacing == 10
+
+
+def test_una_ruta_sin_comisiones_no_se_puede_construir() -> None:
+    """Sin la comisión de cada tramo no hay clave: se dice, no se inventa un 0."""
+    ruta = SwapRoute(
+        hops=(
+            RouteHop(base=_new(), quote=_weth()),
+            RouteHop(base=_weth(), quote=_usdc()),
+        )
+    )
+    with pytest.raises(UnsupportedOperationError, match="comisión"):
+        _motor(_Escenario(par=(NEW, USDC)))._route_path(ruta, token_in=NEW, token_out=USDC)
+
+
+def test_un_tramo_que_el_motor_no_sondea_no_se_construye() -> None:
+    """Un tramo fuera de la tabla no tiene espaciado conocido: se rechaza."""
+    ruta = SwapRoute(
+        hops=(
+            RouteHop(base=_new(), quote=_weth(), fee_bps=BasisPoints(3)),
+            RouteHop(base=_weth(), quote=_usdc(), fee_bps=BasisPoints(5)),
+        )
+    )
+    with pytest.raises(UnsupportedOperationError, match="no sondea"):
+        _motor(_Escenario(par=(NEW, USDC)))._route_path(ruta, token_in=NEW, token_out=USDC)
+
+
+def test_el_venue_de_una_ruta_lleva_los_dos_tramos_dentro() -> None:
+    """Dos rutas del mismo par por hubs distintos son sitios distintos, no una fila."""
+    venue = v4._route_venue("base", (3_000, 500))
+    assert venue.venue_id == "uniswap-v4@30+5"
+    assert venue.name == "Uniswap V4 0.3 % + 0.05 %"
+    # Y no se puede deshacer con el camino de vuelta de un pool: no nombra un
+    # tramo, nombra un camino.
+    with pytest.raises(UnsupportedOperationError, match="no es un venue"):
+        v4._tier_from_venue("uniswap-v4@30+5")
+
+
+#: El calldata medido el 2026-10-09 contra el `V4Quoter` de Base —`eth_call` a
+#: `0x0d5e…048d`—: WETH → USDC → WETH, los dos tramos del 0,30 %, 10¹⁵ wei de
+#: entrada, y devolvió `[993014236051103, 70983]`. Va palabra a palabra, una por
+#: línea, para que además de la igualdad se lea el esqueleto.
+CALLDATA_MEDIDO_DEL_CAMINO = (
+    "0xca253dc9"
+    "0000000000000000000000000000000000000000000000000000000000000020"
+    "0000000000000000000000004200000000000000000000000000000000000006"
+    "0000000000000000000000000000000000000000000000000000000000000060"
+    "00000000000000000000000000000000000000000000000000038d7ea4c68000"
+    "0000000000000000000000000000000000000000000000000000000000000002"
+    "0000000000000000000000000000000000000000000000000000000000000040"
+    "0000000000000000000000000000000000000000000000000000000000000100"
+    "000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+    "0000000000000000000000000000000000000000000000000000000000000bb8"
+    "000000000000000000000000000000000000000000000000000000000000003c"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000000000000000000000000000000000a0"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000004200000000000000000000000000000000000006"
+    "0000000000000000000000000000000000000000000000000000000000000bb8"
+    "000000000000000000000000000000000000000000000000000000000000003c"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000000000000000000000000000000000a0"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+#: Los dos tramos del vector medido: WETH → USDC al 0,30 % y USDC → WETH al
+#: 0,30 % —el mismo tramo dos veces, que es como se midió la composición—.
+LLAVES_MEDIDAS = (
+    abi.PathKey(currency=USDC, fee=3_000, tick_spacing=60),
+    abi.PathKey(currency=WETH, fee=3_000, tick_spacing=60),
+)
+
+
+def test_el_camino_reproduce_el_calldata_medido_en_la_cadena() -> None:
+    """El calldata del camino, byte a byte contra el que se mandó a la cadena.
+
+    La huella de un vector se puede actualizar sin mirar; esto no: es el
+    hexadecimal que el `eth_call` mandó de verdad al `V4Quoter` desplegado y que
+    devolvió la cotización. Si deja de reproducirse es que la codificación se ha
+    movido —la moneda de un tramo, el orden de las palabras, los
+    desplazamientos de la tabla—, no que la prueba esté desactualizada.
+    """
+    medido = abi.quote_exact_input(WETH, LLAVES_MEDIDAS, 10**15)
+    assert medido == CALLDATA_MEDIDO_DEL_CAMINO
+    assert (len(medido) - 2) // 2 == 612
+
+    # Y el esqueleto, que es lo que enseña algo cuando la igualdad se caiga: el
+    # contrato lee la moneda de entrada y la tabla de claves por
+    # desplazamiento, así que cada número tiene que estar en su palabra.
+    selector = abi.SELECTOR_QUOTE_EXACT_INPUT
+    assert _palabra_de(medido, selector, 0) == _palabra_uint(0x20)
+    assert _direccion_de(medido, selector, 1) == WETH
+    assert _palabra_de(medido, selector, 2) == _palabra_uint(0x60)
+    assert _palabra_de(medido, selector, 3) == _palabra_uint(10**15)
+    assert _palabra_de(medido, selector, 4) == _palabra_uint(2)
+    assert _palabra_de(medido, selector, 5) == _palabra_uint(0x40)
+    assert _palabra_de(medido, selector, 6) == _palabra_uint(0x100)
+    assert _direccion_de(medido, selector, 7) == USDC
+    assert _direccion_de(medido, selector, 13) == WETH
+
+
+def test_los_desplazamientos_del_camino_se_cuentan_desde_su_tabla() -> None:
+    """El array se lee por su propia tabla: los desplazamientos son relativos a ella.
+
+    La tabla son la cuenta y los desplazamientos; cada elemento empieza donde
+    termina el anterior, y el `hookData` lleva dentro su **propio**
+    desplazamiento —cinco palabras de cabeza—, no el de nadie más. Escribir
+    estos números en otra base produce un camino que el contrato lee como otra
+    cosa, sin revertir por ello.
+    """
+    tabla = abi.path_keys(LLAVES_NEW_USDC)
+
+    assert tabla[0:64] == _palabra_uint(2)  # cuántas claves
+    assert tabla[64:128] == _palabra_uint(0x40)  # la primera, tras la tabla
+    assert tabla[128:192] == _palabra_uint(0x100)  # la segunda, tras la primera
+    # La primera clave, palabra a palabra: WETH de llegada, 0,30 %, 60 de
+    # espaciado, sin gancho, y el `hookData` vacío con su desplazamiento.
+    assert tabla[192:256] == _palabra_addr(WETH)
+    assert tabla[256:320] == _palabra_uint(3_000)
+    assert tabla[320:384] == _palabra_uint(60)
+    assert tabla[384:448] == _palabra_uint(0)
+    assert tabla[448:512] == _palabra_uint(5 * 32)
+    assert tabla[512:576] == _palabra_uint(0)
+    # Quince palabras: la tabla —cuenta y dos desplazamientos— y dos claves de
+    # seis palabras cada una con el `hookData` vacío.
+    assert len(tabla) // 2 == (1 + 2 + 2 * 6) * 32
+
+
+def test_las_cabezas_del_camino_son_las_que_el_contrato_lee() -> None:
+    """Los dos structs del camino: la llamada lleva un desplazamiento de más.
+
+    El de la cotización tiene cuatro palabras de cabeza —desplazamiento propio,
+    moneda de entrada, desplazamiento a la tabla y el importe— y el del swap
+    cinco: la misma cabeza y el mínimo, que es lo único que separa las dos
+    structs. Y el swap **no** lleva `minHopPriceX36`: es de una versión
+    posterior del repositorio de v4-periphery, y meterlo desplazaría la tabla
+    una palabra —el contrato leería el mínimo donde está la cuenta—.
+    """
+    selector = abi.SELECTOR_QUOTE_EXACT_INPUT
+    cotizacion = abi.quote_exact_input(NEW, LLAVES_NEW_USDC, ENTRADA_NEW)
+    assert _palabra_de(cotizacion, selector, 0) == _palabra_uint(32)
+    assert _direccion_de(cotizacion, selector, 1) == NEW
+    assert _palabra_de(cotizacion, selector, 2) == _palabra_uint(3 * 32)
+    assert _palabra_de(cotizacion, selector, 3) == _palabra_uint(ENTRADA_NEW)
+    assert cotizacion[len(selector) + 4 * 64 :] == abi.path_keys(LLAVES_NEW_USDC)
+
+    swap = abi.swap_exact_in_path(
+        NEW, LLAVES_NEW_USDC, amount_in_raw=ENTRADA_NEW, amount_out_min_raw=7
+    )
+    # Sin selector: es el parámetro de una acción, no una llamada.
+    assert swap[0:64] == _palabra_uint(32)
+    assert swap[64:128] == _palabra_addr(NEW)
+    assert swap[128:192] == _palabra_uint(4 * 32)
+    assert swap[192:256] == _palabra_uint(ENTRADA_NEW)
+    assert swap[256:320] == _palabra_uint(7)
+    assert swap[320:] == abi.path_keys(LLAVES_NEW_USDC)
+    assert len(swap) // 2 == (5 + 3 + 2 * 6) * 32
+
+
+def test_un_camino_vacio_o_un_importe_imposible_no_se_codifican() -> None:
+    """Sin camino no hay nada que cotizar, y un importe que no cabe no se trunca.
+
+    El importe es un `uint128`: truncarlo en silencio cotizaría por otro tamaño
+    —el usuario vería un número y se firmaría otro—, y un camino vacío
+    codificaría una tabla de cero claves que el contrato leería como un
+    camino de cero saltos, que no es un swap.
+
+    La comprobación del importe vive en las llamadas al cotizador, que son las
+    que viajan a la cadena; el `swap` reutiliza la tabla de claves, así que su
+    guarda de camino vacío es la misma, pero no repite la del importe —el
+    número que codifica viene de una cotización que ya pasó por ella—.
+    """
+    with pytest.raises(SourceResponseError, match="camino"):
+        abi.path_keys(())
+    with pytest.raises(SourceResponseError, match="camino"):
+        abi.quote_exact_input(NEW, (), ENTRADA_NEW)
+    with pytest.raises(SourceResponseError, match="camino"):
+        abi.swap_exact_in_path(NEW, (), amount_in_raw=1, amount_out_min_raw=1)
+    with pytest.raises(SourceResponseError, match="no se cotiza"):
+        abi.quote_exact_input(NEW, LLAVES_NEW_USDC, 0)
+    with pytest.raises(SourceResponseError, match="no se cotiza"):
+        abi.quote_exact_input(NEW, LLAVES_NEW_USDC, -1)
+    with pytest.raises(SourceResponseError, match="uint128"):
+        abi.quote_exact_input(NEW, LLAVES_NEW_USDC, 1 << 128)
+
+
+# --------------------------------------------------------------------------- #
+# 10. El impacto
 # --------------------------------------------------------------------------- #
 def test_el_impacto_se_mide_contra_el_marginal_del_pool() -> None:
     """Se deriva, y derivarlo mal publica un número que parece medido.
@@ -1237,7 +1927,7 @@ async def test_la_liquidez_del_rango_activo_no_se_publica_como_si_fuera_reservas
 
 
 # --------------------------------------------------------------------------- #
-# 10. Publicación
+# 11. Publicación
 # --------------------------------------------------------------------------- #
 def test_el_manifiesto_no_necesita_ninguna_clave() -> None:
     """Es la propiedad que hace que este motor no se detenga.

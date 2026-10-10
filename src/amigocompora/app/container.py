@@ -34,6 +34,7 @@ from amigocompora.app.usecases.analyze_with_ai import AnalyzeWithAi
 from amigocompora.app.usecases.claim_bridge import ClaimBridge
 from amigocompora.app.usecases.compare_bridges import CompareBridges
 from amigocompora.app.usecases.compare_prices import ComparePrices
+from amigocompora.app.usecases.estimate_cost import EstimateNetworkCost
 from amigocompora.app.usecases.execute_bridge import ExecuteBridge
 from amigocompora.app.usecases.execute_swap import ExecuteSwap
 from amigocompora.app.usecases.find_prediction_opportunities import (
@@ -57,7 +58,7 @@ from amigocompora.engines.token_lookup import TokenLookup
 from amigocompora.engines.token_store import UserTokenStore
 from amigocompora.infra import config as config_module
 from amigocompora.infra.config import Settings, load_settings
-from amigocompora.infra.evm.broadcast import broadcasters_by_chain
+from amigocompora.infra.evm.broadcast import EvmBroadcaster, broadcasters_by_chain
 from amigocompora.infra.http import build_client
 from amigocompora.infra.logging import configure_logging
 from amigocompora.infra.rpc.pool import RpcEndpoint, RpcPool, RpcRegistry
@@ -71,6 +72,7 @@ from amigocompora.infra.secrets import (
     build_config_resolver,
     resolve_placeholders,
 )
+from amigocompora.infra.wallets import WALLETS_FILE_NAME, WalletBook, WalletKeyProvider
 
 _log = structlog.get_logger(__name__)
 
@@ -151,8 +153,11 @@ class Container:
     #: para saber si puede ofrecer el botón, y para poder explicar por qué no.
     policy: AutonomyPolicy
     #: De dónde sale la clave privada. Se expone para que la interfaz pueda pedir
-    #: la **dirección** derivada —que es pública— sin tocar la clave.
-    keys: SpendingKeyProvider
+    #: la **dirección** derivada —que es pública— sin tocar la clave, y para que
+    #: la pestaña de Cartera pueda gestionar las carteras: añadir, renombrar,
+    #: eliminar, desbloquear y enseñar la clave con contraseña. Es el proveedor
+    #: multi-cartera, que responde a la misma interfaz que el de una sola.
+    keys: WalletKeyProvider
     #: De dónde sale la frase que habilita la ejecución desatendida. Se expone por
     #: el mismo motivo que `keys` y con el mismo límite —el valor no se pide
     #: nunca—: la pantalla de credenciales tiene que poder decir si está puesta y
@@ -297,7 +302,23 @@ async def build_container(
     # `execution.enabled`—, no que falte el objeto. Construirlo bajo condición
     # haría que encenderlo exigiera reiniciar, y que un fallo de cableado sólo
     # apareciera el día que alguien se decide a operar, que es el peor día.
-    prepare_swap = PrepareSwap(registry=registry, gateway=gateway)
+    # Los emisores se construyen **una vez** y se comparten: el camino de swaps,
+    # el de órdenes de predicción y la estimación de coste del panel de rutas
+    # hablan con las mismas redes, y dos mapas con el mismo contenido serían dos
+    # sitios donde el pool de una red puede quedar distinto del otro sin que nada
+    # lo diga. Se construyen aquí —y no dentro de `_build_execution`— porque
+    # `PrepareSwap` los necesita ya, para poder estimar el coste de red al
+    # preparar un swap.
+    broadcasters = broadcasters_by_chain(
+        rpc_registry.pools,
+        gas_policy=effective_settings.execution.gas.to_policy(),
+        clock=effective_clock,
+    )
+    prepare_swap = PrepareSwap(
+        registry=registry,
+        gateway=gateway,
+        estimate=EstimateNetworkCost(broadcasters),
+    )
     prepare_bridge = PrepareBridge(registry=registry, gateway=gateway)
     execution = _build_execution(
         settings=effective_settings,
@@ -306,7 +327,7 @@ async def build_container(
         gateway=gateway,
         prepare=prepare_swap,
         prepare_bridge=prepare_bridge,
-        rpc=rpc_registry,
+        broadcasters=broadcasters,
         registry=registry,
     )
 
@@ -483,7 +504,7 @@ class _Execution:
     #: lo que firma, para que el seguimiento la pida por el mismo gateway.
     claim_bridge: ClaimBridge
     policy: AutonomyPolicy
-    keys: SpendingKeyProvider
+    keys: WalletKeyProvider
     #: Va con las dos anteriores y por el mismo motivo: la pantalla de credenciales
     #: necesita poder decir si una frase servida por el entorno está puesta, y eso
     #: sólo lo sabe el proveedor.
@@ -497,7 +518,7 @@ def _build_execution(
     gateway: ConfirmationGateway,
     prepare: PrepareSwap,
     prepare_bridge: PrepareBridge,
-    rpc: RpcRegistry,
+    broadcasters: Mapping[str, EvmBroadcaster],
     registry: EngineRegistry,
 ) -> _Execution:
     """Cablea firmar y emitir: secretos, límites, registro y emisores.
@@ -509,11 +530,10 @@ def _build_execution(
     «no se puede» sin motivo es lo que empuja a alguien a buscar la forma de
     saltárselo.
 
-    El orden importa por una razón concreta: los emisores se construyen sobre los
-    pools del registro de RPC, que ya existe cuando se llama a esto. Al revés no
-    compilaría; y construirlos perezosamente haría que la primera operación real
-    dependiera de que alguien se acordara de construirlos, que es justo el fallo
-    que este fichero existe para no tener.
+    Los emisores llegan **construidos desde fuera** (`broadcasters`) porque el
+    mismo mapa lo usa ya la estimación de coste de `PrepareSwap`: construirlos
+    otra vez aquí sería tener dos sitios donde el pool de una red puede quedar
+    distinto del otro sin que nada lo diga.
 
     La clave privada **no** se lee aquí. Esto sólo prepara de dónde saldría: se
     pide en el momento de firmar y se suelta. Lo que sí se puede calcular sin
@@ -524,7 +544,16 @@ def _build_execution(
     # El mismo `allow_env_key` para los dos secretos a propósito: es **una**
     # decisión —«esta máquina lee secretos de ejecución del entorno»— y no dos.
     # La frase sola no firma nada; lo que habilita es la ejecución desatendida.
-    keys = SpendingKeyProvider(store, allow_env_fallback=cfg.allow_env_key)
+    # La clave privada pasa por el libro de carteras: el llavero sigue siendo la
+    # cartera heredada —misma lectura, mismo `allow_env_key`— y sobre él viven
+    # las demás fuentes (cifrada con contraseña, modo observación). Se lee por el
+    # **módulo**, como el registro y las demás listas, para que el aislamiento de
+    # la suite desvíe también este fichero.
+    book = WalletBook(config_module.config_dir() / WALLETS_FILE_NAME)
+    keys = WalletKeyProvider(
+        book,
+        legacy=SpendingKeyProvider(store, allow_env_fallback=cfg.allow_env_key),
+    )
     passphrase = AutonomyPassphraseProvider(store, allow_env_fallback=cfg.allow_env_key)
     # El canal de la deposit wallet de Polymarket, para que una orden pueda salir
     # por el único canal que ese recinto admite hoy. Es una fuente que se pregunta
@@ -564,16 +593,6 @@ def _build_execution(
     # recordar —y que olvidar deja la ejecución desatendida sin efecto— a cambio
     # de ninguna seguridad.
     gateway.set_bypass(PolicyBypass(policy))
-
-    # Los emisores se construyen **una vez** y se comparten: el camino de swaps y
-    # el de órdenes de predicción firman en las mismas redes, y dos mapas con el
-    # mismo contenido serían dos sitios donde el pool de una red puede quedar
-    # distinto del otro sin que nada lo diga.
-    broadcasters = broadcasters_by_chain(
-        rpc.pools,
-        gas_policy=cfg.gas.to_policy(),
-        clock=clock,
-    )
 
     return _Execution(
         execute_swap=ExecuteSwap(

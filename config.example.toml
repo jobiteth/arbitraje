@@ -48,11 +48,12 @@ watch_addresses = []
 # lo decide la prioridad de cada motor, no el orden de esta lista.
 #
 # Para operar de verdad hacen falta motores que sepan construir la transacción
-# —`uniswap_v3` y `uniswap_v4` lo hacen, contra los contratos y sin clave—,
-# porque `geckoterminal` sólo publica precios y no puede preparar un swap.
-# V3 y V4 son pools distintos con precios distintos: apilados se ven los dos.
+# —`uniswap_v3`, `uniswap_v4` y `uniswap_v2` lo hacen, contra los contratos y sin
+# clave—, porque `geckoterminal` sólo publica precios y no puede preparar un swap.
+# V3 y V4 son pools concentrados y V2 el de producto constante: son pools
+# distintos con precios distintos, y apilados se ven todos.
 [active_engines]
-dex_quotes = ["uniswap_v3", "uniswap_v4", "geckoterminal"]
+dex_quotes = ["uniswap_v3", "uniswap_v4", "uniswap_v2", "geckoterminal"]
 prediction_markets = "polymarket"
 ai_advisor = "stub_advisor"
 # Puentes para la pestaña «Entre redes». `lifi` cotiza y construye sin clave;
@@ -88,6 +89,21 @@ cross_chain = ["lifi"]
 # quote = "USDC"
 # amount = "1"
 # min_net_bps = 10
+
+# ---------------------------------------------------------------------------
+# Presentación
+# ---------------------------------------------------------------------------
+# La tabla de rutas mezcla motores: los que construyen el swap (uniswap_v3,
+# v4, v2…) y los que sólo publican precios (geckoterminal, dexscreener). Los
+# segundos aparecen marcados «· sólo cotiza» en ámbar: son un precio real que
+# sirve para comparar, y no se pueden firmar.
+#
+# `false` (por omisión): se enseñan todas. `true`: la tabla se queda sólo con
+# lo que tiene constructor detrás y las de sólo cotización no aparecen en
+# ella; si ninguna ruta se puede firmar, la tabla lo dice en vez de quedarse
+# en blanco.
+[ui]
+hide_quote_only_routes = false
 
 # ---------------------------------------------------------------------------
 # Ejecución: firmar y emitir transacciones. Irreversible.

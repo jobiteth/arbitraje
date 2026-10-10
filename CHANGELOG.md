@@ -5,6 +5,512 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Arreglado — Cotizar pregunta a los motores a la vez, y una sola vez por ronda
+
+- **La comparación de precios consulta todos los motores en paralelo y el
+  análisis de oportunidades se deriva de la comparación ya obtenida.** Antes,
+  cada cotización era una ronda **secuencial** por los motores de la ranura
+  —el tiempo era la suma de las latencias, y un motor lento retrasaba a los que
+  ya habían contestado— seguida de una **segunda** ronda completa, la del
+  barrido de oportunidades, que volvía a preguntar lo mismo antes de calcular
+  nada. Reportado por el usuario: «¿por qué tarda tanto la cotización?». El
+  pliegue de los resultados conserva el orden de la pila aunque las respuestas
+  lleguen al revés —de ese orden dependen los desempates por pool y cuál de los
+  fallos se propaga— y una cancelación no se traga: se re-lanza. Ver
+  `app/usecases/compare_prices.py` y `app/usecases/scan_opportunities.py`
+  —`comparison=` es opcional; `WatchScan` sigue cotizando por su cuenta, y una
+  vez—.
+
+### Cambiado — Cambiar el importe, el par o la red vacía lo anterior en el acto
+
+- **Rutas, panel de detalle, oportunidades, línea de la ruta elegida y borrador
+  preparado se retiran en cuanto cambia algo que los describía**, en vez de
+  quedarse en pantalla —todavía seleccionables para preparar y firmar— hasta
+  que llegara la cotización nueva. El rótulo vacío dice «Cotizando…» mientras
+  llega; si el par queda imposible (mismo token en las dos patas, o falta una)
+  dice por qué y no se pide nada a la red. La cotización en vuelo se **cancela**
+  al pedir otra: una petición que ya no interesa no sigue gastando cuota de las
+  fuentes públicas ni compite con la nueva. Reportado por el usuario: «cuando
+  cambio los montos no se limpia lo viejo, rutas etc». Ver `ui/pages/prices.py`
+  (`_schedule_quote`, `_invalidate_quote`, `_clear_results`).
+
+### Cambiado — Las rutas son tarjetas con panel de detalle, no una tabla de ocho columnas
+
+- **La tabla de rutas de la pestaña de precios se sustituye por una lista de
+  tarjetas de dos líneas y un panel de detalle debajo.** Pedido por el usuario:
+  «¿cuál elijo?» se contesta comparando —icono del motor, venue e importe
+  recibido en grande, el desglose debajo, y el importe en **verde** en la mejor—,
+  y «¿qué voy a firmar?» se contesta de una en una en el panel de etiqueta y
+  valor de la ruta elegida. La segunda línea de cada tarjeta se recorta con
+  puntos suspensivos —una fila por ruta, para comparar de un vistazo— y la nota
+  entera vive en su tooltip. **No cambia ninguna funcionalidad**: se conservan
+  la selección que enciende los botones, la marca ámbar «· sólo cotiza» **antes**
+  de elegir, el ajuste `[ui] hide_quote_only_routes` con su recuento «N de M · K
+  ocultas» y su estado vacío, la casilla «Todos los decimales», la tarjeta
+  plegable y los tres botones con sus motivos. Ver `ui/route_list.py` —el
+  resaltado de la tarjeta elegida se pinta por propiedad dinámica porque el
+  `itemWidget` tapa el `::item:selected`— y `ui/pages/prices.py`.
+
+### Añadido — Coste de red estimado al preparar, y camino, cartera y deslizamiento en el panel
+
+- **El panel de la ruta elegida enseña tres datos que existían y no se veían en
+  ninguna parte**: el **camino** de la ruta cuando cruza varios pools
+  (`Quote.route`, con los tramos y sus comisiones en el tooltip), la **cartera
+  receptora** —recortada, con la dirección entera en el tooltip— y el
+  **deslizamiento máximo** configurado, etiquetado como lo que es: la tolerancia
+  de `execution.slippage_bps`, que no cambia el mínimo que acepta el swap —lo
+  fija cada motor al construir el payload—.
+- **`PrepareSwap.__call__` devuelve `PreparedSwap`** —la transacción más lo que
+  se supo de su coste de red— y estima el coste con el payload ya construido,
+  **desde la cartera que firmaría** (`eth_estimateGas` con su `from`: el gas
+  depende de quién envía) y con el **mismo** mapa de emisores que firma, subido
+  un nivel en `container.py` para que no haya dos. La cifra
+  —`gas_limit × max_fee_per_gas`, la semántica de `SignedTransaction.max_cost_wei`,
+  un techo y no un cobro— va al diálogo de confirmación y al panel.
+- **Un fallo de estimación no bloquea nada**: el borrador sale igual, con «no se
+  pudo estimar» y su motivo en el tooltip —un revert por falta de permiso es
+  información, no un muro—. Antes de preparar la fila dice «se estima al
+  preparar» —la estimación es una llamada a la red por ruta y cotizar compara
+  muchas—, en Solana se enseña «—» —no hay `eth_estimateGas` que preguntar— y
+  nunca se escribe un cero en su lugar. Al cambiar de ruta la cifra se retira:
+  era la de otro swap. Ver `app/usecases/estimate_cost.py`.
+
+### Añadido — La tabla de rutas se puede quedar sólo con lo que se puede firmar
+
+- **`[ui] hide_quote_only_routes`** (apagado por omisión): encendido, las rutas
+  de motores que **sólo cotizan** —GeckoTerminal, DexScreener— no llegan a la
+  tabla de rutas de la pestaña de precios, en vez de quedarse marcadas en
+  ámbar. Pedido por el usuario: la fila es un precio de referencia que compara
+  contra las rutas firmables (`PrepareSwap.can_build`), y quien la vea como
+  ruido puede apagarla sin tocar código. La tabla no miente al hacerlo —el
+  recuento dice «N de M · K de sólo cotización ocultas» y, si ninguna es
+  firmable, el rótulo vacío explica que las hay y dónde se encienden, no que
+  ningún motor contestara— y la selección apunta a lo que de verdad se ve
+  (`_shown_quotes`), no al índice de la comparación entera. Ver
+  `infra/config.py` y `ui/pages/prices.py`.
+
+### Añadido — La vía directa de Uniswap V4 ya cruza por dos saltos, sin clave ni cuota
+
+- **El par sin pool directo se cotiza por un hub del catálogo, como en V3 y
+  V2.** El camino entero se le pide al `V4Quoter` de una vez
+  —`quoteExactInput` con los `PathKey[]` del camino— y el importe que devuelve
+  es el que la ejecución daría, no la composición de dos lecturas sueltas.
+  Medido contra Base el 2026-10-09: WETH → USDC → WETH (los dos tramos del
+  0,30 %, 10¹⁵ wei) devolvió `[993014236051103, 70983]` —importe y estimación
+  de gas— y el selector salió del despachador desplegado: **`0xca253dc9`**; el
+  recordado `0xcdca1753` no existe en el contrato desplegado —es de otro
+  cotizador—, y el retorno son **dos** palabras, no las cinco que decía el
+  docstring heredado del `QuoterV2` de V3.
+- **Cada `PathKey` nombra la moneda de llegada de su tramo** y el array lleva su
+  propia tabla de desplazamientos, con el `hookData` vacío en su sitio: escribir
+  la moneda al revés deriva la clave de otro pool, y desplazar la tabla una
+  palabra hace que el contrato lea otra cosa sin revertir al codificar. El
+  calldata se fija byte a byte contra el que se mandó por `eth_call` y contestó
+  con cifras; el payload ejecuta las dos patas en **una sola transacción** con
+  `SWAP_EXACT_IN` (**`0x07`**, medido), `SETTLE_ALL` y `TAKE`, y **sin**
+  `minHopPriceX36`: la revisión desplegada (`v4-periphery@444c526b77d8`) no lo
+  lleva y meterlo desplazaría la tabla una palabra.
+- **Las mismas reglas que la vía de un solo pool, y el mismo contrato de
+  confianza que el multi-salto de V3:** el pool directo con liquidez sigue
+  ganando —la ruta sólo entra cuando no hay ninguno—; las rutas se buscan en
+  paralelo por los hubs del catálogo (`hub_tokens`, filtrados los del par), la
+  segunda pata se cotiza con lo que de verdad dio la primera, compiten por la
+  salida del segundo tramo, el impacto **compone** con tope de 1.000 bps y el
+  venue propio (`uniswap-v4@30+5`) nombra el camino y no un pool. Al construir
+  se vuelve a cotizar **ese** camino —`quoteExactInput` otra vez, deriva del
+  1 %— y sólo entonces se codifica. Ver `engines/uniswap_v4/calldata.py` y
+  `engines/uniswap_v4/engine.py`.
+
+### Añadido — La familia V2 completa la vía directa: AMM de producto constante, sin clave y para cualquier token
+
+- **Un solo motor cubre Uniswap V2, SushiSwap, QuickSwap y PancakeSwap en las
+  seis redes medidas.** Son el mismo contrato con otro despliegue: se midió en
+  los seis routers que llevan los mismos selectores, que la comisión va dentro
+  del contrato —no en el calldata— y que su `path[]` es una lista de direcciones
+  real. Lo que cambia por red es una entrada de la tabla medida, no una rama de
+  código: **Ethereum** Uniswap V2 (4.061 WETH en el par USDC, sobre los 55,8 de
+  SushiSwap), **Optimism** SushiSwap (el router de Uniswap V2 ahí devuelve 0
+  bytes), **Arbitrum** SushiSwap (Camelot queda fuera: sus swaps no llevan los
+  selectores estándar en el dispatcher medido), **Polygon** QuickSwap (**USDC
+  nativo confirmado hoy** con `token1()`: 0x3c49…3359), **Base** Uniswap V2
+  (178,7 WETH sobre 0,7) y **BNB Chain** PancakeSwap. La comisión se midió con
+  aritmética entera contra el contrato desplegado: `997/1000` en los cinco DEX
+  del 0,3 % y `9975/10000` —**25 bps**— en PancakeSwap, cuya discrepancia entre
+  repositorio y documentación queda resuelta por el router real. Ver
+  `engines/uniswap_v2/`.
+- **Cotizar aquí no es simular: es la aritmética que ejecutará el swap.**
+  `getAmountsOut` vive en el propio router y devuelve, sobre el estado del
+  bloque actual, exactamente lo que el swap entregará —neto de comisión—, así
+  que el AMM V2 publica la cifra de la cadena y no una fórmula de este lado. El
+  impacto sale del marginal de las reservas del pool **con la función compartida
+  que ya usaban V3 y V4** (`impact_bps_from_marginal`), de modo que el mismo
+  pool publicado por dos motores da el mismo impacto; la liquidez publicada es
+  la reserva del lado quote, como en las fuentes de pools.
+- **Sin pool directo, dos saltos por los hubs del catálogo en una sola llamada.**
+  El camino entero se cotiza con **un** `getAmountsOut` —el mismo que repetirá
+  el swap—, no componiendo dos lecturas; el impacto de la ruta compone los dos
+  tramos y la comisión publicada es la suma. Un pool directo con liquidez sigue
+  ganando, y el payload vuelve a cotizar **ese mismo camino** con la tolerancia
+  de deriva del 1 % y mínimo redondeado hacia abajo. El nativo se compra y se
+  vende con las funciones dedicadas de la familia (`swapExactETHForTokens`,
+  `swapExactTokensForETH`): el router envuelve y retira él mismo, sin
+  `multicall` ni `unwrapWETH9`, el permiso del token es directo contra el router
+  y el `deadline` existe en todas las redes medidas.
+- **Activado por defecto en el ejemplo, detrás de las vías directas de V3 y V4**
+  (prioridad 30, delante de 0x): su trabajo es que **toda** red medida tenga una
+  vía sin clave ni cuota, y la comparación de precios decide con datos.
+
+### Añadido — La vía directa de Uniswap V3 ya cruza por dos saltos, sin clave ni cuota
+
+- **«1 POL → pUSD» se cotiza y se construye por contrato, sin agregado alguno.**
+  Medido contra Polygon el 2026-10-09: ese par no tiene pool directo en ningún
+  tramo de comisión —los cuatro `getPool` devuelven la dirección cero—, así que
+  el motor V3 directo ahora busca una ruta de dos saltos por los tokens del
+  catálogo (WPOL → USDC → pUSD, tramos 0,05 % + 0,01 %) y la ejecuta en **una
+  sola transacción** con `exactInput` y el camino empaquetado: el QuoterV2
+  devuelve por el camino entero exactamente lo que componen sus dos patas
+  (99594 unidades de 6 decimales por 1 POL). Sin `api_key`, sin cuota y sin
+  tabla por token: los hubs salen del catálogo —envoltorio nativo, stablecoin de
+  referencia y extras medidos—, así que cualquier token que se añada en
+  cualquier red de la tabla enruta solo. Un pool directo con liquidez sigue
+  ganando —la ruta sólo entra cuando no hay ninguno—, y la segunda pata se
+  cotiza con lo que de verdad daría la primera, no con la entrada original.
+- **El payload ejecuta la ruta publicada, no una búsqueda nueva.** Al firmar se
+  vuelve a cotizar con `quoteExactInput` **ese mismo camino** —los tramos con
+  los que se construyó cada pool—, con la misma tolerancia de deriva del 1 % de
+  los demás motores, y el `amountOutMinimum` sale de esa cotización fresca
+  redondeado hacia abajo. Los selectores se midieron en el bytecode desplegado
+  (`exactInput` del SwapRouter V1 `0xc04b8d59` y del SwapRouter02 `0xb858183f`,
+  `quoteExactInput` `0xcdca1753`) y el calldata se contrastó contra el router
+  real: con la forma correcta decodifica el struct entero y sólo echa en falta
+  los fondos (`STF`), mientras que un desplazamiento interno corrompido revierte
+  antes, en `slice_outOfBounds`.
+- **La ruta viaja dentro de la cotización** (`Quote.route`, con `RouteHop` y
+  `SwapRoute` en el dominio): sus tramos, sus comisiones y su venue propio
+  (`uniswap-v3@5+1`, que nombra el camino y no un pool), para que la tabla y el
+  aviso antes de firmar digan por dónde pasa. El impacto de los dos pools
+  **compone** —`1 - Π(1 - i_k)`, no la suma: dos tramos del 1 % cuestan 1,99 %—
+  y viaja como `DERIVED` junto a la comisión sumada. Ver
+  `engines/uniswap_v3/calldata.py` y `engines/uniswap_v3/engine.py`.
+
+### Arreglado — El nativo del swap: 0x y Uniswap ya lo cotizan, y «POL → pUSD» con ellos
+
+- **Los dos agregados se rendían ante la moneda nativa antes de preguntar.** La
+  dirección de un token nativo es `None` —no tiene contrato— y ambos motores lo
+  leían como «no hay nada que cotizar»: justo el caso que más se usa, vender la
+  moneda de la red. Medido el 2026-10-09: la API de Uniswap nombra al nativo con
+  la **dirección cero** (con el centinela de 0x responde `NoRouteFoundError`) y
+  la de 0x con **`0xEeee…`** (con la dirección cero no encuentra ruta). Con la
+  suya, cada API cotiza y construye el nativo en las dos direcciones, y al
+  venderlo la transacción lleva el importe en `value` y el router lo envuelve
+  él mismo — sin aprobación previa que firmar.
+- **«1 POL → pUSD» tiene dos rutas donde antes no había ninguna.** Medido con
+  los motores reales: Uniswap entrega 0,099586 pUSD por el pool V2 de WPOL
+  (una transacción, construible) y 0x entrega 0,098973 pUSD por una ruta de
+  **dos saltos por USDC** (dos pools V3). Y es general, que es lo que importaba:
+  cualquier token que se añada por su contrato se cotiza igual en las nueve
+  redes de los agregados, sin tocar código por token.
+
+### Añadido — Multi-cartera: varias direcciones, una contraseña y el almacén cifrado
+
+- **La Cartera es un libro de carteras, y la activa manda en toda la
+  aplicación.** La cabecera enseña quién es la cartera activa —su nombre, «1»,
+  «2» o el que se le haya puesto— y su dirección con el botón de copiar
+  animado; el nombre es un botón que abre la lista y cambia de cartera **de un
+  clic**, y el cambio sigue en todo lo que firma y lee: swap, predicción,
+  retiradas y saldos pasan a mirar la cartera elegida sin reiniciar nada. Añadir
+  otra por su clave privada, añadir en **modo observación**, renombrar,
+  eliminar, mirar una dirección sin guardarla y bloquear o desbloquear la
+  sesión viven en el menú ☰ de la cabecera; los botones «Otra cartera…» y «Mi
+  cartera» desaparecen —mirar una dirección era lo único que hacían, y eso
+  ahora está en el menú—.
+- **Las claves privadas se guardan cifradas, con una contraseña que se crea la
+  primera vez.** No hay ninguna escrita en el código ni en la configuración: el
+  diálogo la pide al añadir la primera clave —y avisa de que perderla es
+  perderlas—. El cifrado es el keystore estándar de Ethereum (Web3 Secret
+  Storage V3, con scrypt) sobre `eth-account`, sin cripto escrita a mano. La
+  contraseña de sesión queda **en memoria** mientras la cartera esté
+  desbloqueada, porque cada firma descifra la clave con ella; «Bloquear
+  cartera» la olvida y una cartera bloqueada no firma —lo dice la interfaz
+  antes de pulsar y lo dice `WalletLockedError` al firmar—. La clave descifrada
+  no se cachea: se descifra en cada firma.
+- **«Mostrar clave privada» pide la contraseña siempre, y la primera vez migra
+  la del llavero.** La cartera heredada —la clave del llavero de Windows, que
+  se sigue configurando en Credenciales— se lee sin migrar nada mientras no se
+  toque; al enseñarla por primera vez se cifra con la contraseña y queda en el
+  libro, **sin borrar la copia del llavero**, que es el respaldo. Todas las
+  claves del almacén comparten una única contraseña, y el proveedor la verifica
+  contra el almacén ya existente antes de cifrar nada: migrar con otra dejaría
+  una clave que el desbloqueo de la sesión no abriría, y el fallo se
+  descubriría al firmar.
+- **Modo observación: se leen los saldos y no se firma.** Una cartera
+  watch-only —EVM o Solana, con la forma de la dirección validada— enseña su
+  dirección y sus saldos, sirve como destino por omisión y no puede firmar:
+  `require()` la rechaza con `NoWalletError` y los botones que mueven dinero se
+  apagan con su motivo escrito.
+- **La cartera se resuelve en un solo punto, como antes del libro.**
+  `container.keys` pasa de `SpendingKeyProvider` a `WalletKeyProvider` con la
+  misma interfaz —`available/address/get/require`—, así que los casos de uso
+  que firman y los gates de la interfaz no cambiaron ni una línea: elegir otra
+  cartera se propaga por construcción, y con ella llegan los tres «no» de
+  siempre —ninguna cartera, en observación, bloqueada— cada uno con su motivo y
+  su arreglo. El libro vive en `wallets.json` (escritura atómica, lectura
+  tolerante) y nunca guarda una clave en claro —lo fija un test—. Ver
+  `infra/wallets.py` y `ui/pages/wallet.py`.
+
+### Arreglado — El «+» de añadir token y el modal de red, con un solo clic
+
+- **El «+» de token ya funciona con el filtro en «Todas las redes».** Sin red
+  elegida, antes sólo aparecía un aviso y ahí se acababa: la dirección de un
+  contrato sólo significa algo dentro de su red. Ahora el flujo **pregunta
+  primero la red** —«¿En qué red está el token?», con las redes que esa cartera
+  puede leer— y después la dirección del contrato; sin ninguna red que leer lo
+  dice, y con una red ya puesta el comportamiento es el de siempre. Ver
+  `_on_add_token` en `ui/pages/wallet.py`.
+- **El modal de red elige con un solo clic.** El selector de red de la cartera
+  —y el que abre el «+»— cierran y aplican al pulsar una fila; el botón
+  «Elegir» se queda para el teclado, pero ya no hay que tocarlo: seleccionar y
+  luego confirmar era el paso de más que nadie esperaba.
+
+### Cambiado — La cartera: logo redondo, cifras en columna y el selector de red
+
+- **El logo del token es redondo y la insignia de su red va en un cuadro** de
+  esquinas redondeadas del color de la tarjeta —antes era un anillo circular—:
+  redondo el token y cuadrado el marco, cada pieza se distingue de la otra, que
+  es lo que hace legible una esquina con dos logos pegados.
+- **El nombre de la fila es el símbolo, y nada más**: fuera «(nativo)» y la
+  dirección del contrato —el desempate de homónimos sigue en el tooltip de la
+  fila y en el detalle—, y la cantidad y el valor pasan a su **propia columna**
+  a la derecha, alineadas al borde para que los números de la lista se comparen
+  de un salto vertical. En el detalle, el nombre también deja de repetir la
+  dirección: su línea de contrato ya la dice entera.
+- **Los mandos de la lista viven en la cabecera de «Tokens con saldo»**: una
+  **lupa** que despliega el buscador al pulsarla —y al plegarlo lo vacía, para
+  que no quede un filtro escondido junto a su campo—, un **«+»** que añade un
+  token por la dirección de su contrato, y el botón de releer. La barra de
+  búsqueda fija y el botón «+ Añadir token» desaparecen: gastaban una fila
+  entera de un panel de 420 px.
+- **El filtro de red es un selector de la lista**: «▼ Red: Base» —o «▼ Todas
+  las redes» cuando no hay ninguna puesta— abre un modal con las redes que esa
+  cartera puede leer, «Todas las redes» la primera, y filtra sin volver a pedir
+  un nodo. El desplegable «RED» de la cabecera de la cartera desaparece: el
+  filtro es de la lista y ahora vive en ella. Ver `ui/pages/wallet.py`.
+
+### Cambiado — La cartera: la lista por filas, el detalle de cada token y su actividad
+
+- **Cada token es una fila que se lee y se pulsa, no una fila de tabla con un
+  botón al final.** La fila lleva el logo del token con el de su red en la
+  esquina —es lo que distingue el USDC de Polygon del de Base—, el nombre, lo
+  que hay y lo que vale: la cantidad **recortada a cuatro decimales** (19,49166
+  se enseña 19,4916, nunca redondeando hacia arriba, y con la cifra entera en el
+  tooltip) y el valor con **dos decimales**, o su verdad cuando no la hay —«sin
+  cotización» si tiene fondos y nadie lo cotiza, «0.00» si está a cero—. El
+  recorte a «0.0000» no existe: un saldo diminuto se enseña entero, porque un
+  cero falso es la única lectura peor que un número largo.
+- **La fila entera abre el detalle del token** —al soltar el ratón dentro y con
+  Enter o espacio— y desaparecen el ⇄ de la última columna y la barra de
+  acciones: operar con un token empieza por mirarlo, y para llegar al ⇄ había
+  que seleccionar la fila, bajar a la barra y cambiar de pestaña. La red ya no
+  es una columna: va en el tooltip de la fila, que es donde se lee sin gastar el
+  ancho de un panel de 420 px.
+- **El detalle** enseña el nombre con su contrato —abreviado a la vista, entero
+  en el tooltip, y con un botón de copiar que acusa el copiado con una marca
+  verde; la moneda nativa no lo tiene, porque no hay contrato que copiar—, el
+  precio por unidad, la cantidad y el valor, y debajo tres botones: **Enviar**
+  —la retirada de siempre con este token ya elegido—, **Recibir** —el QR en la
+  red de este token— y **Swap** —lo lleva a la tarjeta de conversión con la red
+  y la pata de entrega puestas—.
+- **«Actividad» es lo que ejecutó esta aplicación, y sólo eso**: los asientos del
+  registro (`executions.jsonl`) que tocan a ese token y esa red, del más nuevo
+  al más viejo, con su etiqueta —Envío, Swap, Puente, Recepción, Cobro, Orden,
+  Permiso o Movimiento—, su descripción, su estado cuando no es «success» y su
+  hash. Una transferencia que llegue de fuera **no aparece** —no pasa por el
+  registro— y el texto de la lista vacía lo dice con esas palabras en vez de
+  dejar creer que no pasó nada. Los asientos ganan un campo `tokens` y dos tipos
+  nuevos, `receive` (la recepción de un puente, dinero que entra) y `approval`
+  (el permiso de un ERC-20, que no mueve valor): ninguno de los dos consume el
+  tope del día, y el filtro por token ya no depende del texto del par —los
+  renglones viejos, escritos antes del campo, se siguen emparejando por palabra
+  exacta («USDC» encuentra «WETH/USDC», «USDC.e» no)—. Ver
+  `ui/pages/wallet.py`, `app/execution_policy.py` y `app/usecases/claim_bridge.py`.
+
+### Arreglado — Las compras pequeñas en predicción se validan como lo hace el recinto
+
+- **La tarjeta aplicaba a toda compra el mínimo de participaciones del mercado
+  —5—, también a las que cruzan el libro.** A 0,62 $ cualquier importe por
+  debajo de ~3,10 $ se apagaba con «el mercado pide un mínimo de 5
+  participaciones», aunque el recinto sí acepta esa orden: era el caso de «no me
+  deja comprar 1 $». El recinto valida **por importe** la compra que cruza el
+  libro —mínimo 1 $, medido: «invalid amount for a marketable BUY order …,
+  min size: $1»— y reserva las 5 participaciones para las órdenes que
+  **descansan** en el libro y para las ventas (una venta que cruza de 5
+  participaciones = 0,75 $ se aceptó, medido el 2026-10-09).
+- Ahora la tarjeta aplica **la regla que toque**, y la decide el libro leído:
+  cruza si el precio alcanza el mejor `ask` → importe ≥ 1 $; descansa → mínimo
+  de participaciones; sin libro leído manda la del tamaño. También arregla la
+  dirección contraria: 5 participaciones a 0,18 $ cruzando (0,90 $) ya no pasan
+  el filtro para ser rechazadas por el recinto.
+- **La cifra exacta va en el motivo.** Las participaciones se derivan del
+  importe redondeando hacia abajo —nunca se compra más de lo escrito—, así que a
+  0,62 $, 1,00 $ son 1,61 participaciones = 0,9982 $ y no llegan al dólar: el
+  motivo dice «…se queda en 0.9982 $; sube el importe a 1.01 $». A precios
+  redondos (0,50, 0,25, 0,20, 0,80…) 1,00 $ exacto sí funciona. Ver
+  `ui/pages/prediction.py` (`_order_input_blockers`, `_crosses_book`,
+  `_smallest_marketable_amount`).
+
+### Añadido — El comodín `"*"` en `allowed_chains`: cualquier red, a sabiendas
+
+- **`allowed_chains = ["*"]` significa «cualquier red»**, como `["*"]` ya
+  significaba «cualquier token» en `allowed_tokens`. Hasta ahora la lista de
+  redes sólo admitía nombres concretos: pedir un puente y encontrarse ««base» no
+  está entre las redes habilitadas» una y otra vez no tenía salida salvo
+  enumerar las diez redes a mano —y volver a tocarlo con cada red nueva—. El
+  comodín es una decisión escrita a propósito, no un vacío: la lista vacía sigue
+  siendo «nada», la validación de `config.toml` lo acepta sin colar con él redes
+  escritas mal, y `allows_chain` (nuevo, espejo de `allows_token`) lo reconoce
+  tanto en `check_chain` al firmar como en los avisos de la tarjeta de
+  predicción —retirar, cobrar y publicar—. `ANY_CHAIN` se define a partir de
+  `ANY_TOKEN` para que el mismo asterisco no pueda leerse de dos formas.
+- Los **motores no se abren**: `allowed_engines` sigue diciendo «sólo firma
+  quien construye» y GeckoTerminal queda fuera, que es lo que impide que una
+  fuente de sólo lectura firme. Lo que acota sigue siendo el modo, la
+  confirmación de cada operación y los topes de gasto.
+
+### Añadido — El mínimo del mercado, a la vista siempre en la tarjeta de predicción
+
+- **«Mínimo del mercado: 5 participaciones · salto de precio: 0.01»**, bajo las
+  dos caras de la tarjeta de mercado —comprar y vender—. Antes el mínimo sólo se
+  nombraba en la línea derivada de la compra, así que al vender no había forma
+  de saberlo sin que algo fallara; la línea vive fuera de las caras porque el
+  mínimo aplica igual a las dos. Se dice **lo que publica la fuente**, sin los
+  valores de socorro que usan los campos (1 y 0,01): sin dato se lee «no consta
+  el mínimo de participaciones», que es lo mismo que bloquea el botón con su
+  motivo. La línea derivada de la compra se queda con su oficio —traducir
+  importe a participaciones— sin repetir el mínimo. Ver
+  `ui/pages/prediction.py` (`_refresh_market_limits`).
+
+### Añadido — Las rutas que sólo cotizan se marcan en la tabla de swaps
+
+- **La fila de un motor que no construye lo que se firma se marca antes de
+  elegirla.** GeckoTerminal observa pools y publica cifras, pero no construye el
+  swap (`can_build` en falso): su ruta se puede comparar y no se puede firmar, y
+  eso la tabla sólo lo decía **después** de seleccionar la fila, en el aviso del
+  botón. Ahora la columna «Motor» de esa fila lleva «· sólo cotiza» en ámbar
+  —avisa sin bloquear: la cifra sigue sirviendo para comparar— y su tooltip
+  explica que el swap lo tiene que construir otro motor. Ver
+  `ui/pages/prices.py` (`_fill_table`).
+
+### Arreglado — Un cruce en POL ya se puede firmar: el aviso de valoración no apaga el botón
+
+- **Entregar un token que no es la stablecoin de su red dejaba el botón de firmar
+  apagado, y con él la puerta entera.** Cuando la pata de origen no era la moneda
+  de los topes, la pantalla del puente metía el aviso «se valorará al firmar, y
+  si no se puede valorar no se cruzará» en la lista de **motivos** —la que apaga
+  el botón—: cruzar 2 POL desde Polygon quedaba imposible de empezar siquiera.
+  Ahora ese texto es un **aviso** (ámbar, «Aviso:»), el botón sigue encendido, y
+  la valoración real la hace `ExecuteBridge` al firmar, que se niega a cruzar si
+  no puede medirla —que es lo que el aviso y el propio `bridge_notional` decían
+  que pasaba—. Bloquear ahí era hacer inalcanzable el camino que el motor de
+  ejecución tiene montado para valorar.
+
+### Arreglado — El arranque bajo Avast (`SSLKEYLOGFILE` inyectado)
+
+- **`OPENSSL_Uplink(...): no OPENSSL_Applink` al arrancar no vuelve a tumbar la
+  aplicación.** Avast (Web Shield) añade a los procesos `SSLKEYLOGFILE` con una
+  ruta de dispositivo (`\\.\aswMonFltProxy\…`); el `ssl` de Python la lee al
+  crear cada contexto y el intérprete del venv aborta con esa ruta en cuanto un
+  motor abre su primer cliente HTTP —por eso moría justo al activar `deepseek`—.
+  La aplicación la retira del entorno al arrancar, **sólo si apunta a una ruta
+  de dispositivo** (que no es un fichero de claves legítimo; una ruta normal se
+  respeta, que es alguien depurando TLS a propósito) y lo cuenta en el diario
+  (`env.keylogfile_dropped`). Ya no hace falta lanzarla con
+  `env -u SSLKEYLOGFILE`. Ver `infra/env_guard.py`.
+
+### Arreglado — El botón de publicar y el colateral en caja mixta (`pUSD`)
+
+- **«No se puede publicar: el colateral «pUSD» no está en `allowed_tokens`»
+  —con `PUSD` declarado— no vuelve a aparecer.** La comprobación estaba escrita
+  tres veces en la tarjeta de predicción —cobrar, retirar, publicar— y la del
+  camino que firma comparaba **en crudo**: el símbolo del catálogo es `pUSD` y
+  la lista llega normalizada a mayúsculas, así que `pUSD` «no estaba» en una
+  lista que decía `PUSD`. La comprobación vive ahora en
+  `ExecutionLimits.allows_token`, que normaliza **los dos lados**, y la usan
+  los tres caminos de la tarjeta, el par del swap, la tarjeta de precios y el
+  selector de tokens —con la misma respuesta que dará `check_token` al firmar:
+  un token no puede estar en gris en una pantalla y ser firmable en la
+  siguiente—.
+- El comodín `*` y la lista vacía se deciden ahora en `allows_token`, así que
+  el selector de tokens también respeta el `*` (antes pintaba en gris **todo**
+  con `allowed_tokens = ["*"]`).
+
+### Añadido — Predicción: tendencia, «cuánto paga» y la lista con categorías y orden
+
+- **La tarjeta de mercado enseña la tendencia y cuánto paga.** Bajo la pregunta,
+  la línea «1 h · 24 h · 1 sem» con cada tramo en verde/rojo —deltas por
+  participación, la unidad en la que los publica la fuente: el «sí» que pasó de
+  0.445 a 0.235 trae −0.21— y guion donde no hay dato; debajo, volumen de 24 h,
+  liquidez y diferencial, y las **etiquetas del evento** con las que Polymarket
+  organiza el mercado. Y junto al pago de la orden, «Al precio 0,62: ×1,61 ·
+  +61,3 %»: lo que devuelve una participación al precio límite, recalculado al
+  cambiar de resultado o de precio.
+- **La lista se ordena por más nuevas y lleva filtros.** «Cierran en:» suma
+  «5 minutos» y «10 minutos» —para lo que cierra ya— «Categoría:» —las etiquetas
+  tal cual las da la API, ordenadas por número de mercados— y «Orden:» (más
+  nuevas, más volumen, lo incoherente). «Tendencia» es la primera opción de
+  categoría y una **vista sintética**, no una etiqueta: pide lo que más se mueve
+  en 24 h (`volume24hr`) y apaga «Orden». La tabla gana la columna «24 h» con el
+  cambio del día, con signo y color, y «Categorías». Cambiar cualquier selector
+  re-filtra **en cliente** sobre lo ya traído, sin red; la siguiente búsqueda es
+  la que lleva categoría y orden al motor.
+- **`PredictionMarket` gana los datos de actividad** (`created_at`, `volume`,
+  `volume_24h`, `liquidity`, `spread`, `price_change_1h/24h/1w`) y `tags`
+  (`MarketTag`), todos opcionales: son para mirar, no para operar, y un `None`
+  nunca se convierte en cero. `PredictionSort` nombra los cuatro órdenes, y
+  `sort_reports`/`filter_reports_by_tag` los aplican también del lado del caso
+  de uso —la interfaz los reaplica sin salir a la red—.
+- **El motor pide a Gamma y vuelve a aplicar**: `order=createdAt|volume24hr`,
+  `tag_id` y **`liquidity_num_min`** en `/markets`, y las etiquetas se traen de
+  `/events` en lotes de 40 con `id` repetido —la fuente no las publica en el
+  mercado—. El umbral de liquidez a la fuente es lo que arregla «más nuevas» con
+  datos reales: medido el 2026-10-09, los cien mercados recién creados no
+  llegaban al umbral —aún sin liquidez— y la vista se quedaba en cero filas
+  porque el `limit` se gastaba en filas que el motor tira después. El filtro de
+  categoría sólo descarta a quien **consta** que no la lleva; un lote de
+  etiquetas que falla cuesta la etiqueta, nunca la fila.
+- La barra de la lista pasa a **dos filas** —buscar y acciones arriba, filtros
+  debajo—: en una sola no cabía en el ancho mínimo de la ventana y los campos se
+  recortaban.
+
+### Cambiado — Predicción: la pestaña es la lista, y cada mercado tiene su tarjeta
+
+- La pestaña de predicciones enseña **sólo la lista de mercados abiertos**; al
+  pulsar una fila, su **tarjeta de mercado** sustituye a la lista, con «← Volver a
+  la lista». Volver no vacía la tarjeta —es un borrador—, y una búsqueda nueva sí
+  devuelve a la lista: la tarjeta de un mercado que ya no está sería operar sobre
+  lo que no se está mirando.
+- **Se compra por importe y se vende por participaciones**, porque cada lado
+  piensa en la cifra que compromete. La compra deriva el tamaño del importe
+  —hacia abajo, a los céntimos del campo— y enseña la derivación y el coste
+  exacto; la venta conserva su campo. Los dos lados llevan **atajos** editables:
+  $1/$5/$20/$100 al comprar, 5/10/25/50/100 participaciones al vender. El mínimo
+  del mercado se aplica distinto por lado: al comprar lo vigila el bloqueo con el
+  motivo escrito —subir el importe solo sería comprar más de lo que se escribió—,
+  y al vender el campo no baja de él. El botón firma «orden de compra» o «de
+  venta» según el lado.
+- **El saldo de la wallet, en las dos caras**, junto al formulario, con «Operar
+  wallet…» al lado: abre el panel de la wallet —saldo, posiciones con sus
+  acciones, «Añadir saldo» y el QR—, que era la tarjeta «Wallet de depósito» y
+  ahora es un panel. La tarjeta lee el saldo sola **una vez por sesión** al
+  abrirse; estaban el panel, las órdenes publicadas y «Añadir saldo» para
+  refrescarlo. Las acciones de una posición cierran el panel y saltan a la
+  tarjeta.
+- **«Cestas con margen» y «Por cobrar» son paneles** que abren dos botones junto a
+  «Buscar»: dejaban de tener sentido apilados bajo la lista. Sus flujos no
+  cambian —«Buscar lo que puedo cobrar» sigue siendo manual—.
+- Sin cambios en `domain`, `app`, `engines` ni `infra`: la tarjeta sólo enseña
+  datos que ya estaban mapeados, y `refresh_execution_state` sigue repintando la
+  tarjeta, el cobro y la wallet aunque sus paneles estén cerrados.
+
 ### Añadido — Fase 6: la wallet de depósito en la pestaña de predicciones
 
 - Tarjeta **«Wallet de depósito»** en la pestaña de predicciones, entre la fila de

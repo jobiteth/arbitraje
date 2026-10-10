@@ -313,6 +313,23 @@ class SpendingKeyProvider:
             )
         return key
 
+    def env_lookup(self) -> str | None:
+        """La variable de la que saldría la clave, si es que sale de una.
+
+        Contesta «¿el valor que falta llegaría por el entorno?», que es una
+        pregunta distinta de «¿hay valor?»: con el respaldo apagado la respuesta
+        es no aunque la variable esté puesta, y es justo lo que hay que poder
+        decirle a quien mira una credencial cuando el llavero no responde.
+        Pensada para preguntarse **cuando el almacén ya ha fallado**, que es
+        donde se llama.
+        """
+        try:
+            return self.env_var if self.get() else None
+        except KeyCustodyError:
+            # El respaldo está apagado: nombrar una variable que el proveedor no
+            # va a leer sería prometer una clave que no va a aparecer.
+            return None
+
 
 class PolymarketWalletChannelProvider:
     """Las credenciales del canal de la deposit wallet de Polymarket.
@@ -473,6 +490,14 @@ class AutonomyPassphraseProvider:
                 )
                 return from_env
         return None
+
+    def env_lookup(self) -> str | None:
+        """La variable de la que saldría la frase, si es que sale de una.
+
+        Mismo caso que en `SpendingKeyProvider`: se pregunta cuando el llavero no
+        responde, para poder decir que la credencial **está** aunque no sea de ahí.
+        """
+        return self.env_var if self.get() else None
 
 
 #: Marcador de secreto dentro de un texto de configuración: `${NOMBRE}`.

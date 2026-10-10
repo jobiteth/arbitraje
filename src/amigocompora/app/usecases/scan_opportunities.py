@@ -43,6 +43,7 @@ class ScanOpportunities:
         amount_in: TokenAmount,
         *,
         min_net_bps: BasisPoints = DEFAULT_MIN_NET_BPS,
+        comparison: PriceComparison | None = None,
     ) -> tuple[Opportunity, ...]:
         # Se autoriza el cálculo antes de pedir los datos: si el modo no lo
         # permite, no se gastan peticiones de red para nada.
@@ -54,8 +55,18 @@ class ScanOpportunities:
                 f"Umbral neto mínimo: {min_net_bps}",
             ),
         )
-        comparison = await self.compare_prices(pair, amount_in)
-        return self.from_comparison(comparison, min_net_bps=min_net_bps)
+        # Quien ya tiene la comparación —la pantalla acaba de pedirla para
+        # enseñarla— la pasa aquí para no volver a preguntar lo mismo a todos
+        # los motores: era una segunda ronda completa de la misma cotización, y
+        # el mayor trozo del tiempo que el usuario pasaba mirando «Cotizando…».
+        # La comparación que llegue tiene que ser de **este** par y este importe:
+        # derivar de otros datos daría oportunidades que no son de lo pedido.
+        mirada = (
+            comparison
+            if comparison is not None
+            else await self.compare_prices(pair, amount_in)
+        )
+        return self.from_comparison(mirada, min_net_bps=min_net_bps)
 
     def from_comparison(
         self,

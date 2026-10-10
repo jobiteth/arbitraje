@@ -31,6 +31,12 @@ _UNSET: Final = "sin definir"
 #: explícito y no una lista vacía, porque vacía significa «nada permitido».
 ANY_TOKEN: Final = "*"  # noqa: S105  # el nombre contiene «TOKEN», pero es un símbolo de la lista, no un secreto
 
+#: El mismo comodín en la lista de **redes**: `allowed_chains = ["*"]` permite
+#: firmar en cualquier red. Mismo valor y misma semántica que `ANY_TOKEN` —y por
+#: eso se define a partir de él, para que no puedan separarse—: es una decisión
+#: escrita a propósito, no un vacío que se confunda con «nada permitido».
+ANY_CHAIN: Final = ANY_TOKEN
+
 
 class TriggerKind(StrEnum):
     """Qué dispara una operación. Los tres son combinables."""
@@ -231,13 +237,13 @@ class ExecutionLimits:
                 "poder operar.",
             )
 
-    def check_token(self, symbols: tuple[str, ...]) -> None:
-        """Corta si lo que se mueve toca un token fuera de la lista blanca.
+    def allows_token(self, symbol: str) -> bool:
+        """Si la lista blanca deja operar con `symbol`.
 
-        Admite cualquier número de símbolos: un swap mueve un par y una orden de
-        predicción mueve sólo el colateral. La comprobación es la misma —ninguno
-        fuera de la lista—, así que la lista blanca se escribe una vez y vale
-        para los dos caminos.
+        Es la comprobación que usan `check_token` **y los avisos de la interfaz**
+        (la tarjeta de la orden de predicción, el par del swap, el selector de
+        tokens): una sola respuesta para todos, para que un token no esté gris en
+        una pantalla y firmable en la siguiente.
 
         La comparación es **por mayúsculas en los dos lados**, y no por capricho:
         el catálogo tiene símbolos en caja mixta —`pUSD`, el colateral del recinto
@@ -254,9 +260,20 @@ class ExecutionLimits:
         # escrita como tal en la configuración, y no un vacío que se confunda con
         # «nada permitido». Sin él, la lista vacía sigue significando que no se opera.
         if ANY_TOKEN in self.allowed_tokens:
-            return
+            return True
         permitidos = {entrada.upper() for entrada in self.allowed_tokens}
-        outside = sorted(symbol for symbol in symbols if symbol.upper() not in permitidos)
+        return symbol.upper() in permitidos
+
+    def check_token(self, symbols: tuple[str, ...]) -> None:
+        """Corta si lo que se mueve toca un token fuera de la lista blanca.
+
+        Admite cualquier número de símbolos: un swap mueve un par y una orden de
+        predicción mueve sólo el colateral. La comprobación es la misma —ninguno
+        fuera de la lista—, así que la lista blanca se escribe una vez y vale
+        para los dos caminos. Quién deja pasar cada símbolo lo decide
+        `allows_token`.
+        """
+        outside = sorted(symbol for symbol in symbols if not self.allows_token(symbol))
         if outside:
             raise ExecutionLimitExceededError(
                 "tokens permitidos",
@@ -265,8 +282,28 @@ class ExecutionLimits:
                 f"con él.",
             )
 
+    def allows_chain(self, chain_key: str) -> bool:
+        """Si la lista blanca deja firmar en `chain_key`.
+
+        Espejo de `allows_token`, y con la misma forma: el comodín `["*"]`
+        —cualquier red— es una decisión escrita a propósito en la configuración,
+        no un vacío que se lea como «nada permitido». La lista de redes se
+        normaliza a minúsculas al cargarla, pero se comparan **los dos lados**
+        por la misma razón que en los tokens: unos límites construidos a mano
+        —pruebas, cables sueltos— pueden traer la lista sin normalizar, y una
+        comprobación que dependiera de que alguien la normalizara antes sería
+        una trampa esperando a su dueño.
+
+        La usan `check_chain` **y los avisos de la interfaz** (la tarjeta de
+        predicción al publicar, al retirar y al cobrar): una sola respuesta para
+        todos, como en los tokens.
+        """
+        if ANY_CHAIN in self.allowed_chains:
+            return True
+        return chain_key.lower() in {item.lower() for item in self.allowed_chains}
+
     def check_chain(self, chain_key: str) -> None:
-        if chain_key not in self.allowed_chains:
+        if not self.allows_chain(chain_key):
             raise ExecutionLimitExceededError(
                 "redes permitidas",
                 f"«{chain_key}» no está entre las redes habilitadas "

@@ -35,7 +35,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from amigocompora.app.container import Container, build_container
 from amigocompora.domain.clock import FrozenClock
@@ -43,9 +43,11 @@ from amigocompora.domain.models import (
     DepthLevel,
     MarketDepth,
     MarketOutcome,
+    MarketTag,
     PredictionMarket,
     PredictionOrder,
     PredictionSide,
+    PredictionSort,
     SubmittedPredictionOrder,
     Token,
     Venue,
@@ -105,6 +107,10 @@ class MotorFalso:
         self.libros_pedidos: list[str] = []
         self.firmadas: list[PredictionOrder] = []
         self.publicadas: list[PredictionOrder] = []
+        # El colateral es un atributo y no una constante leída directa: hay una
+        # prueba que lo pone en caja mixta (`pUSD`, como el catálogo) para medir
+        # la comprobación de la lista blanca sin tocar el resto del doble.
+        self.colateral: Token = COLATERAL
 
     @property
     def manifest(self) -> EngineManifest:
@@ -128,7 +134,10 @@ class MotorFalso:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
+        del search, closing_within, category, sort
         return tuple(_MERCADOS[:limit])
 
     async def market(self, market_id: str) -> PredictionMarket:
@@ -205,7 +214,7 @@ class MotorFalso:
         raise AssertionError("no se llega a publicar en esta prueba")
 
     def collateral_for(self, market: PredictionMarket) -> Token:
-        return COLATERAL
+        return self.colateral
 
     def shares_collection_for(self, market: PredictionMarket) -> str:
         return "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -386,12 +395,73 @@ async def test_la_tarjeta_toma_las_reglas_del_mercado_elegido() -> None:
             "Sí — 60.0 %",
             "No — 40.0 %",
         ]
+        # El mínimo del mercado se aplica distinto por lado, porque cada lado se
+        # escribe distinto: al comprar —en dinero— el campo admite cualquier
+        # importe y el mínimo lo vigila el bloqueo con su motivo escrito; al
+        # vender —en participaciones— el campo no baja de ahí.
+        assert pagina._shares.minimum() == 0.01
+        assert Decimal(str(pagina._amount.value())) == Decimal("5")
+        pagina._side.setCurrentIndex(pagina._side.findData(PredictionSide.SELL))
         assert pagina._shares.minimum() == float(_MINIMO)
         assert pagina._price.singleStep() == float(_SALTO)
         assert pagina._price.decimals() == 2
         assert pagina._price.minimum() == float(_SALTO)
         assert pagina._price.maximum() == float(Decimal(1) - _SALTO)
         assert "Se aprueba la propuesta" in pagina._order_market.text()
+
+
+async def test_las_reglas_del_mercado_se_leen_en_las_dos_caras() -> None:
+    """El mínimo y el salto, a la vista siempre —comprar y vender—.
+
+    Antes sólo se nombraba el mínimo en la línea derivada de la compra, así que
+    al vender no había forma de saberlo sin que algo fallara. La línea de reglas
+    vive fuera de las dos caras justo por eso: el mínimo aplica igual a comprar
+    y a vender, y el lado que no se está mirando no puede llevársela por
+    delante.
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+
+        assert pagina._market_limits.text() == (
+            "mínimo del mercado: 5 participaciones · salto de precio: 0.01"
+        )
+        # La línea no viaja con la cara de compra: al vender sigue ahí.
+        pagina._side.setCurrentIndex(pagina._side.findData(PredictionSide.SELL))
+        assert pagina._market_limits.text() == (
+            "mínimo del mercado: 5 participaciones · salto de precio: 0.01"
+        )
+
+
+async def test_un_mercado_sin_reglas_publicadas_lo_dice_en_vez_de_inventarlas() -> None:
+    """Sin mínimo ni salto publicados, la línea dice que no constan.
+
+    Los campos usan valores de socorro —1 y 0,01— para poder existir siquiera,
+    pero enseñarlos aquí sería hacer pasar por regla del recinto lo que es una
+    elección nuestra. Se dice lo que falta, que es lo mismo que bloquea el
+    botón con su motivo escrito.
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina, fila=1)
+
+        assert pagina._market_limits.text() == (
+            "no consta el mínimo de participaciones · no consta el salto de precio"
+        )
+
+
+async def test_volver_a_la_lista_vacia_las_reglas_del_mercado() -> None:
+    """La tarjeta sobrevive a la tabla, así que las reglas tienen que irse con el mercado.
+
+    Sin esto, una búsqueda nueva dejaría «mínimo del mercado: 5» bajo el cartel
+    de «Selecciona un mercado de la lista»: la regla de un mercado que ya no
+    está, leída como una regla vigente.
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        assert pagina._market_limits.text() != ""
+
+        pagina._clear_order_card()
+
+        assert pagina._market_limits.text() == ""
 
 
 async def test_el_precio_se_propone_desde_el_libro_no_desde_el_precio_publicado() -> None:
@@ -424,7 +494,9 @@ async def test_el_libro_enseña_si_el_tamaño_pedido_cabe() -> None:
     """
     async with _pagina() as (_, pagina, _):
         await _abrir(pagina)
-        pagina._shares.setValue(15)
+        # Comprar se escribe en dinero: 9,30 $ al ask propuesto —0,62— son 15
+        # participaciones exactas.
+        pagina._amount.setValue(9.30)
 
         texto = pagina._book_label.text()
         assert "compra 0.58" in texto
@@ -441,7 +513,8 @@ async def test_un_tamaño_que_el_libro_no_tiene_se_dice_y_no_se_calcula() -> Non
     """
     async with _pagina() as (_, pagina, _):
         await _abrir(pagina)
-        pagina._shares.setValue(500)
+        # 310 $ a 0,62 son 500 participaciones, más de las que hay en venta.
+        pagina._amount.setValue(310)
 
         assert "más de lo que hay en venta" in pagina._book_label.text()
 
@@ -450,11 +523,14 @@ async def test_el_coste_y_el_pago_se_enseñan_juntos() -> None:
     """El coste sin el pago potencial es la mitad de lo que hace falta decidir."""
     async with _pagina() as (_, pagina, _):
         await _abrir(pagina)
-        pagina._shares.setValue(10)
         pagina._price.setValue(0.60)
+        # 6 $ a 0,60 son 10 participaciones exactas.
+        pagina._amount.setValue(6)
 
         assert pagina._order_cost.text() == "Pagas 6.00 USDC"
-        assert "10 participaciones pagan 10 USDC" in pagina._order_payout.text()
+        pago = pagina._order_payout.text()
+        assert "10.0 participaciones" in pago
+        assert "USDC si acierta el resultado" in pago
 
         pagina._side.setCurrentIndex(pagina._side.findData(PredictionSide.SELL))
         assert pagina._order_cost.text().startswith("Cobras")
@@ -466,6 +542,32 @@ async def test_el_coste_y_el_pago_se_enseñan_juntos() -> None:
 async def test_con_todo_puesto_el_boton_de_publicar_se_enciende() -> None:
     async with _pagina() as (_, pagina, _):
         await _abrir(pagina)
+        assert pagina._order_note.text() == ""
+        assert pagina._submit_btn.isEnabled() is True
+
+
+async def test_el_colateral_en_caja_mixta_no_apaga_el_boton() -> None:
+    """`pUSD` con una lista que declara `PUSD` es un token permitido, no un bloqueo.
+
+    El catálogo escribe el colateral del recinto con caja mixta —`pUSD`— y la
+    lista llega normalizada a mayúsculas. Comparar en crudo apagaba el botón con
+    «el colateral «pUSD» no está en `allowed_tokens` (ahora declara: PUSD)», que
+    se lee como un error de la propia configuración cuando la configuración está
+    bien: el bloqueo que costaba creer.
+    """
+    async with _pagina(terminos={**_TERMINOS, "allowed_tokens": ["PUSD"]}) as (
+        _,
+        pagina,
+        motor,
+    ):
+        motor.colateral = Token(
+            symbol="pUSD",
+            decimals=6,
+            chain="polygon",
+            address="0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+        )
+        await _abrir(pagina)
+
         assert pagina._order_note.text() == ""
         assert pagina._submit_btn.isEnabled() is True
 
@@ -501,6 +603,21 @@ async def test_cada_pieza_que_falta_se_nombra_y_apaga_el_boton(
         assert esperado in nota
 
 
+async def test_el_comodin_de_redes_deja_publicar_en_cualquier_red() -> None:
+    """`allowed_chains = ["*"]` es «cualquiera»: la red deja de ser un motivo.
+
+    El contrapunto de la lista de piezas que faltan: la misma comprobación que
+    bloqueaba con `["base"]` deja pasar con el comodín, porque la decisión pasa
+    por `allows_chain` —la misma que usará el caso de uso al firmar— y no por
+    una comparación en crudo que leería `"*"` como una red llamada asterisco.
+    """
+    async with _pagina(terminos={**_TERMINOS, "allowed_chains": ["*"]}) as (_, pagina, _):
+        await _abrir(pagina)
+
+        assert pagina._order_note.text() == ""
+        assert pagina._submit_btn.isEnabled() is True
+
+
 async def test_un_mercado_al_que_le_faltan_datos_se_dice_entero() -> None:
     """Un mercado leído sin los datos para firmar no lo arregla ninguna configuración.
 
@@ -517,11 +634,128 @@ async def test_un_mercado_al_que_le_faltan_datos_se_dice_entero() -> None:
 
 
 async def test_el_minimo_del_mercado_no_se_puede_escribir_por_debajo() -> None:
-    """El campo no admite un número que el recinto rechazaría al firmarlo."""
+    """En la venta el campo no admite un número que el recinto rechazaría.
+
+    Al comprar el mínimo lo vigila el bloqueo con su motivo escrito —el campo
+    de importe admite cualquier cifra, porque recortarla sería comprar dinero
+    que nadie escribió—; al vender el tamaño es lo que se escribe, y ahí el
+    campo directamente no deja bajar del mínimo.
+    """
     async with _pagina() as (_, pagina, _):
         await _abrir(pagina)
+        pagina._side.setCurrentIndex(pagina._side.findData(PredictionSide.SELL))
         pagina._shares.setValue(1)
         assert pagina._shares.value() == float(_MINIMO)
+
+
+async def test_el_importe_se_convierte_en_participaciones_hacia_abajo() -> None:
+    """Comprar se escribe en dinero y el tamaño sale de dividir por el precio.
+
+    Hacia **abajo**: redondear hacia arriba daría participaciones que cuestan
+    más de lo que el importe escrito paga, y el importe es lo que el usuario
+    comprometió. La cifra que se firma —y que el coste enseña— son las
+    participaciones derivadas, no el importe.
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        assert pagina._price.value() == pytest.approx(0.62)
+
+        pagina._amount.setValue(20)
+        # 20 / 0,62 = 32,258… → 32,25. Las 32,25 cuestan 19,995; las 32,26
+        # costarían 20,0012, por encima del importe escrito.
+        assert Decimal(str(pagina._shares.value())) == Decimal("32.25")
+        assert pagina._order_cost.text() == "Pagas 19.9950 USDC"
+        # Y la derivación se enseña: es la respuesta a «¿cuántas me llevo?».
+        # El mínimo no se repite aquí: vive en la línea de reglas del mercado,
+        # que se lee de las dos caras.
+        assert "32.25 participaciones" in pagina._buy_derived.text()
+        assert "mínimo" not in pagina._buy_derived.text()
+
+
+async def test_un_importe_que_no_llega_al_minimo_apaga_y_dice_por_que() -> None:
+    """El campo de importe no se recorta solo: la orden se apaga y se explica.
+
+    Subirle el importe al usuario sería comprar más dinero del que escribió, y
+    las participaciones no se pueden subir sin eso. Así que queda apagada con
+    el motivo escrito, que es lo que se puede arreglar.
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        pagina._amount.setValue(1)
+
+        # 1 $ a 0,62 cruza el libro (hay venta a ese precio), y el recinto
+        # valida esa compra por **importe**: las 1,61 participaciones derivadas
+        # valen 0,9982 $, por debajo del 1 $. El importe se queda tal como se
+        # escribió y el motivo dice la cifra que sí llega: 1,01 $.
+        assert Decimal(str(pagina._shares.value())) == Decimal("1.61")
+        assert Decimal(str(pagina._amount.value())) == Decimal("1")
+        assert pagina._submit_btn.isEnabled() is False
+        assert "mínimo de 1 $ de importe" in pagina._order_note.text()
+        assert "se queda en 0.9982 $" in pagina._order_note.text()
+        assert "sube el importe a 1.01 $" in pagina._order_note.text()
+
+
+async def test_una_compra_que_cruza_ya_no_la_para_el_minimo_de_participaciones() -> None:
+    """La regla del recinto para una compra que cruza es el importe, no el tamaño.
+
+    Medido: el recinto valida la compra que cruza por importe (≥ 1 $) y reserva
+    el mínimo de participaciones para las órdenes que descansan. Con el tamaño
+    aplicado a toda compra, este caso se apagaba aunque el recinto lo acepta:
+    era el de «solo me deja operar 5 $».
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        pagina._amount.setValue(1.01)
+
+        # 1,01 / 0,62 = 1,6290… → 1,62 participaciones, por debajo de las 5 del
+        # mercado, y la orden sigue publicable: cruza y su importe real
+        # —1,62 x 0,62 = 1,0044 $— pasa el 1 $ del recinto.
+        assert Decimal(str(pagina._shares.value())) == Decimal("1.62")
+        assert pagina._submit_btn.isEnabled() is True
+        assert pagina._order_note.text() == ""
+
+
+async def test_una_orden_que_descansa_sigue_el_minimo_de_participaciones() -> None:
+    """El mínimo de 5 participaciones no desapareció: es el de las órdenes que descansan.
+
+    A 0,50 —por debajo del mejor ask, 0,62— la compra no cruza: se queda en el
+    libro esperando contrapartida. Ahí el recinto la valida por tamaño, y 1 $ a
+    0,50 son 2 participaciones: se apaga con el motivo de siempre.
+    """
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        pagina._price.setValue(0.50)
+        pagina._amount.setValue(1)
+
+        assert Decimal(str(pagina._shares.value())) == Decimal("2.00")
+        assert pagina._submit_btn.isEnabled() is False
+        assert "mínimo de 5 participaciones" in pagina._order_note.text()
+
+
+async def test_los_atajos_de_compra_fijan_el_importe() -> None:
+    """Los atajos escriben el campo, no sustituyen la lógica: el tamaño sale de él."""
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        atajos = {b.text(): b for b in pagina._buy_box.findChildren(QPushButton)}
+        assert set(atajos) >= {"$1", "$5", "$20", "$100"}
+
+        atajos["$20"].click()
+        assert Decimal(str(pagina._amount.value())) == Decimal("20")
+        assert Decimal(str(pagina._shares.value())) == Decimal("32.25")
+        # El campo sigue siendo editable: el atajo es un atajo, no una jaula.
+        assert pagina._amount.isReadOnly() is False
+
+
+async def test_los_atajos_de_venta_fijan_las_participaciones() -> None:
+    """Vender se escribe en participaciones, y los atajos son cifras redondas."""
+    async with _pagina() as (_, pagina, _):
+        await _abrir(pagina)
+        pagina._side.setCurrentIndex(pagina._side.findData(PredictionSide.SELL))
+        atajos = {b.text(): b for b in pagina._sell_box.findChildren(QPushButton)}
+        assert set(atajos) >= {"5", "10", "25", "50", "100"}
+
+        atajos["25"].click()
+        assert Decimal(str(pagina._shares.value())) == Decimal("25")
 
 
 # --------------------------------------------------------------------------- #
@@ -571,7 +805,9 @@ async def test_publicar_llama_al_caso_de_uso_con_lo_que_dice_la_pantalla(
         monkeypatch.setattr(container, "place_prediction_order", publicador, raising=True)
 
         await _abrir(pagina)
-        pagina._shares.setValue(12)
+        # Lo que se firma son las participaciones derivadas del importe, no el
+        # importe: 7,44 $ a 0,62 son 12 exactas.
+        pagina._amount.setValue(7.44)
         pagina._price.setValue(0.62)
         pagina._on_submit()
         for _ in range(20):

@@ -25,6 +25,13 @@ cubre. Compite con Uniswap por precio en las ocho que ambos ven.
   que la API de Uniswap manda `"0x00"` para lo mismo. Leerlo con el lector de
   Uniswap habría dado cero por accidente —el `"0"` no empieza por `0x`— y
   callado un `value` distinto de cero. Los dos lectores aceptan las dos formas.
+- **El nativo se nombra con su centinela.** Medido el 2026-10-09: se rechaza
+  solo —la API identifica los tokens por contrato y el nativo no tiene— y con
+  `0xEeee…` cotiza y construye el nativo en las dos direcciones. 1 POL contra
+  pUSD sale en una ruta de **dos saltos por USDC** (dos pools V3), y al vender
+  nativo la transacción lleva el `value` con el importe. La dirección cero, que
+  es la convención de Uniswap, aquí no encuentra ruta: cada API nombra al nativo
+  como quiere. Ver `_api_token`.
 
 ### El build va apagado, y por qué es una decisión y no una limitación
 
@@ -70,6 +77,7 @@ from amigocompora.domain.errors import (
 from amigocompora.domain.models import (
     Measurement,
     Quote,
+    Token,
     TradingPair,
     UnsignedTransaction,
     Venue,
@@ -122,6 +130,13 @@ SWAP_CHAINS: Final = frozenset(ROUTERS)
 #: usuarios en vez de tener una entrada por destinatario. El real se usa al
 #: construir, que es cuando el `taker` entra en el calldata.
 QUOTE_TAKER: Final = "0x1111111111111111111111111111111111111111"
+
+#: Dirección con la que la API nombra la **moneda nativa**. Medido el 2026-10-09:
+#: con ella cotiza y construye el nativo en las dos direcciones; sin ella no hay
+#: nada que preguntar, porque la API identifica los tokens por contrato. La
+#: dirección cero, que es como lo nombra Uniswap, aquí no encuentra ruta: cada
+#: API tiene su convención y este archivo usa la de esta.
+NATIVE_SENTINEL: Final = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 
 #: Tolerancia de deslizamiento que se pide en la cotización. Afecta al
 #: `minBuyAmount` que la API calcula dentro del payload, no a la cifra que se
@@ -241,9 +256,6 @@ class ZeroExEngine:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         if pair.chain not in SWAP_CHAINS:
             return ()
-        if pair.base.address is None or pair.quote.address is None:
-            # La API identifica los tokens por dirección de contrato.
-            return ()
 
         payload = await self._quote_payload(pair, amount_in, taker=QUOTE_TAKER)
         if payload is None:
@@ -310,8 +322,8 @@ class ZeroExEngine:
             QUOTE_URL,
             params={
                 "chainId": str(_chain_id(chain_key)),
-                "sellToken": str(pair.base.address),
-                "buyToken": str(pair.quote.address),
+                "sellToken": _api_token(pair.base),
+                "buyToken": _api_token(pair.quote),
                 "sellAmount": str(amount_in.raw),
                 "taker": taker,
                 "slippageBps": str(SLIPPAGE_BPS),
@@ -489,6 +501,16 @@ def _venue(chain_key: str) -> Venue:
         kind=VenueKind.DEX,
         chain=chain_key,
     )
+
+
+def _api_token(token: Token) -> str:
+    """La dirección con la que la API nombra al token; el nativo tiene la suya.
+
+    El nativo no tiene contrato, y esta API lo nombra con `NATIVE_SENTINEL`.
+    Traducirlo aquí y no en cada llamada deja una sola regla: cotizar y
+    construir hablan el mismo idioma.
+    """
+    return token.address if token.address is not None else NATIVE_SENTINEL
 
 
 def _require_known_router(chain_key: str, returned: Any) -> str:

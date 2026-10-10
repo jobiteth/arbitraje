@@ -28,11 +28,26 @@ una cifra falsa:
    declarar los dos permisos encadenados, y lo tiene que decidir el motor, que es
    quien acaba de leer el `factory()` de ese router.
 
-Las cifras de las cotizaciones están **medidas** contra Base el 2026-10-06 —el
-pool bankr/WETH del tramo del 1 %, su `sqrtPriceX96` y la salida del QuoterV2—
-para que las cuentas hablen del mismo orden de magnitud que la cadena. El lector
-se sustituye por un doble, que es la frontera de red del motor; todo lo demás que
-se ejercita es el código de verdad.
+5. **El camino empaquetado del multi-salto.** El `bytes path` de `exactInput` no
+   es una lista de direcciones como el `path[]` de V2: son los bytes pegados
+   —token de 20 bytes, comisión de 3, token— sin longitud por medio. Una
+   dirección de 19 bytes corre todos los bytes siguientes y el contrato lee una
+   comisión donde hay media dirección: no revierte al codificar, revierte en la
+   cadena después de firmar.
+
+6. **El segundo salto.** Cuando el par no tiene pool directo en ningún tramo, el
+   motor arma una ruta de dos saltos por un token del catálogo y la ejecuta en
+   **una sola transacción**. Lo que se fija aquí es que la ruta publicada sea la
+   que se ejecuta —mismo camino, no una búsqueda nueva que diera más—, que la
+   segunda pata se cotice con lo que de verdad daría la primera y que la comisión
+   de la ruta viaje en unidades de V3 al construir.
+
+Las cifras de las cotizaciones están **medidas**: contra Base el 2026-10-06 —el
+pool bankr/WETH del tramo del 1 %, su `sqrtPriceX96` y la salida del QuoterV2— y
+contra Polygon el 2026-10-09 —1 POL por WPOL→USDC→pUSD, con las salidas de sus
+dos patas— para que las cuentas hablen del mismo orden de magnitud que la
+cadena. El lector se sustituye por un doble, que es la frontera de red del
+motor; todo lo demás que se ejercita es el código de verdad.
 """
 
 from __future__ import annotations
@@ -55,12 +70,14 @@ from amigocompora.domain.errors import (
 from amigocompora.domain.models import (
     Measurement,
     Quote,
+    RouteHop,
+    SwapRoute,
     Token,
     TradingPair,
 )
 from amigocompora.domain.money import EXACT, BasisPoints, TokenAmount
-from amigocompora.engines.catalog import wrapped_native
-from amigocompora.engines.uniswap_math import impact_bps
+from amigocompora.engines.catalog import token_by_symbol, tokens_for, wrapped_native
+from amigocompora.engines.uniswap_math import combine_impact_bps, impact_bps
 from amigocompora.engines.uniswap_v3 import calldata as abi
 from amigocompora.engines.uniswap_v3 import engine as v3
 from amigocompora.engines.uniswap_v3.addresses import (
@@ -262,6 +279,9 @@ def test_cada_firma_produce_el_selector_que_se_buscó_en_la_cadena() -> None:
     """
     assert abi.SELECTOR_EXACT_INPUT_SINGLE_V1 == "0x414bf389"
     assert abi.SELECTOR_EXACT_INPUT_SINGLE_SR02 == "0x04e45aaf"
+    assert abi.SELECTOR_EXACT_INPUT_V1 == "0xc04b8d59"
+    assert abi.SELECTOR_EXACT_INPUT_SR02 == "0xb858183f"
+    assert abi.SELECTOR_QUOTE_EXACT_INPUT == "0xcdca1753"
     assert abi.SELECTOR_MULTICALL == "0xac9650d8"
     assert abi.SELECTOR_UNWRAP_WETH9 == "0x49404b7c"
     assert abi.SELECTOR_REFUND_ETH == "0x12210e8a"
@@ -1043,3 +1063,610 @@ def test_el_manifiesto_declara_que_prepara_transacciones() -> None:
 
     assert Capability.PREPARE_TX in v3.MANIFEST.capabilities
     assert v3.MANIFEST.swap_chains == SWAP_CHAINS
+
+
+# --------------------------------------------------------------------------- #
+# 7. El camino empaquetado del multi-salto
+# --------------------------------------------------------------------------- #
+#: Medido contra Polygon el 2026-10-09: 1 POL por WPOL(500)USDC(100)pUSD.
+WPOL = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+USDC_POLYGON = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+USDCE_POLYGON = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+PUSD = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+POLYGON = DEPLOYMENTS["polygon"]
+
+ENTRADA_POL = 10**18
+PATA_1_MEDIDA = 99_603
+PATA_2_MEDIDA = 99_594
+
+
+def test_el_camino_empaquetado_es_token_comision_token() -> None:
+    """La forma medida: 20 bytes de token, 3 de comisión, 20 del siguiente.
+
+    El valor exacto se afirma y no se describe: es el camino que el QuoterV2 de
+    Polygon aceptó el 2026-10-09 devolviendo 99594 —lo mismo que componen sus
+    dos patas sueltas—, así que cualquier desalineación de un byte aquí produce
+    un camino que el contrato lee como otra cosa.
+    """
+    camino = abi.packed_path([WPOL, USDC_POLYGON, PUSD], [500, 100])
+    assert camino == "0x" + WPOL[2:] + "0001f4" + USDC_POLYGON[2:] + "000064" + PUSD[2:]
+    assert len(camino) == 2 + 2 * 66  # los 66 bytes medidos
+
+
+def test_un_camino_que_no_encadena_no_se_codifica() -> None:
+    """De `n` comisiones salen `n + 1` tokens; cualquier otra cuenta no es un camino."""
+    with pytest.raises(SourceResponseError, match="no encadena"):
+        abi.packed_path([WPOL, USDC_POLYGON, PUSD], [500])
+
+
+def test_un_tramo_que_no_cabe_en_tres_bytes_no_es_un_camino() -> None:
+    """La comisión ocupa 3 bytes exactos: ni un tramo mayor ni el cero."""
+    with pytest.raises(SourceResponseError, match="3 bytes"):
+        abi.packed_path([WPOL, USDC_POLYGON], [1 << 24])
+    with pytest.raises(SourceResponseError, match="3 bytes"):
+        abi.packed_path([WPOL, USDC_POLYGON], [0])
+
+
+def test_una_direccion_corta_corre_el_camino_entero() -> None:
+    """19 bytes de dirección leen media dirección como comisión, sin revertir al codificar."""
+    with pytest.raises(SourceResponseError, match="20 bytes"):
+        abi.packed_path([WPOL[:-1], USDC_POLYGON], [500])
+    with pytest.raises(SourceResponseError, match="hexadecimal"):
+        abi.packed_path(["0x" + "z" * 40, USDC_POLYGON], [500])
+
+
+def test_el_exactinput_v1_lleva_deadline_y_el_del_02_no() -> None:
+    """Diez palabras tras el selector en el V1, nueve en el 02 — y en otro orden.
+
+    El struct del multi-salto tiene un campo más en el V1 (`deadline`), así que
+    usar el ABI de uno en el router del otro es llamar a otra función. Y la
+    longitud del camino va en **bytes** (66), no en caracteres: el contrato lee
+    esa palabra como contador de bytes.
+    """
+    camino = abi.packed_path([WPOL, USDC_POLYGON, PUSD], [500, 100])
+    comun: dict[str, Any] = {
+        "path": camino,
+        "recipient": DESTINATARIO,
+        "amount_in_raw": 1_000,
+        "amount_out_min_raw": 900,
+    }
+    v1 = abi.exact_input(**comun, deadline=1_800_000_000)
+    sr02 = abi.exact_input(**comun)
+
+    assert v1.startswith(abi.SELECTOR_EXACT_INPUT_V1)
+    assert sr02.startswith(abi.SELECTOR_EXACT_INPUT_SR02)
+    assert len(v1) == len(abi.SELECTOR_EXACT_INPUT_V1) + 10 * 64
+    assert len(sr02) == len(abi.SELECTOR_EXACT_INPUT_SR02) + 9 * 64
+
+    cuerpo = v1[len(abi.SELECTOR_EXACT_INPUT_V1) :]
+    delgado = sr02[len(abi.SELECTOR_EXACT_INPUT_SR02) :]
+    assert cuerpo[0:64] == _palabra_uint(32)  # desplazamiento al struct
+    assert cuerpo[64:128] == _palabra_uint(0xA0)  # y al `bytes` dentro del struct
+    assert delgado[64:128] == _palabra_uint(0x80)
+    assert cuerpo[128:192] == _palabra_addr(DESTINATARIO)
+    # La caducidad va entre el destinatario y el importe, y sólo en el V1: lo
+    # que el 02 tiene en esa palabra es ya el importe de entrada.
+    assert cuerpo[192:256] == _palabra_uint(1_800_000_000)
+    assert delgado[192:256] == _palabra_uint(1_000)
+    assert cuerpo[256:320] == _palabra_uint(1_000)
+    assert cuerpo[320:384] == _palabra_uint(900)
+    assert cuerpo[384:448] == _palabra_uint(66)
+    assert cuerpo[448 : 448 + 132] == camino[2:]
+    # Los 60 caracteres que sobran son el relleno del bloque de 32 bytes.
+    assert cuerpo[448 + 132 :] == "0" * 60
+
+
+def test_quote_exact_input_lleva_el_camino_y_el_importe() -> None:
+    """El quoter del multi-salto cotiza el camino entero, no un pool."""
+    camino = abi.packed_path([WPOL, USDC_POLYGON, PUSD], [500, 100])
+    crudo = abi.quote_exact_input(camino, 1_000)
+    assert crudo.startswith(abi.SELECTOR_QUOTE_EXACT_INPUT)
+    cuerpo = crudo[len(abi.SELECTOR_QUOTE_EXACT_INPUT) :]
+    assert cuerpo[0:64] == _palabra_uint(64)
+    assert cuerpo[64:128] == _palabra_uint(1_000)
+    assert cuerpo[128:192] == _palabra_uint(66)
+    assert cuerpo[192 : 192 + 132] == camino[2:]
+
+
+def test_un_camino_mal_formado_no_llega_al_quoter() -> None:
+    """La forma se valida en los dos sitios que consumen el camino.
+
+    Un camino puede llegar construido de fuera —una ruta publicada, una celda de
+    caché—, así que no basta con validarlo dentro de `packed_path`.
+    """
+    for malo in ("0x1234", "0x" + "ab" * 44, "0x" + "ab" * 45):
+        with pytest.raises(SourceResponseError, match=r"20 \+ 23"):
+            abi.quote_exact_input(malo, 1)
+        with pytest.raises(SourceResponseError, match=r"20 \+ 23"):
+            abi.exact_input(
+                path=malo,
+                recipient=DESTINATARIO,
+                amount_in_raw=1,
+                amount_out_min_raw=1,
+                deadline=1,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# 8. Cotizar la ruta de dos saltos
+# --------------------------------------------------------------------------- #
+def _palabra_de(data: str, selector: str, index: int) -> str:
+    """La palabra `index` del cuerpo de ese calldata."""
+    inicio = len(selector) + index * 64
+    return data[inicio : inicio + 64]
+
+
+def _direccion_de(data: str, selector: str, index: int) -> str:
+    return "0x" + _palabra_de(data, selector, index)[24:]
+
+
+def _clave_pool(a: str, b: str, fee: int) -> tuple[str, str, int]:
+    """La clave de un pool: la pareja **ordenada** y el tramo.
+
+    La fábrica ordena por dirección antes de calcular la dirección del pool, así
+    que `(A, B)` y `(B, A)` dan el mismo contrato y el doble no puede distinguir
+    el orden con el que se preguntó.
+    """
+    first, second = sorted((a.lower(), b.lower()))
+    return first, second, fee
+
+
+class _EscenarioRuta(_Lector):
+    """Un par sin pool directo y una ruta de dos saltos por un hub.
+
+    Despacha por el camino pedido: los pools por pareja de direcciones en
+    cualquier orden, y las cotizaciones por la terna **direccional**
+    `(entra, sale, tramo, importe)`. El importe va dentro de la clave a
+    propósito: la segunda pata se cotiza con lo que de verdad dio la primera, y
+    una tabla que lo ignorara devolvería la misma salida a cualquier entrada,
+    que es justo el error que la prueba no debe dejar pasar.
+    """
+
+    def __init__(
+        self,
+        *,
+        pools: dict[tuple[str, str, int], str],
+        salidas: dict[tuple[str, str, int, int], int],
+        caminos: dict[tuple[str, int], int],
+        sqrt: dict[str, int],
+        token0: dict[str, str],
+        camino_revierte: bool = False,
+    ) -> None:
+        super().__init__()
+        self.pools = pools
+        self.salidas = salidas
+        self.caminos = caminos
+        self.sqrt = sqrt
+        self.token0 = token0
+        self.camino_revierte = camino_revierte
+
+    def _por_defecto(self, to: str, data: str) -> object:
+        if data.startswith(abi.SELECTOR_GET_POOL):
+            pool = self.pools.get(
+                _clave_pool(
+                    _direccion_de(data, abi.SELECTOR_GET_POOL, 0),
+                    _direccion_de(data, abi.SELECTOR_GET_POOL, 1),
+                    int(_palabra_de(data, abi.SELECTOR_GET_POOL, 2), 16),
+                )
+            )
+            return _cero() if pool is None else "0x" + _palabra_addr(pool)
+        if data.startswith(abi.SELECTOR_QUOTE_EXACT_INPUT_SINGLE):
+            selector = abi.SELECTOR_QUOTE_EXACT_INPUT_SINGLE
+            salida = self.salidas.get(
+                (
+                    _direccion_de(data, selector, 0),
+                    _direccion_de(data, selector, 1),
+                    int(_palabra_de(data, selector, 3), 16),
+                    int(_palabra_de(data, selector, 2), 16),
+                )
+            )
+            if salida is None:
+                # Ese tramo no puede dar salida a este tamaño: una respuesta del
+                # mercado, no una caída.
+                raise SourceResponseError("execution reverted")
+            return "0x" + _palabra_uint(salida)
+        if data.startswith(abi.SELECTOR_QUOTE_EXACT_INPUT):
+            if self.camino_revierte:
+                raise SourceResponseError("execution reverted")
+            inicio = len(abi.SELECTOR_QUOTE_EXACT_INPUT)
+            cantidad = int(data[inicio + 64 : inicio + 128], 16)
+            largo = int(data[inicio + 128 : inicio + 192], 16)
+            camino = "0x" + data[inicio + 192 : inicio + 192 + largo * 2]
+            salida = self.caminos.get((camino, cantidad))
+            if salida is None:
+                # Construir con otro camino que el publicado es el fallo que
+                # esta prueba existe para ver: que se vea con el camino entero.
+                raise AssertionError(f"se cotizó un camino que no es el publicado: {camino}")
+            return "0x" + _palabra_uint(salida)
+        if data == abi.SELECTOR_TOKEN0:
+            return "0x" + _palabra_addr(self.token0[to.lower()])
+        if data == abi.SELECTOR_SLOT0:
+            return _slot0(self.sqrt[to.lower()])
+        return None
+
+
+def _sin_datos() -> _EscenarioRuta:
+    """Un lector que no contesta nada: para construir sin volver a cotizar."""
+    return _EscenarioRuta(pools={}, salidas={}, caminos={}, sqrt={}, token0={})
+
+
+def _sqrt_de(precio: Decimal) -> int:
+    """`sqrtPriceX96` de un precio marginal, para no escribir el entero a mano."""
+    return int(EXACT.multiply(precio.sqrt(), Decimal(1 << 96)))
+
+
+def _pusd() -> Token:
+    token = token_by_symbol("pUSD", "polygon")
+    assert token is not None
+    return token
+
+
+def _par_pol_a_pusd() -> TradingPair:
+    return TradingPair(base=_nativo("polygon"), quote=_pusd())
+
+
+#: Los pools del escenario medido: WPOL/USDC en dos tramos, WPOL/USDC.e y USDC/pUSD.
+P1 = "0x" + "1" * 40
+P2 = "0x" + "2" * 40
+P3 = "0x" + "3" * 40
+P4 = "0x" + "4" * 40
+
+#: La vuelta: pUSD → USDC → WPOL, con las cifras coherentes con la ida.
+REVERSA_ENTRADA = 99_594
+REVERSA_PATA_1 = 99_600
+REVERSA_PATA_2 = 995_000_000_000_000_000
+
+CAMINO_IDA = abi.packed_path([WPOL, USDC_POLYGON, PUSD], [500, 100])
+CAMINO_VUELTA = abi.packed_path([PUSD, USDC_POLYGON, WPOL], [100, 500])
+
+
+def _escenario_pol_a_pusd() -> _EscenarioRuta:
+    """El caso medido: 1 POL no tiene pool directo con pUSD en ningún tramo.
+
+    El hub USDC.e cotiza la primera pata pero no tiene segunda —es lo que se
+    midió: `quoteExactInputSingle` de USDC.e→pUSD revierte—, así que su ruta no
+    llega entera y compite sólo la del USDC. Las direcciones de la vuelta van en
+    los mismos diccionarios para poder construir también pUSD → POL.
+    """
+    return _EscenarioRuta(
+        pools={
+            _clave_pool(WPOL, USDC_POLYGON, 500): P1,
+            _clave_pool(WPOL, USDC_POLYGON, 3_000): P4,
+            _clave_pool(WPOL, USDCE_POLYGON, 500): P3,
+            _clave_pool(USDC_POLYGON, PUSD, 100): P2,
+        },
+        salidas={
+            (WPOL, USDC_POLYGON, 500, ENTRADA_POL): PATA_1_MEDIDA,
+            (WPOL, USDC_POLYGON, 3_000, ENTRADA_POL): 99_500,  # peor: no se elige
+            (WPOL, USDCE_POLYGON, 500, ENTRADA_POL): 99_608,  # sin segunda pata
+            (USDC_POLYGON, PUSD, 100, PATA_1_MEDIDA): PATA_2_MEDIDA,
+            (PUSD, USDC_POLYGON, 100, REVERSA_ENTRADA): REVERSA_PATA_1,
+            (USDC_POLYGON, WPOL, 500, REVERSA_PATA_1): REVERSA_PATA_2,
+        },
+        caminos={
+            (CAMINO_IDA, ENTRADA_POL): PATA_2_MEDIDA,
+            (CAMINO_VUELTA, REVERSA_ENTRADA): REVERSA_PATA_2,
+        },
+        # El marginal de WPOL/USDC sale del precio medido y el de USDC/pUSD, de
+        # la paridad con la pegged: los dos lados de la ruta existen de verdad.
+        sqrt={P1: _sqrt_de(Decimal("9.97e-14")), P2: _sqrt_de(Decimal("1.001"))},
+        token0={P1: WPOL, P2: USDC_POLYGON},
+    )
+
+
+def test_las_direcciones_del_escenario_son_las_del_catalogo() -> None:
+    """Si el catálogo cambia una dirección, el escenario tiene que cambiar con él."""
+    assert _dir(_weth("polygon")) == WPOL
+    usdc = token_by_symbol("USDC", "polygon")
+    assert usdc is not None
+    assert (usdc.address or "").lower() == USDC_POLYGON
+    assert (_pusd().address or "").lower() == PUSD
+    assert USDCE_POLYGON in {
+        (token.address or "").lower() for token in tokens_for("polygon")
+    }
+
+
+async def test_si_el_par_directo_cotiza_no_se_buscan_rutas() -> None:
+    """La ruta no compite con el pool directo: sólo entra cuando no hay ninguno."""
+    lector = _Escenario()
+    motor = _motor(lector)
+    cotizaciones = await motor.quote(_par(), _par().base.amount("0.0005"))
+
+    assert len(cotizaciones) == 1
+    assert cotizaciones[0].route is None
+    # Cuatro `getPool`, los del par directo: ninguna pareja de hub se preguntó.
+    assert len(lector.calls_to(BASE.factory)) == 4
+
+
+async def test_una_ruta_de_dos_saltos_cotiza_el_camino_entero() -> None:
+    """El par sin pool directo cae a la ruta por hub, y la publica dentro."""
+    lector = _escenario_pol_a_pusd()
+    motor = _motor(lector)
+    par = _par_pol_a_pusd()
+    cotizaciones = await motor.quote(par, par.base.amount("1"))
+
+    assert len(cotizaciones) == 1
+    cotizacion = cotizaciones[0]
+    assert cotizacion.venue.venue_id == "uniswap-v3@5+1"
+    assert cotizacion.venue.name == "Uniswap V3 0.05 % + 0.01 %"
+    assert cotizacion.fee_bps == BasisPoints(6)
+    assert cotizacion.fee_basis is Measurement.DERIVED
+    assert cotizacion.impact_basis is Measurement.DERIVED
+    assert cotizacion.liquidity is None
+    assert cotizacion.amount_out.raw == PATA_2_MEDIDA
+    assert cotizacion.amount_out.symbol == "pUSD"
+
+    # El camino publicado nombra los tokens **del pool**: el lado nativo del par
+    # es su envoltorio, que es el que de verdad cruza el pool.
+    assert cotizacion.route is not None
+    assert [token.symbol for token in cotizacion.route.tokens] == ["WPOL", "USDC", "pUSD"]
+    assert [hop.fee_bps for hop in cotizacion.route.hops] == [
+        BasisPoints(5),
+        BasisPoints(1),
+    ]
+    assert cotizacion.route.total_fee_bps == BasisPoints(6)
+
+    # El impacto es la composición de los dos tramos, calculada con los datos
+    # que el doble dio a cada pata —incluida la segunda, cotizada con lo que
+    # dio la primera— y no una suma ni el impacto de un solo pool.
+    primera = impact_bps(
+        amount_in_raw=ENTRADA_POL,
+        amount_out_raw=PATA_1_MEDIDA,
+        sqrt_price_x96=lector.sqrt[P1],
+        token_in_is_token0=True,
+        fee=BasisPoints(5),
+    )
+    segunda = impact_bps(
+        amount_in_raw=PATA_1_MEDIDA,
+        amount_out_raw=PATA_2_MEDIDA,
+        sqrt_price_x96=lector.sqrt[P2],
+        token_in_is_token0=True,
+        fee=BasisPoints(1),
+    )
+    assert primera is not None
+    assert segunda is not None
+    assert cotizacion.price_impact_bps == combine_impact_bps([primera, segunda])
+    assert 0 < cotizacion.price_impact_bps.value < 100
+
+    assert "dos saltos" in cotizacion.source_note
+    assert "USDC" in cotizacion.source_note
+
+
+async def test_la_ruta_se_ejecuta_en_un_solo_swap_con_el_camino_publicado() -> None:
+    """Construir vuelve a cotizar **ese** camino, no busca otro que diera más.
+
+    El doble sólo contesta a la ruta exacta que el motor publicó: si al
+    construir se buscara de nuevo, o se cambiara un tramo, la lectura no
+    casaría y la prueba lo vería.
+    """
+    lector = _escenario_pol_a_pusd()
+    motor = _motor(lector)
+    par = _par_pol_a_pusd()
+    cotizacion = (await motor.quote(par, par.base.amount("1")))[0]
+    payload = await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+    assert payload.calldata.startswith(abi.SELECTOR_MULTICALL)
+    assert abi.SELECTOR_REFUND_ETH[2:] in payload.calldata
+    indice = payload.calldata.index(abi.SELECTOR_EXACT_INPUT_V1[2:])
+    cuerpo = payload.calldata[indice + 8 :]
+    assert cuerpo[64:128] == _palabra_uint(0xA0)  # el struct del V1, con caducidad
+    assert cuerpo[128:192] == _palabra_addr(DESTINATARIO)
+    assert cuerpo[192:256] == _palabra_uint(int(AHORA.timestamp()) + v3.DEADLINE_SECONDS)
+    assert cuerpo[256:320] == _palabra_uint(ENTRADA_POL)
+    # El mínimo sale de la cotización **fresca** del camino y se redondea abajo.
+    assert cuerpo[320:384] == _palabra_uint(int(Decimal(PATA_2_MEDIDA) * Decimal("0.995")))
+    assert cuerpo[384:448] == _palabra_uint(66)
+    assert cuerpo[448 : 448 + 132] == CAMINO_IDA[2:]
+
+    assert payload.to_address == POLYGON.router
+    assert payload.value.raw == ENTRADA_POL
+    assert payload.approval is None  # se paga con el nativo: no hay token que autorizar
+
+
+async def test_vender_por_el_nativo_en_una_ruta_desenvuelve_en_la_misma_transaccion() -> None:
+    """La vuelta: pUSD → USDC → WPOL, con el envoltorio retirado al final.
+
+    El destinatario del swap es el router —el envoltorio se le queda a él— y el
+    del `unwrapWETH9` es el usuario: con el usuario en los dos, el nativo no
+    saldría nunca del router.
+    """
+    lector = _escenario_pol_a_pusd()
+    motor = _motor(lector)
+    pusd = _pusd()
+    par = TradingPair(base=pusd, quote=_nativo("polygon"))
+    cotizacion = (await motor.quote(par, pusd.amount("0.099594")))[0]
+
+    assert cotizacion.venue.venue_id == "uniswap-v3@1+5"
+    assert cotizacion.amount_out.raw == REVERSA_PATA_2
+    payload = await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+    assert payload.calldata.startswith(abi.SELECTOR_MULTICALL)
+    assert abi.SELECTOR_UNWRAP_WETH9[2:] in payload.calldata
+    indice = payload.calldata.index(abi.SELECTOR_EXACT_INPUT_V1[2:])
+    cuerpo = payload.calldata[indice + 8 :]
+    assert cuerpo[128:192] == _palabra_addr(POLYGON.router)
+    assert cuerpo[448 : 448 + 132] == CAMINO_VUELTA[2:]
+    assert payload.value.raw == 0
+    assert payload.approval is not None
+    assert payload.approval.spender == POLYGON.router
+    assert payload.approval.via is None
+
+
+async def test_la_descripcion_de_una_ruta_dice_por_donde_pasa() -> None:
+    """Lo que el usuario tiene que leer antes de firmar: el camino y los tramos."""
+    motor = _motor(_escenario_pol_a_pusd())
+    par = _par_pol_a_pusd()
+    cotizacion = (await motor.quote(par, par.base.amount("1")))[0]
+    payload = await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+    texto = payload.description
+    assert "un solo swap" in texto
+    assert "dos tramos" in texto
+    assert "0.05 % y 0.01 %" in texto
+    assert "WPOL → USDC → pUSD" in texto
+
+
+async def test_si_el_camino_se_movio_mas_de_lo_tolerado_no_se_construye() -> None:
+    """La deriva se mide contra la cotización fresca del mismo camino."""
+    lector = _escenario_pol_a_pusd()
+    motor = _motor(lector)
+    par = _par_pol_a_pusd()
+    cotizacion = (await motor.quote(par, par.base.amount("1")))[0]
+    lector.caminos[(CAMINO_IDA, ENTRADA_POL)] = int(PATA_2_MEDIDA * 1.05)
+
+    with pytest.raises(QuoteMovedError):
+        await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+
+async def test_si_el_camino_ya_no_cotiza_se_dice_por_donde_iba() -> None:
+    """La liquidez se agota entre la tabla y el botón, también en una ruta."""
+    lector = _escenario_pol_a_pusd()
+    lector.camino_revierte = True
+    motor = _motor(lector)
+    par = _par_pol_a_pusd()
+    cotizacion = (await motor.quote(par, par.base.amount("1")))[0]
+
+    with pytest.raises(NoQuotesError, match="WPOL → USDC → pUSD"):
+        await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+
+async def test_una_ruta_que_no_corresponde_al_par_no_se_construye() -> None:
+    """Un camino que no empiece o no termine donde el par ejecutaría otro swap."""
+    motor = _motor(_sin_datos())
+    par = _par_pol_a_pusd()
+    wpol = Token(chain="polygon", address=WPOL, symbol="WPOL", decimals=18)
+    usdc = Token(chain="polygon", address=USDC_POLYGON, symbol="USDC", decimals=6)
+    usdce = Token(chain="polygon", address=USDCE_POLYGON, symbol="USDC.e", decimals=6)
+    ajena = SwapRoute(
+        hops=(
+            RouteHop(base=wpol, quote=usdc, fee_bps=BasisPoints(5)),
+            RouteHop(base=usdc, quote=usdce, fee_bps=BasisPoints(1)),
+        )
+    )
+    cotizacion = Quote(
+        venue=v3._route_venue("polygon", (500, 100)),
+        engine_id="uniswap_v3",
+        pair=par,
+        amount_in=par.base.amount("1"),
+        amount_out=TokenAmount(PATA_2_MEDIDA, 6, "pUSD"),
+        fee_bps=BasisPoints(6),
+        fee_basis=Measurement.DERIVED,
+        price_impact_bps=BasisPoints(5),
+        impact_basis=Measurement.DERIVED,
+        observed_at=AHORA,
+        route=ajena,
+    )
+    with pytest.raises(UnsupportedOperationError, match="no corresponde al par"):
+        await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+
+# --------------------------------------------------------------------------- #
+# 9. El camino hacia el router, y la ruta en otra red
+# --------------------------------------------------------------------------- #
+def test_el_camino_de_la_ruta_va_en_unidades_de_v3() -> None:
+    """De la ruta publicada al camino se multiplica por cien, como en el venue.
+
+    `fee_bps` son puntos básicos —5 es el 0,05 %— pero el camino empaquetado
+    quiere centésimas de punto básico, donde ese pool es 500. Sin la conversión
+    el camino apuntaría al pool del 0,0005 %, que en la mayoría de los pares ni
+    existe, y no chirriaría hasta ejecutar.
+    """
+    wpol = Token(chain="polygon", address=WPOL, symbol="WPOL", decimals=18)
+    usdc = Token(chain="polygon", address=USDC_POLYGON, symbol="USDC", decimals=6)
+    ruta = SwapRoute(
+        hops=(
+            RouteHop(base=wpol, quote=usdc, fee_bps=BasisPoints(5)),
+            RouteHop(base=usdc, quote=_pusd(), fee_bps=BasisPoints(1)),
+        )
+    )
+    motor = _motor(_sin_datos())
+    fees, camino = motor._route_path(ruta, token_in=WPOL, token_out=PUSD)
+
+    assert fees == (500, 100)
+    assert camino == CAMINO_IDA
+
+
+def test_una_ruta_sin_comisiones_no_se_puede_construir() -> None:
+    """Sin la comisión de cada tramo no hay camino: se dice, no se inventa un 0."""
+    wpol = Token(chain="polygon", address=WPOL, symbol="WPOL", decimals=18)
+    usdc = Token(chain="polygon", address=USDC_POLYGON, symbol="USDC", decimals=6)
+    ruta = SwapRoute(
+        hops=(
+            RouteHop(base=wpol, quote=usdc),
+            RouteHop(base=usdc, quote=_pusd()),
+        )
+    )
+    motor = _motor(_sin_datos())
+    with pytest.raises(UnsupportedOperationError, match="comisión"):
+        motor._route_path(ruta, token_in=WPOL, token_out=PUSD)
+
+
+def test_el_venue_de_una_ruta_lleva_los_dos_tramos_dentro() -> None:
+    """Dos rutas del mismo par por hubs distintos son sitios distintos, no una fila."""
+    venue = v3._route_venue("polygon", (500, 100))
+    assert venue.venue_id == "uniswap-v3@5+1"
+    assert venue.name == "Uniswap V3 0.05 % + 0.01 %"
+
+
+#: La vuelta medida: bankr → WETH → USDC, con el 1 % del pool bankr/WETH.
+ENTRADA_BANKR = SALIDA_RAW
+PATA_B_WETH = 500_000_000_000_000
+PATA_B_USDC = 1_900_000
+Q1 = "0x" + "5" * 40
+Q2 = "0x" + "6" * 40
+WETH_BASE = "0x4200000000000000000000000000000000000006"
+USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+CAMINO_BASE = abi.packed_path([BANKR, WETH_BASE, USDC_BASE], [10_000, 500])
+
+
+async def test_en_una_red_sin_swaprouter_v1_la_ruta_usa_el_abi_del_02() -> None:
+    """En Base el permiso es encadenado y el struct no lleva caducidad, también en ruta.
+
+    Es la prueba de que el multi-salto no tiene su propia tabla de routers: el
+    ABI sale de la misma tabla medida que usa el swap de un solo pool.
+    """
+    lector = _EscenarioRuta(
+        pools={
+            _clave_pool(BANKR, WETH_BASE, 10_000): Q1,
+            _clave_pool(WETH_BASE, USDC_BASE, 500): Q2,
+        },
+        salidas={
+            (BANKR, WETH_BASE, 10_000, ENTRADA_BANKR): PATA_B_WETH,
+            (WETH_BASE, USDC_BASE, 500, PATA_B_WETH): PATA_B_USDC,
+        },
+        caminos={(CAMINO_BASE, ENTRADA_BANKR): PATA_B_USDC},
+        sqrt={
+            Q1: SQRT_PRICE_X96,
+            Q2: _sqrt_de(Decimal(PATA_B_USDC) / Decimal(PATA_B_WETH)),
+        },
+        token0={Q1: BANKR, Q2: WETH_BASE},
+    )
+    motor = _motor(lector)
+    usdc = token_by_symbol("USDC", "base")
+    assert usdc is not None
+    par = TradingPair(base=_bankr(), quote=usdc)
+    cotizacion = (await motor.quote(par, TokenAmount(ENTRADA_BANKR, 18, "bankr")))[0]
+
+    assert cotizacion.venue.venue_id == "uniswap-v3@100+5"
+    assert cotizacion.fee_bps == BasisPoints(105)
+    assert cotizacion.amount_out.raw == PATA_B_USDC
+    assert cotizacion.route is not None
+    assert [token.symbol for token in cotizacion.route.tokens] == ["bankr", "WETH", "USDC"]
+
+    payload = await motor.plan_swap(cotizacion, recipient=DESTINATARIO)
+
+    # Token contra token: la llamada sola, sin `multicall` de envoltorio.
+    assert payload.calldata.startswith(abi.SELECTOR_EXACT_INPUT_SR02)
+    cuerpo = payload.calldata[len(abi.SELECTOR_EXACT_INPUT_SR02) :]
+    assert cuerpo[64:128] == _palabra_uint(0x80)
+    assert cuerpo[128:192] == _palabra_addr(DESTINATARIO)
+    # Sin caducidad en el struct: la palabra que sigue al destinatario es ya el
+    # importe de entrada —con el ABI del V1 aquí habría una deadline—.
+    assert cuerpo[192:256] == _palabra_uint(ENTRADA_BANKR)
+    assert cuerpo[320:384] == _palabra_uint(len(CAMINO_BASE[2:]) // 2)
+    assert cuerpo[384 : 384 + len(CAMINO_BASE[2:])] == CAMINO_BASE[2:]
+
+    assert payload.approval is not None
+    assert payload.approval.spender == BASE.router
+    assert payload.approval.via == BASE.permit2
+    assert payload.approval.is_chained

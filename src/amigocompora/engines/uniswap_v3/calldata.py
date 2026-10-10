@@ -32,6 +32,20 @@ barato para fallar esto.
 específicos de los contratos de V3 —`getPool`, `quoteExactInputSingle`, `slot0`—
 así que se quedan con el motor que los usa. Leer no mueve dinero y no necesita
 estar en el camino que firma.
+
+### La misma historia en el multi-salto, y un camino que no es una lista
+
+El swap de varios pools repite la división: `exactInput` del V1 lleva `deadline`
+(`0xc04b8d59`) y el del SwapRouter02 no (`0xb858183f`), y el QuoterV2 cotiza el
+camino entero con `quoteExactInput(bytes,uint256)` (`0xcdca1753`). Los tres
+selectores se midieron el 2026-10-09 buscándolos en el bytecode desplegado: los
+del V1 y el QuoterV2 en Polygon, los del SwapRouter02 y su quoter en Base y BSC.
+
+Y el `bytes path` no es una lista de direcciones como el `path[]` de V2: es el
+camino **empaquetado** —token de 20 bytes, comisión del tramo en 3 bytes, token
+siguiente— sin longitud por medio. `packed_path` lo construye y valida su forma:
+un camino con los bytes desalineados no revierte al codificarlo, revierte en la
+cadena, después de firmar.
 """
 
 from __future__ import annotations
@@ -52,6 +66,12 @@ EXACT_INPUT_SINGLE_SR02: Final = (
     "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))"
 )
 
+#: `exactInput` del SwapRouter V1: el struct del multi-salto **con** `deadline`.
+EXACT_INPUT_V1: Final = "exactInput((bytes,address,uint256,uint256,uint256))"
+
+#: `exactInput` del SwapRouter02: el mismo struct **sin** `deadline`.
+EXACT_INPUT_SR02: Final = "exactInput((bytes,address,uint256,uint256))"
+
 MULTICALL: Final = "multicall(bytes[])"
 UNWRAP_WETH9: Final = "unwrapWETH9(uint256,address)"
 REFUND_ETH: Final = "refundETH()"
@@ -61,9 +81,12 @@ TOKEN0: Final = "token0()"
 QUOTE_EXACT_INPUT_SINGLE: Final = (
     "quoteExactInputSingle((address,address,uint256,uint24,uint160))"
 )
+QUOTE_EXACT_INPUT: Final = "quoteExactInput(bytes,uint256)"
 
 SELECTOR_EXACT_INPUT_SINGLE_V1: Final = selector(EXACT_INPUT_SINGLE_V1)
 SELECTOR_EXACT_INPUT_SINGLE_SR02: Final = selector(EXACT_INPUT_SINGLE_SR02)
+SELECTOR_EXACT_INPUT_V1: Final = selector(EXACT_INPUT_V1)
+SELECTOR_EXACT_INPUT_SR02: Final = selector(EXACT_INPUT_SR02)
 SELECTOR_MULTICALL: Final = selector(MULTICALL)
 SELECTOR_UNWRAP_WETH9: Final = selector(UNWRAP_WETH9)
 SELECTOR_REFUND_ETH: Final = selector(REFUND_ETH)
@@ -71,6 +94,7 @@ SELECTOR_GET_POOL: Final = selector(GET_POOL)
 SELECTOR_SLOT0: Final = selector(SLOT0)
 SELECTOR_TOKEN0: Final = selector(TOKEN0)
 SELECTOR_QUOTE_EXACT_INPUT_SINGLE: Final = selector(QUOTE_EXACT_INPUT_SINGLE)
+SELECTOR_QUOTE_EXACT_INPUT: Final = selector(QUOTE_EXACT_INPUT)
 
 #: Lo que se **midió**: cada selector buscado literalmente dentro del bytecode
 #: desplegado, que es donde el dispatcher de Solidity lo lleva. Un contrato que
@@ -79,15 +103,29 @@ SELECTOR_QUOTE_EXACT_INPUT_SINGLE: Final = selector(QUOTE_EXACT_INPUT_SINGLE)
 #: Las direcciones con las que se midió están en `addresses.DEPLOYMENTS`: el
 #: SwapRouter V1 en Ethereum, Optimism, Arbitrum y Polygon, y el SwapRouter02 en
 #: las seis redes. Medido el 2026-10-06.
+#:
+#: Los del multi-salto se midieron el 2026-10-09 con la misma técnica y además
+#: **en funcionamiento**: `quoteExactInput` con el camino empaquetado
+#: WPOL→USDC→pUSD devolvió en Polygon exactamente lo que componen sus dos patas
+#: sueltas (99594 unidades de 6 decimales por 1 POL), que es lo que demuestra
+#: que el camino empaquetado que se codifica es el que el contrato espera. Y el
+#: `exactInput` codificado se llamó contra el router V1 desplegado: revierte en
+#: el `transferFrom` del token (`STF`), o sea que el contrato decodificó el
+#: struct entero y sólo echó en falta los fondos; con el desplazamiento interno
+#: de `bytes` corrompido el revert es otro —`slice_outOfBounds`—, que es la
+#: prueba de que la forma codificada es la que se decodifica.
 _MEASURED: Final[Mapping[str, str]] = {
     EXACT_INPUT_SINGLE_V1: "0x414bf389",
     EXACT_INPUT_SINGLE_SR02: "0x04e45aaf",
+    EXACT_INPUT_V1: "0xc04b8d59",
+    EXACT_INPUT_SR02: "0xb858183f",
     MULTICALL: "0xac9650d8",
     UNWRAP_WETH9: "0x49404b7c",
     REFUND_ETH: "0x12210e8a",
     GET_POOL: "0x1698ee82",
     TOKEN0: "0x0dfe1681",
     QUOTE_EXACT_INPUT_SINGLE: "0xc6a5026a",
+    QUOTE_EXACT_INPUT: "0xcdca1753",
 }
 
 
@@ -144,6 +182,78 @@ def exact_input_single(
     if deadline is None:
         return SELECTOR_EXACT_INPUT_SINGLE_SR02 + head + tail
     return SELECTOR_EXACT_INPUT_SINGLE_V1 + head + word_uint(deadline) + tail
+
+
+def packed_path(tokens: Sequence[str], fees: Sequence[int]) -> str:
+    """El camino empaquetado del multi-salto: `token(20) ‖ comisión(3) ‖ …`.
+
+    No es una lista de direcciones como el `path[]` de V2: son los bytes
+    pegados, sin longitud por medio. De `n` comisiones salen `n + 1` tokens, y
+    la forma —20 bytes de token y 23 por tramo— se valida aquí y no se supone:
+    un camino con los bytes desalineados no falla al codificarlo, falla en la
+    cadena después de firmar.
+
+    La comisión va en **centésimas de punto básico** (el tramo `3000` es el
+    0,30 %), que es la unidad en la que la fábrica construyó el pool: es la
+    misma regla que en el resto del módulo, y el sitio donde equivocarla
+    construiría el camino contra otro pool sin que nada chirriara.
+    """
+    if len(tokens) != len(fees) + 1:
+        raise SourceResponseError(
+            f"un camino de {len(tokens)} tokens lleva {len(tokens) - 1} comisiones "
+            f"y llegaron {len(fees)}: el camino no encadena"
+        )
+    parts: list[str] = []
+    for index, token in enumerate(tokens):
+        parts.append(_address_body(token))
+        if index < len(fees):
+            fee = fees[index]
+            if not 0 < fee < 1 << 24:
+                raise SourceResponseError(
+                    f"la comisión de un tramo ocupa 3 bytes: {fee} no cabe como "
+                    f"tramo de V3"
+                )
+            parts.append(f"{fee:06x}")
+    return "0x" + "".join(parts)
+
+
+def exact_input(
+    *,
+    path: str,
+    recipient: str,
+    amount_in_raw: int,
+    amount_out_min_raw: int,
+    deadline: int | None = None,
+) -> str:
+    """`exactInput` en la forma que espera el router de esa red, con el camino dado.
+
+    Igual que `exact_input_single`, el `deadline` decide el codificador: el
+    struct del V1 lleva cinco campos y el del SwapRouter02 cuatro, así que
+    pasarle a uno la forma del otro es llamar a otra función. La diferencia con
+    el de un solo pool es el primer campo —el camino empaquetado en vez de
+    tokenIn/tokenOut/fee— y que aquí **no hay `sqrtPriceLimitX96`**: el límite
+    de precio no existe en el multi-salto, y el efectivo lo pone igualmente
+    `amount_out_min`.
+    """
+    body = _hex_body(path)
+    _require_packed_path(body)
+    dynamic = word_uint(len(body) // 2) + body + _padding(len(body))
+    if deadline is None:
+        head = (
+            word_uint(0x80)
+            + word_address(recipient)
+            + word_uint(amount_in_raw)
+            + word_uint(amount_out_min_raw)
+        )
+        return SELECTOR_EXACT_INPUT_SR02 + word_uint(32) + head + dynamic
+    head = (
+        word_uint(0xA0)
+        + word_address(recipient)
+        + word_uint(deadline)
+        + word_uint(amount_in_raw)
+        + word_uint(amount_out_min_raw)
+    )
+    return SELECTOR_EXACT_INPUT_V1 + word_uint(32) + head + dynamic
 
 
 def multicall(payloads: Sequence[str]) -> str:
@@ -235,6 +345,28 @@ def quote_exact_input_single(
     )
 
 
+def quote_exact_input(path: str, amount_in_raw: int) -> str:
+    """`quoteExactInput` del QuoterV2, para un `eth_call`, con el camino entero.
+
+    Cotiza el multi-salto de una vez, **como se ejecutará**: es el mismo camino
+    empaquetado que lleva el swap, así que el número no es la composición de
+    dos lecturas sino el que da el contrato para esta ruta. En el retorno, la
+    primera palabra es el importe de salida; las listas que vienen detrás —los
+    precios tras cada tramo y los ticks cruzados— no se usan aquí, y el impacto
+    se mide contra el marginal de cada pool, como en el camino de un solo pool.
+    """
+    body = _hex_body(path)
+    _require_packed_path(body)
+    return (
+        SELECTOR_QUOTE_EXACT_INPUT
+        + word_uint(64)
+        + word_uint(amount_in_raw)
+        + word_uint(len(body) // 2)
+        + body
+        + _padding(len(body))
+    )
+
+
 def slot0() -> str:
     """`slot0()` del pool, para un `eth_call`."""
     return SELECTOR_SLOT0
@@ -308,6 +440,42 @@ def _hex_body(value: str) -> str:
 def _padding(body_hex_length: int) -> str:
     """El relleno del último bloque de 32 bytes de un elemento dinámico."""
     return "0" * ((-body_hex_length) % 64)
+
+
+def _address_body(address: str) -> str:
+    """Una dirección como los 20 bytes exactos del camino empaquetado, validada.
+
+    La comprobación de longitud no es ceremonia: pegar una dirección de 19 o 21
+    bytes corre **todos** los bytes siguientes del camino y el contrato leería
+    una comisión donde hay media dirección, sin revertir al codificar.
+    """
+    body = address.strip().lower().removeprefix("0x")
+    if len(body) != 40:
+        raise SourceResponseError(
+            f"una dirección del camino empaquetado ocupa 20 bytes: «{address}» "
+            f"no es una"
+        )
+    try:
+        bytes.fromhex(body)
+    except ValueError as error:
+        raise SourceResponseError(f"«{address}» no es hexadecimal") from error
+    return body
+
+
+def _require_packed_path(body: str) -> None:
+    """Comprueba la forma del camino empaquetado: `20 + 23·k` bytes.
+
+    Se valida en los dos sitios que lo consumen —la cotización y el swap— y no
+    en `packed_path` solamente, porque un camino puede llegar construido de
+    fuera. La regla es exactamente la del contrato: token de 20 bytes y tramo de
+    3, sin longitud por medio.
+    """
+    if len(body) < 86 or (len(body) - 40) % 46 != 0:
+        raise SourceResponseError(
+            f"un camino empaquetado de V3 mide 20 + 23·k bytes —un token de 20 y "
+            f"una comisión de 3 por tramo— y llegaron {len(body) // 2}: la forma "
+            f"equivocada no revierte al codificarla, revierte en la cadena"
+        )
 
 
 def _padded_bytes(body_hex_length: int) -> int:

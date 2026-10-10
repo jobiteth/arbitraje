@@ -37,11 +37,14 @@ contratos, que es la fuente última:
   publicada de 0 no significa «gratis», significa «dinámica», y el pool se
   descarta.
 
-PancakeSwap V2 no está en la tabla de constantes a propósito: su contrato en
-repositorio usa `amount0In.mul(2)` (20 bps) mientras su documentación publica
-0,25 %, y esa discrepancia no se resuelve sin leer el bytecode desplegado.
-Mientras no se resuelva, sus pools se cotizan con la comisión que publique la
-fuente, como cualquier otro protocolo de comisión por pool.
+PancakeSwap V2 estuvo fuera de la tabla a propósito hasta que se midió: su
+contrato en repositorio usa `amount0In.mul(2)` (20 bps) mientras su
+documentación publica 0,25 %, y esa discrepancia no se resolvía sin leer el
+contrato desplegado. Medido el 2026-10-09 contra el router de BSC: su
+`getAmountsOut` sobre el par WBNB/USDT devuelve **exactamente** el resultado de
+la fórmula con `9975/10000` —0,25 %— y el de ninguna otra, así que ésa es la
+constante que entra en la tabla. QuickSwap entró el mismo día con la misma
+prueba: 30 bps (`997/1000`), medidos en su par WPOL/USDC de Polygon.
 
 El caso por omisión, que es el más frecuente, es el segundo: todo protocolo que
 no esté en la tabla de constantes y no lleve hooks se trata como comisión **por
@@ -135,6 +138,11 @@ CONSTANT_FEES: Final[Mapping[tuple[str, str], BasisPoints]] = {
     ("uniswap", "v1"): BasisPoints(30),
     ("uniswap", "v2"): BasisPoints(30),
     ("sushiswap", "v2"): BasisPoints(30),
+    # Medidas el 2026-10-09 contra los routers desplegados, con la técnica del
+    # docstring: el `getAmountsOut` del router tiene que reproducir la fórmula
+    # exacta con esta comisión y con ninguna otra.
+    ("quickswap", "v2"): BasisPoints(30),
+    ("pancakeswap", "v2"): BasisPoints(25),
 }
 
 #: Marcas de que un protocolo admite hooks que alteran la comisión por swap.

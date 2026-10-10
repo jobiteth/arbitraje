@@ -1,7 +1,7 @@
-"""Motor de 0x: el interruptor del build, el fee y el impacto que no publica.
+"""Motor de 0x: el interruptor del build, el fee, el impacto que no publica y el nativo.
 
-Tres bloques, cada uno cubriendo algo que se midió contra la API real y que si
-se rompe no lo detecta nadie más:
+Cada bloque cubre algo que se midió contra la API real y que si se rompe no lo
+detecta nadie más:
 
 - **El build apagado.** 0x cobra un 0,15 % de lo que se recibe, y el motor nace
   sin construir para que nadie pague esa comisión sin saberlo. Lo que se prueba
@@ -14,6 +14,9 @@ se rompe no lo detecta nadie más:
 - **El `value` en decimal.** Medido: 0x manda `"0"` donde Uniswap manda `"0x00"`.
   Un lector que sólo entendiera una de las dos formas habría abortado cada swap
   o, peor, habría leído un valor distinto de cero como cero.
+- **El centinela del nativo.** El nativo no tiene dirección, y la API lo nombra
+  con `0xEeee…` —no con la dirección cero, que es la de Uniswap—. Se afirma la
+  dirección que viaja en la petición porque confundirla es no tener ruta.
 
 Va contra el `JsonSource` real con `respx` por debajo, así que se ejercitan la
 lista blanca de hosts, la caché por URL y parámetros, y el mapeo de errores.
@@ -48,7 +51,7 @@ from amigocompora.domain.models import (
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import BasisPoints, TokenAmount
-from amigocompora.engines.catalog import quote_token, wrapped_native
+from amigocompora.engines.catalog import native_token, quote_token, wrapped_native
 from amigocompora.engines.zeroex.engine import (
     CONFIG_API_KEY,
     CONFIG_ENABLE_BUILD,
@@ -460,6 +463,63 @@ async def test_cotizar_dos_veces_no_gasta_cuota() -> None:
         await engine.quote(_pair(), _amount())
         await engine.quote(_pair(), _amount())
     assert route.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# El nativo: su centinela
+# --------------------------------------------------------------------------- #
+async def test_cotiza_el_nativo_con_su_centinela() -> None:
+    """Medido el 2026-10-09: sin centinela la petición ni se hacía.
+
+    La API identifica los tokens por contrato y el nativo no tiene, así que el
+    motor se rendía antes de preguntar. Se afirma la dirección concreta que
+    viaja en los parámetros —el centinela de 0x, no la dirección cero de
+    Uniswap— porque cada API tiene la suya y confundirlas es no tener ruta.
+    """
+    native = native_token("polygon")
+    pair = TradingPair(base=native, quote=_stable("polygon"))
+    amount = TokenAmount(10**18, native.decimals, native.symbol)
+    route = _mock_quote(sell=str(10**18))
+
+    async with _engine() as engine:
+        quotes = await engine.quote(pair, amount)
+
+    assert len(quotes) == 1
+    params = dict(route.calls[-1].request.url.params)
+    assert params["sellToken"] == "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+
+
+async def test_el_build_del_nativo_lee_el_value_decimal() -> None:
+    """Vender nativo devuelve el importe en `value`, en decimal como todo aquí."""
+    native = native_token("polygon")
+    stable = _stable("polygon")
+    pair = TradingPair(base=native, quote=stable)
+    amount = TokenAmount(10**18, native.decimals, native.symbol)
+    quote = Quote(
+        venue=Venue(
+            venue_id="zeroex@polygon",
+            name="0x (agregado, polygon)",
+            kind=VenueKind.DEX,
+            chain="polygon",
+        ),
+        engine_id=MANIFEST.engine_id,
+        pair=pair,
+        amount_in=amount,
+        amount_out=TokenAmount(int(_BUY_RAW), stable.decimals, stable.symbol),
+        fee_bps=None,
+        fee_basis=None,
+        price_impact_bps=None,
+        impact_basis=None,
+        observed_at=NOW,
+    )
+    _mock_quote(chain_key="polygon", sell=str(10**18), value=str(10**18))
+
+    async with _engine(build=True) as engine:
+        transaction = await engine.plan_swap(quote, recipient=_TAKER)
+
+    assert transaction.value.raw == 10**18
+    assert transaction.value.symbol == native.symbol
+    assert transaction.to_address == ROUTERS["polygon"]
 
 
 # --------------------------------------------------------------------------- #

@@ -77,9 +77,11 @@ from amigocompora.domain.execution import ExecutionLimits, TriggerKind
 from amigocompora.domain.models import (
     MarketDepth,
     MarketOutcome,
+    MarketTag,
     PredictionMarket,
     PredictionOrder,
     PredictionSide,
+    PredictionSort,
     SignedPredictionOrder,
     SubmittedPredictionOrder,
     Token,
@@ -306,8 +308,10 @@ class MotorFalso:
         limit: int = 20,
         search: str | None = None,
         closing_within: timedelta | None = None,
+        category: MarketTag | None = None,
+        sort: PredictionSort | None = None,
     ) -> Sequence[PredictionMarket]:
-        del limit, search, closing_within
+        del limit, search, closing_within, category, sort
         return (_mercado(),)
 
     async def market(self, market_id: str) -> PredictionMarket:

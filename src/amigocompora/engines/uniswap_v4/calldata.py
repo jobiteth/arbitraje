@@ -88,6 +88,16 @@ QUOTE_EXACT_INPUT_SINGLE: Final = (
     "quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))"
 )
 
+#: `quoteExactInput` del V4Quoter: un **camino** entero en una sola llamada. La
+#: firma se midió en el dispatcher del bytecode desplegado, no se dedujo: la que
+#: se llevaba de memoria —`quoteExactInput(bytes,uint256)`— **no existe** en el
+#: contrato (su selector `0xcdca1753` no aparece por ningún lado), y la real
+#: lleva una struct con dos campos dinámicos dentro. Escribir la de memoria
+#: habría llamado a otra función o a ninguna, sin error hasta el revert.
+QUOTE_EXACT_INPUT: Final = (
+    "quoteExactInput((address,(address,uint24,int24,address,bytes)[],uint128))"
+)
+
 #: `StateView`. Son las dos preguntas que en V3 le hacía la fábrica: «¿existe este
 #: pool?» y «¿tiene liquidez?». Aquí no hay fábrica, así que se le preguntan al
 #: estado por el `poolId` derivado.
@@ -102,6 +112,7 @@ GET_LIQUIDITY: Final = "getLiquidity(bytes32)"
 EXECUTE: Final = "execute(bytes,bytes[],uint256)"
 
 SELECTOR_QUOTE_EXACT_INPUT_SINGLE: Final = selector(QUOTE_EXACT_INPUT_SINGLE)
+SELECTOR_QUOTE_EXACT_INPUT: Final = selector(QUOTE_EXACT_INPUT)
 SELECTOR_GET_SLOT0: Final = selector(GET_SLOT0)
 SELECTOR_GET_LIQUIDITY: Final = selector(GET_LIQUIDITY)
 SELECTOR_EXECUTE: Final = selector(EXECUTE)
@@ -111,6 +122,15 @@ SELECTOR_EXECUTE: Final = selector(EXECUTE)
 # --------------------------------------------------------------------------- #
 #: Se intercambia contra el pool y se anotan la deuda y el saldo a favor.
 ACTION_SWAP_EXACT_IN_SINGLE: Final = 0x06
+#: Se intercambia contra un **camino** de varios pools, con la misma protección
+#: de precio dentro (`ExactInputParams` en vez de `ExactInputSingleParams`). Se
+#: midió con el mismo control que la de un solo pool: con el envoltorio bien
+#: formado el contrato **decodifica** y llega hasta liquidar —devuelve
+#: `CurrencyNotSettled()`, el mismo revert que el control de un salto—, y sin la
+#: palabra de desplazamiento del struct revierte **sin dato**. Decodificar y
+#: revertir son la misma respuesta para el nodo; lo que los separa es a qué
+#: acción entró: una acción inexistente devolvería `UnsupportedAction`.
+ACTION_SWAP_EXACT_IN: Final = 0x07
 #: Liquida **toda** la deuda de esa moneda. El importe no se le indica: lo
 #: pregunta el propio contrato al PoolManager, así que no se puede pagar de menos
 #: por un redondeo nuestro.
@@ -155,11 +175,13 @@ NO_HOOKS: Final = "0x" + "00" * 20
 #: Lo que se **midió**: cada selector buscado literalmente dentro del bytecode
 #: desplegado, que es donde el dispatcher de Solidity lo lleva.
 #:
-#: Medido el 2026-10-06 contra los contratos de la tabla de `addresses`. Las
-#: acciones de arriba **no** están aquí a propósito: no son funciones y no
-#: aparecen en ningún dispatcher.
+#: Medido el 2026-10-06 contra los contratos de la tabla de `addresses`, y el
+#: del camino el 2026-10-09 contra el mismo V4Quoter de Base —los catorce
+#: `PUSH4` de su dispatcher, uno a uno—. Las acciones de arriba **no** están
+#: aquí a propósito: no son funciones y no aparecen en ningún dispatcher.
 _MEASURED: Final[Mapping[str, str]] = {
     QUOTE_EXACT_INPUT_SINGLE: "0xaa9d21cb",
+    QUOTE_EXACT_INPUT: "0xca253dc9",
     GET_SLOT0: "0xc815641c",
     GET_LIQUIDITY: "0xfa6793d5",
     EXECUTE: "0x3593564c",
@@ -288,6 +310,93 @@ def _keccak(palabras_hex: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# El camino — `PathKey[]`
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class PathKey:
+    """Un tramo de un camino de V4: **hasta** dónde llega, y por qué pool.
+
+    Un camino de V4 no se escribe como una lista de tokens con la comisión
+    intercalada, como el `path` empaquetado de V3, ni como una lista de
+    direcciones como la de V2: cada salto se describe entero con su propia
+    clave. La diferencia que importa y que costó medir está en `currency`: el
+    contrato empareja cada `PathKey` con la moneda que traía para derivar el
+    pool del salto —`(currencyIn, pathKey.intermediateCurrency)`—, así que
+    `currency` es la moneda a la que **llega** el tramo, no de la que sale.
+    Escribirla al revés derivaría la clave de otro pool —normalmente uno que no
+    existe— y el único aviso sería un revert del `PoolManager` que no dice
+    nada de esto.
+
+    El espaciado de ticks tampoco es decorativo: va **dentro** de la clave del
+    pool, así que un tramo con otro espaciado es otro pool, y aquí no hay
+    fábrica que lo confirme. El motor lo recupera de la tabla de tramos
+    canónicos que sondea, que es la única fuente que tiene.
+    """
+
+    #: La moneda a la que **llega** este tramo, no la que entra en él.
+    currency: str
+    #: El tramo de comisión, en unidades de V4 (centésimas de punto básico).
+    fee: int
+    #: El espaciado de ticks del pool, que va dentro de su clave.
+    tick_spacing: int
+    #: Sin ganchos, que es donde está toda la liquidez medida: un pool con
+    #: ganchos es otro `poolId` y no se sondea.
+    hooks: str = NO_HOOKS
+    #: El dato que se le pasa al gancho; vacío cuando no hay ganchos.
+    hook_data: str = "0x"
+
+
+def path_keys(keys: Sequence[PathKey]) -> str:
+    """`abi.encode(PathKey[])`: el camino entero, con sus desplazamientos.
+
+    Es un array de structs **dinámicos** —cada `PathKey` lleva un `bytes`
+    dentro—, así que no basta con concatenar los elementos: primero la
+    longitud, luego un desplazamiento por elemento y detrás los elementos. Los
+    desplazamientos se cuentan desde el final de la palabra de longitud y
+    avanzan por el tamaño **ya relleno** de cada elemento, igual que en
+    `_enc_bytes_array`.
+
+    Dentro de cada elemento la cabeza son cinco palabras —la moneda, la
+    comisión, el espaciado, los ganchos y el desplazamiento al `hookData`—, y
+    ese desplazamiento vale la cabeza entera: `0xa0`, cinco palabras. Con el
+    `hookData` vacío el elemento mide **seis** palabras, y el `int24` del
+    espaciado va con el signo extendido, como en el `PoolKey`.
+
+    Un camino vacío no se codifica: el contrato lo cotizaría como un camino de
+    cero saltos, que no es un swap. Se corta aquí, que es barato.
+    """
+    if not keys:
+        raise SourceResponseError(
+            "un camino sin tramos no es un camino: no hay ningún pool contra el "
+            "que intercambiar."
+        )
+    elementos: list[str] = []
+    for key in keys:
+        hook = _hex_body(key.hook_data)
+        elementos.append(
+            word_address(key.currency)
+            + word_uint(key.fee)
+            + _word_int(key.tick_spacing)
+            + word_address(key.hooks)
+            + word_uint(5 * 32)
+            + _enc_bytes(hook)
+        )
+    desplazamientos: list[int] = []
+    cursor = len(keys) * 32
+    for elemento in elementos:
+        desplazamientos.append(cursor)
+        # Cada elemento ya viene relleno a 32 bytes —la cabeza son cinco
+        # palabras y el `bytes` es palabra más relleno—, así que su tamaño en
+        # bytes es exactamente lo que hay que avanzar.
+        cursor += len(elemento) // 2
+    return (
+        word_uint(len(keys))
+        + "".join(word_uint(offset) for offset in desplazamientos)
+        + "".join(elementos)
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Codificación — lectura
 # --------------------------------------------------------------------------- #
 def get_slot0(pool_id_hex: str) -> str:
@@ -343,17 +452,7 @@ def quote_exact_input_single(
     El importe es un `uint128` y se comprueba: uno que no quepa no cabe en la
     palabra, y truncarlo en silencio cotizaría por otro tamaño.
     """
-    if amount_in_raw <= 0:
-        raise SourceResponseError(
-            f"no se cotiza un importe de entrada de {amount_in_raw}: tiene que ser "
-            f"positivo, y el contrato no admite el cero."
-        )
-    if amount_in_raw >= 1 << 128:
-        raise SourceResponseError(
-            f"el importe {amount_in_raw} no cabe en el `uint128` que declara la "
-            f"struct del cotizador: el contrato lo leería truncado y cotizaría por "
-            f"otro tamaño."
-        )
+    _require_quote_amount(amount_in_raw)
     par = orient(currency_in, currency_out, fee, tick_spacing)
     hook = _hex_body(hook_data)
     return (
@@ -367,6 +466,72 @@ def quote_exact_input_single(
         + hook
         + _padding(len(hook))
     )
+
+
+def quote_exact_input(
+    currency_in: str,
+    keys: Sequence[PathKey],
+    amount_in_raw: int,
+) -> str:
+    """`quoteExactInput` del V4Quoter para un camino entero, para un `eth_call`.
+
+    Cotiza todos los saltos **en una sola llamada**, igual que el swap los
+    ejecuta: el importe que devuelve no es la composición de varias
+    cotizaciones sueltas, es el que el contrato calcula encadenando los pools
+    de verdad —cada salto parte de lo que entregó el anterior—, y por eso es el
+    número contra el que se comprueba la deriva al firmar.
+
+    Medido contra el V4Quoter de Base, en dos saltos WETH → USDC → WETH
+    (tramos 0,30 % y 0,05 %, 10^15 wei de entrada): devuelve
+    `[993014236051103, 70983]` —el importe y una estimación de gas—, y la cifra
+    cae dentro de 6 partes por millón de la composición de dos cotizaciones
+    sueltas del mismo bloque. La diferencia está explicada y no es un error: la
+    ruta artificial repite el **mismo** pool en los dos saltos, así que el
+    segundo ve el precio que ya movió el primero, mientras que dos
+    cotizaciones sueltas parten las dos del estado original.
+
+    El struct va precedido de **su palabra de desplazamiento** por el mismo
+    motivo que el de un solo pool: lleva un campo dinámico dentro —el
+    `PathKey[]`— y sin esa palabra el decodificador lee la moneda donde está el
+    desplazamiento. Medido: sin ella, `execution reverted data=0x` en tres
+    nodos distintos; con ella, el importe exacto.
+
+    Dentro, el camino lleva **otro** desplazamiento relativo al principio de la
+    struct, y su valor es el tamaño de su cabeza: **tres** palabras —la moneda
+    que entra, el desplazamiento y el importe—. Y el importe se comprueba como
+    en la variante de un pool: es un `uint128`, y truncarlo cotizaría por otro
+    tamaño.
+    """
+    _require_quote_amount(amount_in_raw)
+    return (
+        SELECTOR_QUOTE_EXACT_INPUT
+        + word_uint(32)
+        + word_address(currency_in)
+        + word_uint(3 * 32)
+        + word_uint(amount_in_raw)
+        + path_keys(keys)
+    )
+
+
+def _require_quote_amount(amount_in_raw: int) -> None:
+    """El importe de una cotización: positivo y dentro del `uint128`.
+
+    Vive aquí y no en cada variante porque las dos —un pool y un camino—
+    declaran el mismo `uint128` y truncarlo del mismo modo: por la izquierda,
+    en silencio, cotizando por otro tamaño. El mensaje dice cuál de las dos
+    cosas falla, que es lo único que cambia.
+    """
+    if amount_in_raw <= 0:
+        raise SourceResponseError(
+            f"no se cotiza un importe de entrada de {amount_in_raw}: tiene que ser "
+            f"positivo, y el contrato no admite el cero."
+        )
+    if amount_in_raw >= 1 << 128:
+        raise SourceResponseError(
+            f"el importe {amount_in_raw} no cabe en el `uint128` que declara la "
+            f"struct del cotizador: el contrato lo leería truncado y cotizaría por "
+            f"otro tamaño."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -407,6 +572,43 @@ def swap_exact_in_single(
         + word_uint(len(hook) // 2)
         + hook
         + _padding(len(hook))
+    )
+
+
+def swap_exact_in_path(
+    currency_in: str,
+    keys: Sequence[PathKey],
+    *,
+    amount_in_raw: int,
+    amount_out_min_raw: int,
+) -> str:
+    """`abi.encode(ExactInputParams)`: la acción que ejecuta un camino entero.
+
+    Es a `SWAP_EXACT_IN` (0x07) lo que `swap_exact_in_single` a su acción: la
+    cabeza son **cuatro** palabras —la moneda que entra, el desplazamiento al
+    camino, el importe y el mínimo—, y el `PathKey[]` va detrás. Cuatro, no
+    cinco: la revisión con la que se desplegó el router
+    (`v4-periphery@444c526b77d8`, abril de 2025) **no** lleva el
+    `minHopPriceX36` que se le añadió después a la rama principal, y meterlo
+    desplazaría el camino una palabra. Se comprobó contra el contrato
+    desplegado: con esta cabeza el `UniversalRouter` de Base decodifica la
+    acción y llega hasta liquidar —devuelve `CurrencyNotSettled()`, el mismo
+    revert que el control de un solo salto—, y sin la palabra de desplazamiento
+    revierte **sin dato**.
+
+    El mínimo va aquí dentro igual que en la variante de un pool, y por el
+    mismo motivo: es donde el contrato conoce el importe que sale, así que la
+    protección de precio viaja en el propio swap y `TAKE` puede cobrar el saldo
+    íntegro sin perder nada. Con dos saltos el número se comprueba contra la
+    salida del **camino entero**, que es lo que el usuario recibe.
+    """
+    return (
+        word_uint(32)
+        + word_address(currency_in)
+        + word_uint(4 * 32)
+        + word_uint(amount_in_raw)
+        + word_uint(amount_out_min_raw)
+        + path_keys(keys)
     )
 
 
@@ -541,11 +743,17 @@ def decode_slot0(raw: str) -> tuple[int, int] | None:
 def decode_quote(raw: str) -> int | None:
     """El `amountOut` de la respuesta del V4Quoter, o `None` si no llega.
 
-    Devuelve **cinco** palabras —el importe de salida, el de entrada, el precio
-    después, el tick después y una estimación de gas— y la que interesa es la
-    primera. La de gas es del intercambio solo: el `execute` que lo envuelve hace
-    mucho más trabajo, así que usarla como límite de la transacción sería quedarse
-    corto por un margen que no se sabe.
+    Devuelve **dos** palabras —el importe de salida y una estimación de gas— y
+    la que interesa es la primera. Que sean dos se midió contra el contrato
+    desplegado: el docstring que decía «cinco palabras» describía el retorno
+    del `QuoterV2` de V3 —el de este contrato es otro—, y aunque leer la
+    primera palabra funcionaba igual, la cifra de gas es un dato distinto del
+    que se creía. La de gas es del intercambio solo: el `execute` que lo
+    envuelve hace mucho más trabajo, así que usarla como límite de la
+    transacción sería quedarse corto por un margen que no se sabe.
+
+    La misma lectura vale para la respuesta de un pool y para la de un camino:
+    las dos empiezan por el importe.
     """
     return decode_uint(raw, 0)
 

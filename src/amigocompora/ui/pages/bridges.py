@@ -842,6 +842,9 @@ class BridgesSection(QWidget):
             and self._container.prepare_bridge.is_available(quote.request.origin.chain)
         )
         motivos = self._blockers(quote)
+        # Los avisos no apagan el botón: informan de lo que decidirá la firma (hoy,
+        # que el importe se valorará al firmar). Ver `_notes`.
+        notas = self._notes(quote)
         self._exec_btn.setEnabled(quote is not None and not motivos)
 
         if quote is None:
@@ -864,11 +867,16 @@ class BridgesSection(QWidget):
             self._chosen.setToolTip(f"Ruta elegida: {resumen}")
             self._set_estimate(quote.amount_out)
 
-        self._exec_note.setText(
-            ""
-            if quote is None or not motivos
-            else "No se puede ejecutar: " + " · ".join(motivos) + "."
-        )
+        if quote is not None and motivos:
+            self._exec_note.setStyleSheet(f"color: {COLOR_DANGER};")
+            self._exec_note.setText("No se puede ejecutar: " + " · ".join(motivos) + ".")
+        elif notas:
+            # En ámbar y sin el «no se puede»: el botón sigue encendido, porque lo
+            # que anuncia el aviso lo decidirá la firma con la cotización delante.
+            self._exec_note.setStyleSheet(f"color: {COLOR_WARNING};")
+            self._exec_note.setText("Aviso: " + " · ".join(notas) + ".")
+        else:
+            self._exec_note.setText("")
         self._refresh_upgrade_offer(motivos)
 
     def _blockers(self, quote: BridgeQuote | None) -> tuple[str, ...]:
@@ -945,6 +953,13 @@ class BridgesSection(QWidget):
         una red que el usuario no autorizó. Es el motivo que más se va a encontrar
         quien pruebe esto por primera vez, porque la configuración por defecto no
         tiene ni `base` ni `polygon` declaradas.
+
+        El importe sólo se comprueba aquí si la pata que se entrega ya está en la
+        moneda de los topes; cuando no lo está, valorarlo es una petición de red
+        que el repintado no puede permitirse y lo hace `ExecuteBridge` al firmar.
+        Ese caso **no bloquea** —bloquearlo haría imposible cruzar cualquier token
+        que no sea la stablecoin de su red, que es medio catálogo—: se avisa en
+        `_notes`.
         """
         limits = self._container.policy.limits
         motivos: list[str] = []
@@ -962,16 +977,6 @@ class BridgesSection(QWidget):
 
         notional = bridge_notional(request)
         if notional is None:
-            # La pata de origen no es la moneda de los topes, así que el importe hay
-            # que valorarlo cotizando y el repintado de un botón no puede permitirse
-            # una petición de red. No se calla del todo: se dice que el tope se
-            # aplicará al firmar, y que si no se puede valorar no se cruzará. Un
-            # botón encendido sin esta línea prometería un cruce que puede negarse.
-            motivos.append(
-                f"el importe sale en {request.origin.symbol}, que no es la moneda de "
-                f"los topes de {request.origin.chain}: se valorará al firmar, y si no "
-                f"se puede valorar no se cruzará"
-            )
             return tuple(motivos)
         try:
             limits.check_amount(
@@ -981,6 +986,27 @@ class BridgesSection(QWidget):
         except ExecutionLimitExceededError as error:
             motivos.append(str(error))
         return tuple(motivos)
+
+    def _notes(self, quote: BridgeQuote | None) -> tuple[str, ...]:
+        """Lo que conviene saber antes de firmar, sin apagar el botón.
+
+        Hoy una sola: la pata que se entrega no es la moneda de los topes de su
+        red, así que el importe se valorará al firmar —y si no se puede valorar,
+        no se cruzará—. El repintado no puede hacer esa valoración, y por eso no
+        la decide: `ExecuteBridge` valora con la cotización delante y se niega a
+        cruzar cuando no puede medir. La línea existe para que ese «no se cruzará»
+        no sorprenda, no para prometer nada.
+        """
+        if quote is None:
+            return ()
+        request = quote.request
+        if bridge_notional(request) is not None:
+            return ()
+        return (
+            f"el importe sale en {request.origin.symbol}, que no es la moneda de "
+            f"los topes de {request.origin.chain}: se valorará al firmar, y si no "
+            f"se puede valorar no se cruzará",
+        )
 
     def _refresh_upgrade_offer(self, motivos: tuple[str, ...]) -> None:
         """Ofrece el cambio de modo sólo cuando el modo es lo que bloquea.

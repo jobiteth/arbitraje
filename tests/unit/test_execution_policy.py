@@ -48,7 +48,7 @@ from amigocompora.domain.errors import (
     ExecutionLimitExceededError,
     ModeNotPermittedError,
 )
-from amigocompora.domain.execution import ExecutionLimits, TriggerKind
+from amigocompora.domain.execution import ANY_TOKEN, ExecutionLimits, TriggerKind
 from amigocompora.domain.models import (
     BroadcastReceipt,
     BroadcastStatus,
@@ -1145,6 +1145,23 @@ def test_a_mixed_case_symbol_matches_the_normalized_whitelist() -> None:
     limits.check_token(("pUSD",))
     with pytest.raises(ExecutionLimitExceededError):
         limits.check_token(("USDC",))
+
+
+def test_allows_token_answers_with_both_sides_normalized() -> None:
+    """La interfaz pregunta por un token suelto, y los dos lados van a mayúsculas.
+
+    Es la misma respuesta que da `check_token` al firmar —la pantalla no puede
+    decir que no cuando la política deja—, pero sobre un símbolo en vez de una
+    tupla. `limits_from_config` normaliza la lista; unos límites construidos a
+    mano pueden no haber pasado por ahí, así que se normalizan los dos lados y la
+    respuesta no depende de quién escribió la lista. El comodín pasa todo y la
+    lista vacía no pasa nada, como en `check_token`.
+    """
+    for lista in (frozenset({"pUsD"}), frozenset({"PUSD"})):
+        assert _limits(allowed_tokens=lista).allows_token("pUSD") is True
+        assert _limits(allowed_tokens=lista).allows_token("USDC") is False
+    assert _limits(allowed_tokens=frozenset({ANY_TOKEN})).allows_token("cualquiera") is True
+    assert _limits(allowed_tokens=frozenset()).allows_token("pUSD") is False
 
 
 @pytest.mark.parametrize(

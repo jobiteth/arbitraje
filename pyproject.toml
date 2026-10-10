@@ -35,6 +35,11 @@ dependencies = [
     # quedarse a que la de arriba cambie de idea.
     "eth-abi>=5.0",
     "eth-utils>=5.0",
+    # Cifrado y descifrado del almacén de carteras. Llega como dependencia de
+    # `eth-account`, pero se declara porque `infra.wallets` clasifica sus
+    # excepciones sin intermediarios: distinguir «contraseña incorrecta» de
+    # «almacén dañado» es lo que decide el mensaje que ve quien la escribe.
+    "eth-keyfile>=0.10,<0.11",
     # El código QR de una dirección de depósito. Es Python puro y no arrastra
     # Pillow —que traería binarios compilados a una aplicación que sólo necesita
     # una matriz de ceros y unos para pintarla con QPainter—. Se declara aunque
@@ -61,6 +66,7 @@ geckoterminal = "amigocompora.engines.geckoterminal:PROVIDER"
 dexscreener = "amigocompora.engines.dexscreener:PROVIDER"
 jupiter = "amigocompora.engines.jupiter:PROVIDER"
 uniswap = "amigocompora.engines.uniswap:PROVIDER"
+uniswap_v2 = "amigocompora.engines.uniswap_v2:PROVIDER"
 uniswap_v3 = "amigocompora.engines.uniswap_v3:PROVIDER"
 uniswap_v4 = "amigocompora.engines.uniswap_v4:PROVIDER"
 zeroex = "amigocompora.engines.zeroex:PROVIDER"

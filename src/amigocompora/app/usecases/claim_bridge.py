@@ -25,7 +25,11 @@ from dataclasses import dataclass, field
 import structlog
 
 from amigocompora.app.confirmation import ConfirmationGateway
-from amigocompora.app.execution_policy import AutonomyPolicy, PrivateKeySource
+from amigocompora.app.execution_policy import (
+    RECEIVE_KIND,
+    AutonomyPolicy,
+    PrivateKeySource,
+)
 from amigocompora.app.registry import EngineRegistry
 from amigocompora.app.usecases.track_bridge import TrackedBridge
 from amigocompora.domain.addresses import shorten
@@ -138,7 +142,11 @@ class ClaimBridge:
             expected_to=transaction.to_address,
             event="bridge.claim_sending",
         )
-        self.policy.ledger.record_receipt(receipt, intent)
+        # El tipo, además del importe cero, para que lo que entra quede dicho
+        # por lo que el asiento es: una recepción. Como `transaction` contaría
+        # el día que el importe deje de ser cero, que es justo lo que este
+        # caso de uso documenta que no debe pasar.
+        self.policy.ledger.record_receipt(receipt, intent, kind=RECEIVE_KIND)
         _log.info(
             "bridge.claim_recorded",
             origin=origin,

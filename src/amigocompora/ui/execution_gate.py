@@ -34,9 +34,9 @@ from amigocompora.app.usecases.execute_swap import reference_notional
 from amigocompora.domain.addresses import is_evm_address, is_solana_address
 from amigocompora.domain.chains import AddressFormat, chain
 from amigocompora.domain.errors import ExecutionLimitExceededError
-from amigocompora.domain.execution import ANY_TOKEN
 from amigocompora.domain.models import Quote, TradingPair
 from amigocompora.domain.modes import Capability
+from amigocompora.infra.wallets import WalletSource
 
 
 def execution_blockers(
@@ -91,8 +91,9 @@ def execution_blockers(
             f"no hay ningún motor activo capaz de construir el swap{donde} "
             "(activa `uniswap` o `zeroex` y dale su clave)"
         )
-    if not container.keys.available():
-        motivos.append("no hay cartera configurada, así que no hay con qué firmar")
+    cartera = _wallet_blocker(container)
+    if cartera is not None:
+        motivos.append(cartera)
     if quote is not None and not container.prepare_swap.can_build(quote):
         # La ruta la cotizó un motor que sólo cotiza: aparece en la tabla, pero el
         # swap no sale de él. Se dice cuál sirve, en vez de dejar un botón que falla.
@@ -105,6 +106,42 @@ def execution_blockers(
     return tuple(motivos)
 
 
+def _wallet_blocker(container: Container) -> str | None:
+    """El motivo de cartera para no poder firmar, o `None` si la activa puede.
+
+    Se distinguen los tres «no» —ninguna cartera, la activa en observación, la
+    activa cifrada sin desbloquear— porque se arreglan en sitios distintos:
+    añadir una cartera, elegir la que tiene clave, desbloquear la sesión. Un
+    motivo genérico mandaría a buscar la solución donde no está.
+
+    Las preguntas se le hacen al proveedor —`is_locked`, `available`— y no se
+    deducen del libro: es la misma pieza que decide al firmar, y una respuesta
+    copiada aquí podría desviarse de la que da el caso de uso.
+    """
+    keys = container.keys
+    active = keys.active()
+    if active is None:
+        # Sin entradas en el libro manda el proveedor heredado —la clave del
+        # llavero o la del entorno—, y su respuesta es la de siempre.
+        if not keys.available():
+            return "no hay cartera configurada, así que no hay con qué firmar"
+        return None
+    if active.source is WalletSource.WATCH:
+        return (
+            f"la cartera «{active.label}» está en modo observación: se leen sus "
+            f"saldos, pero no puede firmar (elige una cartera con clave en la "
+            f"Cartera, pulsando su nombre)"
+        )
+    if keys.is_locked():
+        return (
+            f"la cartera «{active.label}» está bloqueada: desbloquéala en la "
+            f"Cartera (menú de la cabecera → «Desbloquear cartera»)"
+        )
+    if not keys.available():
+        return "no hay cartera configurada, así que no hay con qué firmar"
+    return None
+
+
 def _token_blockers(container: Container, pair: TradingPair) -> tuple[str, ...]:
     """Las dos patas del par contra `allowed_tokens`, nombrando lo que sí hay.
 
@@ -114,22 +151,23 @@ def _token_blockers(container: Container, pair: TradingPair) -> tuple[str, ...]:
     `WETH`—, así que una lista con `ETH` dentro deja fuera justo lo que se quería
     permitir, y sin ver la lista al lado eso no se nota.
     """
-    permitidos = container.policy.limits.allowed_tokens
-    # El comodín «*» permite cualquier token: la pantalla y el caso de uso tienen que
-    # coincidir, así que aquí tampoco se marca nada como fuera de la lista.
-    if ANY_TOKEN in permitidos:
-        return ()
+    limites = container.policy.limits
+    # Quién pasa lo decide `allows_token` —mayúsculas en los dos lados, como
+    # `check_token` al firmar, y comodín «*» incluido—: la pantalla y el caso de
+    # uso tienen que dar la misma respuesta, o el botón diría que no cuando la
+    # política sí deja. El catálogo tiene símbolos en caja mixta (`pUSD`), así
+    # que comparar en crudo bloquea tokens que la lista sí permite.
     fuera = sorted(
         symbol
         for symbol in (pair.base.symbol, pair.quote.symbol)
-        if symbol not in permitidos
+        if not limites.allows_token(symbol)
     )
     if not fuera:
         return ()
     return (
         f"{', '.join(fuera)} no está en `allowed_tokens`, así que la política no "
         f"deja operar con ese par (ahora declara: "
-        f"{', '.join(sorted(permitidos)) or 'nada'}; añádelo en config.toml)",
+        f"{', '.join(sorted(limites.allowed_tokens)) or 'nada'}; añádelo en config.toml)",
     )
 
 
@@ -177,7 +215,9 @@ def recipient_candidates(container: Container, chain_key: str) -> list[str]:
     La **cartera de la aplicación va primera**, porque es la dirección desde la que
     sale el dinero —de ahí sale y ahí vuelve— y es la única de la lista que la
     aplicación conoce sin que nadie la haya escrito en la configuración. Se deriva
-    de la clave, así que nunca es la clave.
+    de la clave, así que nunca es la clave. Después van las demás carteras del
+    libro —a qué otra dirección mandaría el usuario si no a la suya de reserva— y
+    por último las observadas de la configuración.
     """
     spec = chain(chain_key)
     solana = spec.address_format is AddressFormat.SOLANA_BASE58
@@ -187,8 +227,11 @@ def recipient_candidates(container: Container, chain_key: str) -> list[str]:
     if propia is not None and check(propia):
         candidates.append(propia)
     candidates.extend(
+        wallet.address for wallet in container.keys.wallets() if check(wallet.address)
+    )
+    candidates.extend(
         address for address in container.settings.watch_addresses if check(address)
     )
-    # Sin repetidos y conservando el orden: la cartera puede estar también en
-    # `watch_addresses`, y verla dos veces en la lista parece un fallo.
+    # Sin repetidos y conservando el orden: la cartera activa está también en el
+    # libro, y verla dos veces en la lista parece un fallo.
     return list(dict.fromkeys(candidates))

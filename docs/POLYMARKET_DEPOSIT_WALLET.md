@@ -129,8 +129,10 @@ Fuentes:
     wallet a los segundos y la posición desapareció de la API pública.
   - La wallet no se fondea sola: la recarga del 2026-10-09 se hizo con una
     retirada real (0.15 pUSD) por el camino de la aplicación.
-- **Fase 6 (interfaz): hecha** (2026-10-09). La pestaña de predicciones trae la
-  tarjeta «Wallet de depósito» (`ui/pages/prediction.py`, con el caso de uso de
+- **Fase 6 (interfaz): hecha** (2026-10-09). La pestaña de predicciones trae el
+  panel «Wallet de depósito» —lo abre «Operar wallet…», el botón que va al lado
+  del saldo en las dos caras de la tarjeta de cada mercado—
+  (`ui/pages/prediction.py`, con el caso de uso de
   sólo lectura `app/usecases/read_settlement_wallet.py`):
   - La dirección se **deriva** —pura, sin red y sin clave: `settlement_wallet` del
     planificador— y por eso se enseña con «Copiar» y «Ver QR» antes de leer nada;
@@ -145,9 +147,10 @@ Fuentes:
     dirección y el QR: sólo pUSD, sólo Polygon.
   - **Posiciones con acciones por fila**: «Vender» y «Comprar más» resuelven el
     mercado por su `conditionId` (`market_by_condition`, gamma
-    `/markets?condition_ids=…`) y **cargan** la tarjeta de orden de encima —el
-    resultado por `token_id`, no por la etiqueta— sin firmar nada: el precio y
-    «Publicar» siguen siendo los de arriba, con sus comprobaciones y su diálogo.
+    `/markets?condition_ids=…`), cierran el panel y **cargan** la tarjeta del
+    mercado —el resultado por `token_id`, no por la etiqueta— sin firmar nada:
+    el precio y «Publicar» siguen siendo los del formulario, con sus
+    comprobaciones y su diálogo.
     La venta propone la posición entera truncada hacia abajo a los decimales de la
     participación; la compra, el mínimo del mercado. La tabla trae además precio
     medio y resultado abierto (`avgPrice`/`cashPnl`/`percentPnl` de la fuente;

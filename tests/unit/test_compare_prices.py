@@ -21,6 +21,7 @@ fijan las cuatro propiedades que hacen que la fusión sea correcta y no un
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -81,9 +82,14 @@ def _manifest(engine_id: str, *, priority: int = 100) -> EngineManifest:
 
 
 class _Engine:
-    """Motor de doble: devuelve lo que se le diga, o falla si se le pide."""
+    """Motor de doble: devuelve lo que se le diga, o falla si se le pide.
 
-    __slots__ = ("_error", "_manifest", "_quotes", "asked")
+    `barrier` sirve para medir la concurrencia: dos dobles que la compartan no
+    pueden responder hasta que los dos hayan empezado. `delay` retrasa la
+    respuesta para poder invertir el orden en que llegan.
+    """
+
+    __slots__ = ("_barrier", "_delay", "_error", "_manifest", "_quotes", "asked")
 
     def __init__(
         self,
@@ -91,10 +97,14 @@ class _Engine:
         *,
         quotes: Sequence[Quote] = (),
         error: Exception | None = None,
+        barrier: asyncio.Barrier | None = None,
+        delay: float = 0.0,
     ) -> None:
         self._manifest = manifest
         self._quotes = tuple(quotes)
         self._error = error
+        self._barrier = barrier
+        self._delay = delay
         self.asked: list[TradingPair] = []
 
     @property
@@ -110,6 +120,13 @@ class _Engine:
 
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         self.asked.append(pair)
+        if self._barrier is not None:
+            # Si las consultas fueran secuenciales, la primera se quedaría aquí
+            # esperando a una segunda que no ha llegado a empezar, y el plazo lo
+            # delataría en vez de pasar.
+            await asyncio.wait_for(self._barrier.wait(), timeout=1.0)
+        if self._delay:
+            await asyncio.sleep(self._delay)
         if self._error is not None:
             raise self._error
         return self._quotes
@@ -538,6 +555,61 @@ async def test_sin_liquidez_se_nombra_a_quien_no_respondio() -> None:
 
     with pytest.raises(NoQuotesError, match="No respondieron: caido"):
         await _usecase(await _registry(caido, vacio))(PAIR, AMOUNT)
+
+
+# --------------------------------------------------------------------------- #
+# El tiempo: se pregunta a todos a la vez
+# --------------------------------------------------------------------------- #
+async def test_los_motores_se_preguntan_a_la_vez() -> None:
+    """El tiempo de la comparación es el del motor más lento, no la suma.
+
+    En secuencia —como eran— cada motor esperaba a que el anterior acabara:
+    con cinco activos la primera cifra tardaba varios segundos, y el más lento
+    retrasaba también a los que ya habían respondido. Los dos dobles se esperan
+    en una barrera: si las consultas no fueran concurrentes, la primera se
+    quedaría esperando a una segunda que no llegaría a empezar y el plazo la
+    haría fallar en vez de pasar.
+    """
+    barrera = asyncio.Barrier(2)
+    una = _Engine(
+        _manifest("una"),
+        quotes=(_quote(engine_id="una", venue_id="una@ethereum", out_raw=_OUT_2690),),
+        barrier=barrera,
+    )
+    otra = _Engine(
+        _manifest("otra"),
+        quotes=(_quote(engine_id="otra", venue_id="otra@ethereum", out_raw=_OUT_2700),),
+        barrier=barrera,
+    )
+
+    comparison = await _usecase(await _registry(una, otra))(PAIR, AMOUNT)
+
+    assert len(comparison.quotes) == 2
+    assert comparison.failed_engines == ()
+
+
+async def test_el_desempate_no_depende_de_quien_responda_primero() -> None:
+    """El pliegue va en el orden de la pila aunque la red conteste al revés.
+
+    Las dos mediciones son del mismo pool, así que se queda una: la primera de
+    la pila. Da igual que sea la que más tarda en llegar —en paralelo, quien
+    responde antes es quien tiene menos latencia, no quien manda—.
+    """
+    lenta = _Engine(
+        _manifest("preferida"),
+        quotes=(_pool_quote("preferida", _OUT_2690),),
+        delay=0.05,
+    )
+    rapida = _Engine(
+        _manifest("respaldo"),
+        quotes=(_pool_quote("respaldo", _OUT_2700),),
+    )
+
+    comparison = await _usecase(await _registry(lenta, rapida))(PAIR, AMOUNT)
+
+    assert len(comparison.quotes) == 1
+    assert comparison.quotes[0].engine_id == "preferida"
+    assert comparison.quotes[0].amount_out.raw == _OUT_2690
 
 
 # --------------------------------------------------------------------------- #

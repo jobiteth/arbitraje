@@ -35,6 +35,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -352,13 +354,14 @@ async def test_la_pantalla_de_swap_tiene_la_lista_de_tokens() -> None:
 # --------------------------------------------------------------------------- #
 # 3. Operar desde la lista
 # --------------------------------------------------------------------------- #
-async def test_cada_fila_de_tokens_tiene_su_boton_de_intercambiar() -> None:
-    """Cada fila lleva su propio ⇄, y lleva **su** token dentro.
+async def test_pulsar_la_fila_de_un_token_lo_lleva_al_swap() -> None:
+    """Pulsar la fila abre su detalle, y «Swap» lleva **ese** token a la tarjeta.
 
-    El botón no lee la fila seleccionada a propósito: pulsar un widget dentro de
-    una celda no selecciona la fila, así que leerla mandaría a la tarjeta el token
-    de la última fila que se tocó —y eso se paga firmando lo que no se quería—.
-    Por eso lo que se comprueba es que el token que sale es el de la fila pulsada.
+    La fila entera es el botón, y el token viaja dentro de la señal: el botón no
+    lee la última fila tocada ni una selección aparte, porque lo que se paga
+    firmando es justo eso —intercambiar el token que no era—. Por eso lo que se
+    comprueba es que el token que sale es el de la fila pulsada, y con el ratón
+    sintetizado, que es lo que distingue «la fila responde» de «la señal existe».
     """
     pol = native_token("polygon")
     async with _ventana({"polygon": (TokenHolding(token=pol, amount=pol.amount("3")),)}) as (
@@ -366,16 +369,17 @@ async def test_cada_fila_de_tokens_tiene_su_boton_de_intercambiar() -> None:
         window,
     ):
         wallet = window._wallet
-        await _esperar(lambda: wallet._table.rowCount() > 0)
+        await _esperar(lambda: len(wallet._row_widgets) > 0)
 
-        boton = wallet._table.cellWidget(0, 5)
-        assert isinstance(boton, QPushButton), "la última columna tiene que ser el botón ⇄"
+        QTest.mouseClick(wallet._row_widgets[0], Qt.MouseButton.LeftButton)
+        assert wallet._detail_view.isHidden() is False, "la fila tiene que abrir el detalle"
+        assert wallet._swap_btn.isEnabled()
 
         elegidos: list[object] = []
         wallet.swap_requested.connect(elegidos.append)
-        boton.click()
+        wallet._swap_btn.click()
 
-        assert len(elegidos) == 1, "el botón de la fila tiene que emitir el token"
+        assert len(elegidos) == 1, "el botón del detalle tiene que emitir el token"
         assert elegidos[0] is pol
 
 
@@ -401,9 +405,9 @@ async def test_una_tarjeta_plegada_no_ocupa_y_se_abre() -> None:
         assert page._routes_empty.isVisibleTo(page._routes_card) is False
 
         # Cotizar la abre sola: plegada, el botón parecería no haber hecho nada.
-        page._fill_table(_con_rutas(2))
+        page._fill_routes(_con_rutas(2))
         assert page._routes_card._cuerpo.isHidden() is False
-        assert page._table.isVisibleTo(page._routes_card) is True
+        assert page._routes.isVisibleTo(page._routes_card) is True
         abierta = page._routes_card.sizeHint().height()
 
         # Y plegarla devuelve el sitio que ocupaba, sin perder el contenido.
