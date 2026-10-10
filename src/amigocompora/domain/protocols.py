@@ -350,7 +350,26 @@ class SwapPlanner(Engine, Protocol):
     que se le pasó.
     """
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction: ...
+    async def plan_swap(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        slippage_bps: int | None = None,
+    ) -> PlannedTransaction:
+        """Construye el payload del swap, con la tolerancia que se le pida.
+
+        `slippage_bps` es el deslizamiento con el que se fija el mínimo
+        garantizado dentro del payload (el importe que se acepta recibir como
+        peor caso). `None` significa «la tolerancia propia del motor», que es lo
+        que usan las llamadas que no configuran nada; quien la pase está
+        fijando, de verdad, lo que el swap aceptará.
+
+        Se pide aquí —y no en `quote`— porque es al **construir** cuando se
+        firma un mínimo: la cotización es una cifra que se mira, el payload es
+        un compromiso que se ejecuta.
+        """
+        ...
 
     def expected_destination(self, chain_key: str) -> str | None:
         """El contrato al que este motor dirige los swaps en esa red, o `None`.

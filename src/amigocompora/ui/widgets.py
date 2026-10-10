@@ -15,9 +15,25 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Final
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import (
+    Property,
+    QEvent,
+    QPointF,
+    QPropertyAnimation,
+    QRectF,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QEnterEvent,
+    QFontMetrics,
+    QPainter,
+    QPaintEvent,
+    QPen,
+)
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -39,12 +55,15 @@ from amigocompora.domain.modes import Capability
 from amigocompora.engines.catalog import native_token, tokens_for
 from amigocompora.engines.token_store import UserTokenStore
 from amigocompora.ui.theme import (
+    COLOR_ACCENT,
+    COLOR_ACCENT_HOVER,
     COLOR_BG,
     COLOR_BORDER,
     COLOR_BORDER_STRONG,
     COLOR_DANGER,
     COLOR_ELEVATED,
     COLOR_MUTED,
+    COLOR_ON_ACCENT,
     COLOR_TEXT,
     COLOR_WARNING,
 )
@@ -465,6 +484,109 @@ class Card(QFrame):
         if hasattr(self, "_chevron"):
             self._chevron.setText("▾" if visible else "▸")
         self._cuerpo.setVisible(visible)
+
+
+#: Ancho y alto del interruptor, en píxeles. Fijos y no negociados con el
+#: layout: es una pastilla de dos estados, y una pastilla que se estira deja de
+#: leerse como un mando.
+_SWITCH_W: Final = 38
+_SWITCH_H: Final = 20
+
+
+class Switch(QAbstractButton):
+    """Interruptor deslizante: un mando de encender y apagar, dibujado a mano.
+
+    Existe porque la pestaña de motores tenía un desplegable y un botón para
+    algo que es **por fila** —encender o apagar cada motor—, y porque Qt no
+    trae interruptor: el `QCheckBox` es una casilla y su indicador no se estira
+    desde la hoja de estilos. Aquí se pinta la pista y el botón que viaja de un
+    extremo al otro, con los colores del tema: veinte líneas de pintura valen
+    menos que un SVG incrustado que además no se enteraría de la paleta.
+
+    El contrato de señales importa, y es el de Qt: **`clicked` es del usuario**
+    —se emite al pulsar o con el teclado— y `setChecked` sólo pinta estado, así
+    que quien repuebla una tabla puede fijar el estado sin disparar la acción.
+    Por eso quien conecta lógica escucha `clicked` y no `toggled`.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(_SWITCH_W, _SWITCH_H)
+        self._knob: float = 1.0 if self.isChecked() else 0.0
+        self._viaje = QPropertyAnimation(self, b"knob", self)
+        self._viaje.setDuration(120)
+        self.toggled.connect(self._on_toggled)
+
+    # La posición del botón, de 0 —apagado, a la izquierda— a 1 —encendido, a la
+    # derecha—. Va como propiedad de Qt para que la anime `QPropertyAnimation`:
+    # es lo único que repinta en cada fotograma del viaje.
+    def _get_knob(self) -> float:
+        return self._knob
+
+    def _set_knob(self, value: float) -> None:
+        self._knob = value
+        self.update()
+
+    knob = Property(float, _get_knob, _set_knob)
+
+    def _on_toggled(self, checked: bool) -> None:
+        destino = 1.0 if checked else 0.0
+        if not self.isVisible():
+            # Poblar una tabla no es un gesto del usuario: un interruptor recién
+            # creado nace en su sitio, sin viaje. El viaje es para el clic.
+            self._viaje.stop()
+            self._set_knob(destino)
+            return
+        self._viaje.stop()
+        self._viaje.setStartValue(self._knob)
+        self._viaje.setEndValue(destino)
+        self._viaje.start()
+
+    def enterEvent(self, event: QEnterEvent) -> None:
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event: QEvent) -> None:
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pista = QRectF(0.5, 0.5, float(self.width()) - 1.0, float(self.height()) - 1.0)
+        radio = pista.height() / 2
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self._track_color()))
+        painter.drawRoundedRect(pista, radio, radio)
+
+        diametro = pista.height() - 4
+        recorrido = pista.width() - diametro - 4
+        centro = QPointF(
+            pista.x() + 2 + diametro / 2 + self._knob * recorrido, pista.center().y()
+        )
+        painter.setBrush(QColor(self._knob_color()))
+        painter.drawEllipse(centro, diametro / 2, diametro / 2)
+
+        if self.hasFocus():
+            # El aro de foco va dentro de la pista y cambia con el estado —blanco
+            # sobre el acento, acento sobre el gris— para verse en los dos.
+            tinta = COLOR_ON_ACCENT if self.isChecked() else COLOR_ACCENT
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(tinta), 1))
+            painter.drawRoundedRect(pista.adjusted(2.0, 2.0, -2.0, -2.0), radio, radio)
+
+    def _track_color(self) -> str:
+        if not self.isEnabled():
+            return COLOR_ELEVATED
+        if self.isChecked():
+            return COLOR_ACCENT_HOVER if self.underMouse() else COLOR_ACCENT
+        return COLOR_MUTED if self.underMouse() else COLOR_BORDER_STRONG
+
+    def _knob_color(self) -> str:
+        return COLOR_MUTED if not self.isEnabled() else COLOR_ON_ACCENT
 
 
 class Chip(QLabel):

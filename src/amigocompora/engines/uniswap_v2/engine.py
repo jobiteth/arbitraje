@@ -99,10 +99,11 @@ _log = structlog.get_logger(__name__)
 
 SOURCE_NAME: Final = "AMM V2 (directo)"
 
-#: Deslizamiento tolerado al construir. Es **la única protección** que el payload
-#: lleva contra el movimiento del precio entre que se cotiza y que se mina: el
-#: `amountOutMinimum` sale de aquí. Se aplica sobre la cotización fresca, no sobre
-#: la que se mostró.
+#: Deslizamiento tolerado al construir cuando nadie fija otro. Es **la única
+#: protección** que el payload lleva contra el movimiento del precio entre que se
+#: cotiza y que se mina: el `amountOutMinimum` sale de aquí. Se aplica sobre la
+#: cotización fresca, no sobre la que se mostró. `plan_swap` lo sustituye cuando
+#: llega `slippage_bps` —el deslizamiento que el usuario haya fijado—.
 SLIPPAGE_PCT: Final = Decimal("0.5")
 
 #: Deriva máxima tolerada entre la cotización que el usuario vio y la que hay al
@@ -446,8 +447,18 @@ class UniswapV2Engine:
         return address is not None and address != token_in and address != token_out
 
     # --------------------------------------------------------------- construir #
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction:
+    async def plan_swap(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        slippage_bps: int | None = None,
+    ) -> UnsignedTransaction:
         """Construye la transacción sin firmar del swap que describe `quote`.
+
+        `slippage_bps` fija la tolerancia con la que se calcula el mínimo
+        garantizado; `None` deja el comportamiento de siempre: la constante del
+        módulo.
 
         ### Por qué vuelve a cotizar
 
@@ -514,8 +525,13 @@ class UniswapV2Engine:
         spec = chain(chain_key)
         out_token = quote.pair.quote
         amount_out = TokenAmount(fresh, out_token.decimals, out_token.symbol)
+        slippage = (
+            BasisPoints.from_percent(SLIPPAGE_PCT)
+            if slippage_bps is None
+            else BasisPoints(slippage_bps)
+        )
         minimum = amount_out.scaled_by(
-            EXACT.subtract(Decimal(1), BasisPoints.from_percent(SLIPPAGE_PCT).as_ratio()),
+            EXACT.subtract(Decimal(1), slippage.as_ratio()),
             # Hacia abajo, como el SDK de Uniswap: `amountOutMinimum` no puede
             # quedar por encima de lo que los pools entregan de verdad, porque
             # entonces la transacción revierte y el gas se pierde.
@@ -588,6 +604,7 @@ class UniswapV2Engine:
                 deployment=deployment,
                 amount_out=amount_out,
                 minimum=minimum,
+                slippage=slippage,
                 pays_native=pays_native,
                 receives_native=receives_native,
             ),
@@ -867,6 +884,7 @@ class UniswapV2Engine:
         deployment: Deployment,
         amount_out: TokenAmount,
         minimum: TokenAmount,
+        slippage: BasisPoints,
         pays_native: bool,
         receives_native: bool,
     ) -> str:
@@ -876,8 +894,8 @@ class UniswapV2Engine:
         parts = [
             f"{what} en {quote.venue.name} ({chain(quote.pair.chain).name}): "
             f"entregas {quote.amount_in} y recibes {amount_out} "
-            f"—{minimum} como mínimo, con un {SLIPPAGE_PCT} % de deslizamiento "
-            f"tolerado—.",
+            f"—{minimum} como mínimo, con un {slippage.as_percent():g} % de "
+            f"deslizamiento tolerado—.",
         ]
         if quote.route is None:
             parts.append(

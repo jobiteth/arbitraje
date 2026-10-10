@@ -1206,6 +1206,28 @@ async def test_el_minimo_es_el_de_ahora_y_nunca_por_encima_de_lo_que_el_pool_da(
     assert Decimal("0.5") == v4.SLIPPAGE_PCT
 
 
+async def test_el_deslizamiento_fijado_cambia_el_minimo_del_calldata() -> None:
+    """El mínimo sale de la tolerancia que llega, no de la constante.
+
+    Es donde la tolerancia se convierte en dinero: un mínimo calculado con otra
+    cifra deja al swap expuesto a más deslizamiento del que el usuario aceptó.
+    Se comprueba con la cuenta hecha aparte y contra el mínimo por defecto, para
+    que un motor que ignorara el parámetro no pudiera pasar la prueba.
+    """
+    a_mano = int(
+        (Decimal(SALIDA_500) * (Decimal(1) - Decimal("0.025"))).to_integral_value(
+            rounding=ROUND_DOWN
+        )
+    )
+    payload = await _motor(_Escenario()).plan_swap(
+        _cotizacion(), recipient=DESTINATARIO, slippage_bps=250
+    )
+
+    assert a_mano != MINIMO_DEL_VECTOR
+    assert _palabra_uint(a_mano) in payload.calldata
+    assert "2.5 %" in payload.description
+
+
 async def test_si_el_precio_se_movio_mas_de_lo_tolerado_no_se_construye() -> None:
     """El payload tiene que corresponder al precio que el usuario leyó.
 

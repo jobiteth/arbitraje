@@ -47,6 +47,11 @@ watch_addresses = []
 # suman, así que cotizan todos y se comparan sus precios; el orden de respuesta
 # lo decide la prioridad de cada motor, no el orden de esta lista.
 #
+# La pestaña «Motores» también escribe aquí: encender o apagar un interruptor
+# deja esta tabla —sólo la ranura que cambió— tal como quedó, y eso es lo que
+# arranca la próxima vez. Editar a mano sigue valiendo hasta que el panel toque
+# esa ranura.
+#
 # Para operar de verdad hacen falta motores que sepan construir la transacción
 # —`uniswap_v3`, `uniswap_v4` y `uniswap_v2` lo hacen, contra los contratos y sin
 # clave—, porque `geckoterminal` sólo publica precios y no puede preparar un swap.
@@ -60,6 +65,13 @@ ai_advisor = "stub_advisor"
 # `relay` exige la suya, que se guarda en la pestaña «Motores» → «Credenciales»,
 # así que apilarlo sin ella deja un aviso en el registro y no se activa.
 cross_chain = ["lifi"]
+
+# Nombres de pantalla por motor (opcional). El alias cambia cómo se llama un
+# motor en la interfaz —también se edita con el lápiz de cada fila en la
+# pestaña «Motores»— y nada más: el id, su configuración y lo que hace no
+# cambian. Borrar el alias devuelve el nombre original.
+# [engine_names]
+# uniswap_v3 = "Uniswap V3 (directo)"
 
 # Endpoints RPC por red (opcional). Mínimo privilegio: sólo https salvo hosts
 # locales. La API key del proveedor viaja en la URL, así que nunca uses http.

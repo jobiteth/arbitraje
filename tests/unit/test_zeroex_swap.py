@@ -60,6 +60,7 @@ from amigocompora.engines.zeroex.engine import (
     QUOTE_TAKER,
     QUOTE_URL,
     ROUTERS,
+    SLIPPAGE_BPS,
     SWAP_CHAINS,
     ZeroExEngine,
 )
@@ -422,6 +423,29 @@ async def test_sin_ruta_no_sigue_con_la_cotizacion_vieja() -> None:
     async with _engine(build=True) as engine:
         with pytest.raises(NoQuotesError, match="ya no tiene ruta"):
             await engine.plan_swap(_quote(), recipient=_TAKER)
+
+
+async def test_el_deslizamiento_fijado_viaja_en_la_peticion_y_en_el_texto() -> None:
+    """La tolerancia se le pide a la API en la re-cotización del build.
+
+    Va en los parámetros —y por tanto en la clave de caché—, así que dos
+    tolerancias no comparten cotización; el texto la dice con la cifra efectiva.
+    """
+    route = _mock_quote()
+    async with _engine(build=True) as engine:
+        tx = await engine.plan_swap(_quote(), recipient=_TAKER, slippage_bps=250)
+
+    assert dict(route.calls[-1].request.url.params)["slippageBps"] == "250"
+    assert "2.5 %" in tx.description
+
+
+async def test_sin_deslizamiento_fijado_se_pide_el_del_motor() -> None:
+    """El parámetro es opcional: sin él, la petición queda exactamente igual."""
+    route = _mock_quote()
+    async with _engine(build=True) as engine:
+        await engine.plan_swap(_quote(), recipient=_TAKER)
+
+    assert dict(route.calls[-1].request.url.params)["slippageBps"] == str(SLIPPAGE_BPS)
 
 
 # --------------------------------------------------------------------------- #

@@ -124,6 +124,28 @@ class ExecutionLimitExceededError(ExecutionError):
         super().__init__(f"la operación supera el límite de {limit}: {detail}")
 
 
+class InsufficientBalanceError(ExecutionError):
+    """La cartera no tiene el token que la operación va a entregar.
+
+    No es un fallo técnico: es la cartera enseñando lo que hay. Se comprueba
+    **antes** de aprobar y de estimar, porque aprobar un permiso para un swap
+    que no se puede pagar gasta gas para nada, y el nodo, al estimar, contesta
+    un «execution reverted: STF» que no dice a nadie qué pasa —medido el
+    2026-10-10, con pUSD en Polygon: 0.550579 en la cartera y un swap de
+    1 pUSD—. El mensaje lleva las dos cifras tal como se ven en la interfaz,
+    porque la salida —reducir el importe o traer saldo— la decide el usuario.
+    """
+
+    def __init__(self, available: str, required: str) -> None:
+        self.available = available
+        self.required = required
+        super().__init__(
+            f"no hay saldo para esta operación: tu cartera tiene {available} y "
+            f"la operación mueve {required}. Reduce el importe o trae saldo: no "
+            f"se aprobó ni se firmó nada."
+        )
+
+
 class BroadcastError(ExecutionError):
     """La transacción se firmó pero la red no la aceptó.
 

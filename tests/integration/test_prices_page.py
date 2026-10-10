@@ -22,30 +22,33 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import cast
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
+import tomlkit
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 from amigocompora.app.container import Container, build_container
 from amigocompora.app.execution_policy import LedgerEntry
 from amigocompora.app.usecases.estimate_cost import NetworkCost
-from amigocompora.app.usecases.prepare_swap import PreparedSwap, PrepareSwap
+from amigocompora.app.usecases.execute_swap import StepState, StepUpdate, SwapStep
 from amigocompora.domain.addresses import shorten
+from amigocompora.domain.errors import ConfirmationDeniedError, ExecutionError
 from amigocompora.domain.models import (
+    BroadcastReceipt,
     BroadcastStatus,
     PriceComparison,
     Quote,
     Token,
     TradingPair,
-    UnsignedTransaction,
     Venue,
     VenueKind,
 )
@@ -59,6 +62,7 @@ from amigocompora.infra.secrets import (
     app_secret_key,
     secret_key,
 )
+from amigocompora.ui.pages import prices as prices_module
 from amigocompora.ui.pages.prices import PricesPage
 from amigocompora.ui.route_list import RouteCard
 from amigocompora.ui.theme import COLOR_MUTED, COLOR_WARNING, STYLESHEET
@@ -342,9 +346,6 @@ async def test_the_button_is_off_and_the_screen_says_why() -> None:
         nota = page._exec_note.text()
         assert nota.startswith("No se puede ejecutar:")
         assert "OBSERVACIÓN" in nota
-        # Y el botón de preparar sigue disponible: el camino que no firma no
-        # depende de nada de esto.
-        assert page._swap_btn.isEnabled() is True
 
 
 # --------------------------------------------------------------------------- #
@@ -381,8 +382,6 @@ async def test_el_tope_por_operacion_apaga_el_boton_antes_de_pulsarlo() -> None:
         nota = page._exec_note.text()
         assert "importe por operación" in nota
         assert _SALIDA_DE_LA_COMPARACION in nota
-        # Y el camino que no firma sigue abierto: preparar el payload no gasta.
-        assert page._swap_btn.isEnabled() is True
 
 
 async def test_el_tope_diario_cuenta_lo_que_ya_se_gasto() -> None:
@@ -903,7 +902,7 @@ async def test_con_el_ajuste_encendido_la_lista_solo_ensena_lo_firmable() -> Non
         elegida = page._selected_quote()
         assert elegida is not None
         assert elegida.engine_id == "uniswap"
-        assert page._swap_btn.isEnabled() is True
+        assert page._exec_btn.isEnabled() is True
 
 
 async def test_si_todo_lo_que_se_cotizo_solo_cotiza_la_lista_lo_dice() -> None:
@@ -973,12 +972,16 @@ async def test_cambiar_el_importe_vacia_lo_viejo_en_el_acto() -> None:
             if tarjeta.quote is not None and tarjeta.quote.engine_id == "uniswap":
                 page._routes.select_row(fila)
                 break
-        assert page._swap_btn.isEnabled() is True
+        assert page._exec_btn.isEnabled() is True
 
-        # Como si se hubiera preparado el swap: el borrador también es de lo
-        # anterior y no puede sobrevivir al cambio.
-        page._prepared = _preparado(_COSTE, None).transaction
-        page._save_btn.setEnabled(True)
+        # Como si la operación anterior hubiera terminado en esta ruta: el
+        # desenlace y su lista son de lo anterior y no pueden sobrevivir al
+        # cambio. Se simula el estado terminal directamente —el recorrido
+        # completo se prueba en su propia prueba— porque lo que se mide aquí es
+        # que el cambio de importe lo retira.
+        page._exec_done = True
+        page._executed_quote = page._selected_quote()
+        page._exec_btn.setText("✓ Completado")
 
         # El importe cambia: lo de antes describía otro número.
         page._card.amount.setValue(page._card.amount.value() + 1)
@@ -988,12 +991,11 @@ async def test_cambiar_el_importe_vacia_lo_viejo_en_el_acto() -> None:
         assert page._detail.isHidden() is True
         assert page._route_count.text() == ""
         assert page._chosen.text() == ""
-        assert page._swap_btn.isEnabled() is False
-        # Con `cast` a propósito: mypy mantiene la deducción del borrador que se
-        # asignó unas líneas antes —nadie lo reasigna en este ámbito— y no ve
-        # que quien lo vacía es la propia página, por dentro de la señal de Qt.
-        assert cast("UnsignedTransaction | None", page._prepared) is None
-        assert page._save_btn.isEnabled() is False
+        assert page._exec_btn.isEnabled() is False
+        # Y el desenlace de la operación anterior no se queda pegado al botón:
+        # volvía a decir «✓ Completado» sobre una ruta que ya no está.
+        assert page._exec_btn.text() == "Ejecutar: firmar y emitir…"
+        assert page._exec_done is False
         assert "Cotizando" in page._routes_empty.text()
         assert page._routes_empty.text() == page._opps_empty.text()
 
@@ -1105,12 +1107,11 @@ async def test_el_panel_ensena_la_ruta_elegida_con_lo_que_no_se_veia() -> None:
         assert cartera is not None
         assert detalle["cartera"].text() == shorten(cartera)
         assert detalle["cartera"].toolTip() == cartera
-        # El deslizamiento: la tolerancia configurada, dicha como es —no cambia
-        # lo que el swap acepta, que lo fija cada motor al construir—.
-        assert detalle["deslizamiento"].text() == (
-            f"{container.settings.execution.slippage_bps} bps"
-        )
-        assert "execution.slippage_bps" in detalle["deslizamiento"].toolTip()
+        # El deslizamiento: la tolerancia **viva** —la que el engranaje cambia y
+        # con la que se construye el swap—, no la que traía la configuración al
+        # arrancar.
+        assert detalle["deslizamiento"].text() == f"{container.slippage.bps} bps"
+        assert "engranaje" in detalle["deslizamiento"].toolTip()
 
 
 #: Un coste de red con la forma del de verdad: 21 000 de gas a 1 gwei son
@@ -1123,36 +1124,16 @@ _COSTE = NetworkCost(
 )
 
 
-def _preparar_con(
-    monkeypatch: pytest.MonkeyPatch, resultado: PreparedSwap
-) -> None:
-    """Sustituye **la llamada** del caso de uso, no el caso de uso entero.
-
-    `can_build` se deja el de verdad —responde el registro de motores—: lo que
-    se prueba es que la página lee el desenlace del coste, no qué rutas son
-    firmables, y falsear también esa mitad dejaría la prueba midiendo al doble
-    en lugar de a la página.
-    """
-
-    async def preparar(
-        self: PrepareSwap, quote: Quote, *, recipient: str, sender: str | None = None
-    ) -> PreparedSwap:
-        return resultado
-
-    monkeypatch.setattr(PrepareSwap, "__call__", preparar)
-
-
-def _preparado(coste: NetworkCost | None, error: str | None) -> PreparedSwap:
-    """Un borrador con el desenlace de coste que se quiera medir."""
-    return PreparedSwap(
-        transaction=UnsignedTransaction(
-            chain_id=8453,
-            to_address="0x2626664c2603336E57B271c5C0b26F421741e481",
-            calldata="0xdeadbeef",
-            value=TokenAmount(raw=0, decimals=18, symbol="ETH"),
-            description="Swap de prueba",
-        ),
-        network_cost=coste,
+def _paso_de_coste(
+    coste: NetworkCost | None, error: str | None, *, detail: str = ""
+) -> StepUpdate:
+    """El aviso del paso ESTIMATE, con el desenlace de coste que se quiera medir."""
+    return StepUpdate(
+        step=SwapStep.ESTIMATE,
+        state=StepState.DONE,
+        title="Coste de red",
+        detail=detail,
+        cost=coste,
         cost_error=error,
     )
 
@@ -1169,13 +1150,12 @@ def _preparado(coste: NetworkCost | None, error: str | None) -> PreparedSwap:
             "no se pudo estimar",
             COLOR_WARNING,
         ),
-        # No aplica —una transacción de Solana—: raya en gris apagado, que no es
-        # un cero ni una cifra.
+        # No se intentó —una transacción de Solana, o sin estimador—: raya en
+        # gris apagado, que no es un cero ni tampoco un fallo.
         (None, None, "—", COLOR_MUTED),
     ],
 )
 async def test_el_coste_de_red_del_panel_cuenta_el_desenlace(
-    monkeypatch: pytest.MonkeyPatch,
     coste: NetworkCost | None,
     error: str | None,
     esperado: str,
@@ -1184,10 +1164,11 @@ async def test_el_coste_de_red_del_panel_cuenta_el_desenlace(
     """Los tres desenlaces del coste, y ninguno disfrazado de cero.
 
     La fila empieza en «se estima al preparar» —la cifra es una llamada a la red
-    por ruta y no se hace al comparar precios— y al preparar enseña lo que
-    devolvió el caso de uso. Lo que no puede pasar es que un fallo de estimación
-    tumbe la preparación ni que el hueco se rellene con un cero: el borrador
-    sale igual y el motivo se lee en el tooltip.
+    por ruta y no se hace al comparar precios— y la rellena el paso ESTIMATE de
+    la ejecución, que es donde la estimación vive ahora. Lo que no puede pasar
+    es que un fallo de estimación tumbe la operación ni que el hueco se rellene
+    con un cero: el motivo se lee en el tooltip, y «se intentó y no salió» se
+    distingue de «no se intentó», que no son el mismo desenlace.
     """
     async with _pagina(
         modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
@@ -1197,8 +1178,10 @@ async def test_el_coste_de_red_del_panel_cuenta_el_desenlace(
         page._routes.select_row(0)
         assert page._detail.values["coste"].text() == "se estima al preparar"
 
-        _preparar_con(monkeypatch, _preparado(coste, error))
-        await page._do_prepare(page._shown_quotes[0], page._owner())
+        page._on_step(
+            _paso_de_coste(coste, error, detail="lo que quedó en la lista"),
+            page._shown_quotes[0],
+        )
 
         etiqueta = page._detail.values["coste"]
         assert etiqueta.text() == esperado
@@ -1207,13 +1190,9 @@ async def test_el_coste_de_red_del_panel_cuenta_el_desenlace(
         assert etiqueta.styleSheet() == (f"color: {color};" if color else "")
         if error is not None:
             assert error in etiqueta.toolTip()
-        # Y el borrador queda preparado igual: el coste es información, no un muro.
-        assert page._save_btn.isEnabled() is True
 
 
-async def test_el_coste_estimado_no_sobrevive_a_cambiar_de_ruta(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_el_coste_estimado_no_sobrevive_a_cambiar_de_ruta() -> None:
     """La cifra es de **una** ruta: al elegir otra vuelve a «se estima al preparar».
 
     Dejar escrita la estimación de otro swap al lado de la ruta nueva sería
@@ -1230,8 +1209,9 @@ async def test_el_coste_estimado_no_sobrevive_a_cambiar_de_ruta(
         page._fill_routes(page._comparison)
         page._routes.select_row(0)
 
-        _preparar_con(monkeypatch, _preparado(_COSTE, None))
-        await page._do_prepare(page._shown_quotes[0], page._owner())
+        page._on_step(
+            _paso_de_coste(_COSTE, None), page._shown_quotes[0]
+        )
         assert page._detail.values["coste"].text() == "≈ 0.000021 ETH"
 
         page._routes.select_row(1)
@@ -1251,3 +1231,462 @@ async def test_el_boton_de_invertir_se_lee_sin_depender_de_la_fuente() -> None:
     ) as (_, page):
         assert page._invert_btn.text().isalpha()
         assert page._invert_btn.toolTip()
+
+
+# --------------------------------------------------------------------------- #
+# El botón único: la narración en vivo y la lista de lo que pasó de verdad
+# --------------------------------------------------------------------------- #
+#: Los hashes de las tres transacciones que emite una operación encadenada por
+#: Permit2: los dos permisos y el swap. Son inventados y con la forma exacta de
+#: los de verdad —«0x» y 64 dígitos— porque el recibo y la lista los validan al
+#: pintarlos, y un hash inválido estaría midiendo una pantalla que no es la real.
+_HASH_DEL_PERMISO = "0x" + "1a" * 32
+_HASH_DE_PERMIT2 = "0x" + "2b" * 32
+_HASH_DEL_SWAP = "0x" + "3c" * 32
+
+#: La operación narrada **como la narra `ExecuteSwap`**: los títulos son los
+#: suyos, copiados de `execute_swap.py` —donde los fija `test_execute_swap.py`
+#: contra nodos falsos—, y el orden es el de una ejecución encadenada de verdad:
+#: preparar, permiso del ERC-20, permiso en Permit2, coste de red y swap.
+_OPERACION = (
+    StepUpdate(SwapStep.PREPARE, StepState.RUNNING, "Preparando el swap…"),
+    StepUpdate(SwapStep.PREPARE, StepState.DONE, "Swap preparado"),
+    StepUpdate(SwapStep.APPROVE, StepState.RUNNING, "Aprobando pUSD (1 de 2)…"),
+    StepUpdate(
+        SwapStep.APPROVE,
+        StepState.DONE,
+        "Permiso de pUSD (1 de 2)",
+        tx_hash=_HASH_DEL_PERMISO,
+    ),
+    StepUpdate(
+        SwapStep.APPROVE_PERMIT2,
+        StepState.RUNNING,
+        "Aprobando pUSD en Permit2 (2 de 2)…",
+    ),
+    StepUpdate(
+        SwapStep.APPROVE_PERMIT2,
+        StepState.DONE,
+        "Permiso de pUSD en Permit2 (2 de 2)",
+        tx_hash=_HASH_DE_PERMIT2,
+    ),
+    StepUpdate(SwapStep.ESTIMATE, StepState.RUNNING, "Estimando el coste de red…"),
+    StepUpdate(SwapStep.ESTIMATE, StepState.DONE, "Coste de red", cost=_COSTE),
+    StepUpdate(SwapStep.SWAP, StepState.RUNNING, "Esperando tu confirmación…"),
+    StepUpdate(SwapStep.SWAP, StepState.RUNNING, "Firmando y emitiendo…"),
+    StepUpdate(SwapStep.SWAP, StepState.DONE, "Swap en fake", tx_hash=_HASH_DEL_SWAP),
+)
+
+#: El desenlace del primer permiso cuando el usuario dice que no en su diálogo:
+#: el paso queda rechazado y el caso de uso vuelve a lanzar la negativa.
+_RECHAZO_DEL_PERMISO = (
+    *_OPERACION[:3],
+    StepUpdate(
+        SwapStep.APPROVE,
+        StepState.REJECTED,
+        "Permiso de pUSD (1 de 2)",
+        detail="lo rechazaste en el diálogo: no se firmó nada",
+    ),
+)
+
+#: El desenlace de un permiso que minó en rojo: el paso queda fallado y el caso
+#: de uso lanza el error —que es la mitad que un rechazo no tiene—.
+_FALLO_DEL_PERMISO = (
+    *_OPERACION[:3],
+    StepUpdate(
+        SwapStep.APPROVE,
+        StepState.FAILED,
+        "Permiso de pUSD (1 de 2)",
+        detail="la transacción no llegó a buen término (reverted)",
+        tx_hash=_HASH_DEL_PERMISO,
+    ),
+)
+
+#: El recibo de la operación que salió bien, con la forma del que da el nodo.
+_RECIBO = BroadcastReceipt(
+    tx_hash=_HASH_DEL_SWAP,
+    chain="base",
+    status=BroadcastStatus.SUCCESS,
+    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+)
+
+
+class _EjecucionSimulada:
+    """Un `ExecuteSwap` de mentira que cuenta la operación como la cuenta el real.
+
+    Sustituye a `container.execute_swap` para poder recorrer la pantalla entera
+    —botón, lista y desenlaces— sin firmar nada: lo que se prueba aquí es la
+    interfaz, y la narración de verdad ya tiene sus pruebas contra nodos falsos
+    en `test_execute_swap.py`. `textos` guarda lo que el botón decía **tras cada
+    aviso**, que es la única forma de medir «va contando a medida que avanza»:
+    la narración ocurre dentro de la llamada y al volver sólo quedaría el final.
+    """
+
+    def __init__(
+        self,
+        page: PricesPage,
+        *,
+        pasos: tuple[StepUpdate, ...] = _OPERACION,
+        desenlace: BaseException | None = None,
+    ) -> None:
+        self._page = page
+        self._pasos = pasos
+        self._desenlace = desenlace
+        self.textos: list[str] = []
+
+    async def __call__(
+        self, quote: Quote, *, recipient: str, on_step: Callable[[StepUpdate], None]
+    ) -> BroadcastReceipt:
+        for update in self._pasos:
+            on_step(update)
+            self.textos.append(self._page._exec_btn.text())
+        if self._desenlace is not None:
+            raise self._desenlace
+        return _RECIBO
+
+
+async def test_el_boton_narra_cada_fase_y_acaba_en_completado(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un solo botón que va contando la operación de verdad, fase a fase.
+
+    Es lo que sustituye a la antigua cadena de botones —«Preparar», «Guardar»,
+    «Ejecutar»—: una pulsación arranca la operación entera y el texto del botón
+    sigue al último paso que empezó, que es lo que deja ver el avance sin abrir
+    nada. Cada paso «terminado» no retrocede el texto —el botón dice en qué se
+    está, no lo último que acabó— y al final queda el estado terminal con su
+    hash, con el botón apagado: terminado no es reintentable sin empezar de
+    nuevo.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+        ruta = page._selected_quote()
+
+        doble = _EjecucionSimulada(page)
+        monkeypatch.setattr(container, "execute_swap", doble)
+
+        page._on_execute()
+
+        # Nada más pulsar, la pantalla ya dice que la operación arrancó: el
+        # botón se apaga —no se puede lanzar dos veces— y la línea avisa de que
+        # cada transacción pedirá su propio «sí».
+        assert page._exec_btn.isEnabled() is False
+        assert page._exec_btn.text() == "Preparando el swap…"
+        assert "cada transacción pedirá su propia confirmación" in page._status.text()
+
+        await asyncio.sleep(0.05)
+
+        # El botón recorrió los títulos de los pasos que empezaron, en orden y
+        # sin saltarse ninguno: la secuencia sin repetir es la de los `RUNNING`.
+        empezados = [
+            update.title for update in _OPERACION if update.state is StepState.RUNNING
+        ]
+        assert list(dict.fromkeys(doble.textos)) == empezados
+        # Y los «terminado» no reescriben el texto: tras el DONE de preparar, el
+        # botón sigue diciendo en qué estaba.
+        assert doble.textos[1] == "Preparando el swap…"
+        # Igual tras el último DONE —el «✓ Completado» lo pone el desenlace—.
+        assert doble.textos[-1] == "Firmando y emitiendo…"
+
+        # El desenlace: estado terminal, con el hash a la vista y sin poder
+        # volver a pulsar el mismo botón.
+        assert page._exec_btn.text() == "✓ Completado"
+        assert page._exec_btn.isEnabled() is False
+        assert page._exec_done is True
+        assert page._executed_quote is ruta
+        assert page._status.text() == f"Emitida {_HASH_DEL_SWAP} · estado success."
+        # La lista quedó con una fila por paso real, con su glifo y su título.
+        assert page._steps.steps() == (
+            SwapStep.PREPARE,
+            SwapStep.APPROVE,
+            SwapStep.APPROVE_PERMIT2,
+            SwapStep.ESTIMATE,
+            SwapStep.SWAP,
+        )
+        assert page._steps.glyph_of(SwapStep.SWAP) == "✓"
+        assert page._steps.title_of(SwapStep.SWAP) == "Swap en fake"
+        # El coste de red que narró el paso ESTIMATE acabó en el panel.
+        assert page._detail.values["coste"].text() == "≈ 0.000021 ETH"
+        # Y «Empezar de nuevo» está a la vista para poder barrer el relato.
+        assert page._new_btn.isHidden() is False
+
+
+async def test_un_rechazo_devuelve_el_boton_sin_llamarlo_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decir que no en un diálogo no es una avería, y la pantalla no puede mentir.
+
+    El caso que enseñó a separar los dos desenlaces: el usuario rechaza la
+    primera aprobación —que es lo correcto si no lo tiene claro— y la pantalla
+    respondía «Error: …», empujando a tratar una decisión legítima como algo que
+    hay que arreglar. El rechazo vuelve al botón de ejecutar —reintentable: los
+    permisos ya concedidos se reaprovechan— y queda **listado** como paso
+    rechazado, que es parte del relato de lo que pasó.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+
+        doble = _EjecucionSimulada(
+            page,
+            pasos=_RECHAZO_DEL_PERMISO,
+            desenlace=ConfirmationDeniedError("rechazaste la aprobación"),
+        )
+        monkeypatch.setattr(container, "execute_swap", doble)
+
+        page._on_execute()
+        await asyncio.sleep(0.05)
+
+        assert page._status.text() == "Cancelaste la operación. No se firmó ni se emitió nada."
+        assert "Error" not in page._status.text()
+        assert page._exec_btn.text() == "Ejecutar: firmar y emitir…"
+        assert page._exec_btn.isEnabled() is True
+        assert page._exec_done is False
+        # El rechazo se lista con su motivo: la lista cuenta la historia entera.
+        assert page._steps.glyph_of(SwapStep.APPROVE) == "✕"
+        assert page._new_btn.isHidden() is False
+
+
+async def test_un_fallo_al_emitir_se_cuenta_como_error_y_el_boton_vuelve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un fallo de verdad —la transacción no llegó a buen término— sí es un error.
+
+    La otra cara del rechazo: aquí sí hubo algo que arreglar (el permiso minó
+    en rojo), y la línea de estado lo dice con el motivo. El botón vuelve a su
+    sitio igual —se puede reintentar— pero la lista deja el paso fallado con su
+    hash, que es lo que hace falta para mirarlo en el explorador.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+
+        doble = _EjecucionSimulada(
+            page,
+            pasos=_FALLO_DEL_PERMISO,
+            desenlace=ExecutionError("la aprobación de pUSD no llegó a buen término (reverted)"),
+        )
+        monkeypatch.setattr(container, "execute_swap", doble)
+
+        page._on_execute()
+        await asyncio.sleep(0.05)
+
+        assert page._status.text().startswith("Error: ")
+        assert "no llegó a buen término" in page._status.text()
+        assert page._exec_btn.text() == "Ejecutar: firmar y emitir…"
+        assert page._exec_btn.isEnabled() is True
+        assert page._exec_done is False
+        assert page._steps.glyph_of(SwapStep.APPROVE) == "✕"
+        assert page._new_btn.isHidden() is False
+
+
+async def test_empezar_de_nuevo_barre_el_relato_y_deja_el_boton_listo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminada la operación, «Empezar de nuevo» devuelve la pantalla al inicio.
+
+    Barre lo único que sobra tras una operación —los pasos, que ya cumplieron su
+    función de contar qué pasó— y no toca la cotización ni la ruta elegida: el
+    usuario sigue donde estaba, con el botón como recién llegado para hacer otro
+    swap sobre la misma ruta. El click se da sobre el botón de verdad, que es lo
+    que prueba que está conectado y no sólo pintado.
+    """
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+
+        monkeypatch.setattr(container, "execute_swap", _EjecucionSimulada(page))
+        page._on_execute()
+        await asyncio.sleep(0.05)
+        assert page._exec_btn.text() == "✓ Completado"
+        assert page._steps.steps() != ()
+
+        page._new_btn.click()
+
+        assert page._steps.steps() == ()
+        # `isHidden()` y no `isVisible()`: la ventana nunca se ha mostrado, así
+        # que lo que se afirma es que el panel se ocultó, no que se haya pintado.
+        assert page._steps.isHidden() is True
+        assert page._new_btn.isHidden() is True
+        assert page._exec_btn.text() == "Ejecutar: firmar y emitir…"
+        assert page._exec_btn.isEnabled() is True
+        assert page._exec_done is False
+        assert page._executed_quote is None
+        assert page._status.text() == ""
+        # Y la ruta sigue elegida: volver al estado inicial no es perder el sitio.
+        assert page._selected_quote() is not None
+        assert page._detail.isHidden() is False
+
+
+# --------------------------------------------------------------------------- #
+# El engranaje: la tolerancia con la que se construyen los swaps
+# --------------------------------------------------------------------------- #
+#: La configuración que encontrará el engranaje al guardar, con un comentario y
+#: claves que no son suyas: la escritura edita la tabla `[execution]`, no la
+#: recrea, y esto lo mide.
+_CONFIG_CON_EJECUCION = """\
+# Comentario que debe sobrevivir.
+mode = "execution"
+
+[execution]
+enabled = true
+max_value_usd = 250
+"""
+
+
+class _SlippageFalso:
+    """Un `SlippageDialog` de mentira: contesta sin abrir nada.
+
+    Mismo patrón que los dobles de diálogo del resto de la suite —la retirada
+    falsa de `test_wallet_page.py`—: se sustituye la clase en el módulo de la
+    página, se anota con qué valor vigente se abrió y se contesta lo que la
+    prueba pida por las clases, para poder medir el guardado y la cancelación
+    con el mismo doble.
+    """
+
+    Accepted = QDialog.DialogCode.Accepted
+    respuesta: QDialog.DialogCode = QDialog.DialogCode.Accepted
+    elegido = 250
+    abiertos: ClassVar[list[int]] = []
+
+    def __init__(self, bps: int, parent: object = None) -> None:
+        _SlippageFalso.abiertos.append(bps)
+
+    def exec(self) -> QDialog.DialogCode:
+        return _SlippageFalso.respuesta
+
+    def value_bps(self) -> int:
+        return _SlippageFalso.elegido
+
+
+def _enganchar_engranaje(
+    monkeypatch: pytest.MonkeyPatch, archivo: Path, *, cancelar: bool = False
+) -> type[_SlippageFalso]:
+    """Deja el engranaje apuntando al doble y a un `config.toml` de verdad.
+
+    El archivo es el de `tmp_path`: `_on_slippage` escribe en el `config.toml`
+    de verdad —no se dobla el escritor, porque lo que se prueba es que la
+    escritura ocurre—, pero nunca en el de la máquina que corre las pruebas.
+    """
+    _SlippageFalso.abiertos.clear()
+    monkeypatch.setattr(
+        _SlippageFalso,
+        "respuesta",
+        QDialog.DialogCode.Rejected if cancelar else QDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(prices_module, "SlippageDialog", _SlippageFalso)
+    monkeypatch.setattr(prices_module, "config_file", lambda: archivo)
+    return _SlippageFalso
+
+
+async def test_el_engranaje_aplica_el_deslizamiento_y_lo_guarda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El número del diálogo pasa a la copia viva, a la pantalla y al archivo.
+
+    Las tres a la vez porque las tres son la misma promesa: que lo que se firma
+    usa esa tolerancia. `config.toml` se escribe de verdad —contra un archivo de
+    `tmp_path`— porque el fallo que esta prueba existe para impedir es el de un
+    engranaje que cambia una etiqueta y no el número: la tolerancia viaja al
+    motor al construir el swap, y eso lo fija `test_prepare_swap.py`.
+    """
+    archivo = tmp_path / "config.toml"
+    archivo.write_text(_CONFIG_CON_EJECUCION, encoding="utf-8")
+
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        page._comparison = _comparison(_pair())
+        page._fill_routes(page._comparison)
+        page._routes.select_row(0)
+        assert container.slippage.bps == 50
+
+        _enganchar_engranaje(monkeypatch, archivo)
+        # El click va sobre el engranaje de verdad: lo que se comprueba es la
+        # cadena «pulsar → señal → diálogo», no que el método sepa guardar.
+        page._card._slippage_btn.click()
+
+        # El diálogo se abrió con el valor vigente, no con el de fábrica.
+        assert _SlippageFalso.abiertos == [50]
+        # La copia viva —la que lee el constructor del swap— cambió.
+        assert container.slippage.bps == 250
+        # El engranaje enseña el valor nuevo sin tener que abrir nada.
+        assert "2.5 %" in page._card._slippage_btn.toolTip()
+        # El panel de detalle repinta su fila con el valor vigente.
+        assert page._detail.values["deslizamiento"].text() == "250 bps"
+        # Y quedó guardado sin llevarse por delante lo que no era suyo.
+        texto = archivo.read_text(encoding="utf-8")
+        assert tomlkit.parse(texto)["execution"]["slippage_bps"] == 250
+        assert "# Comentario que debe sobrevivir." in texto
+        assert "max_value_usd = 250" in texto
+        # La línea de estado lo dice, en la unidad que se escribió.
+        assert page._status.text().startswith("Deslizamiento por defecto: 2.5 %")
+
+
+async def test_cancelar_el_engranaje_no_cambia_nada(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decir que no en el engranaje deja la tolerancia y el archivo como estaban.
+
+    Cancelar es la salida honesta del diálogo, así que no puede quedar ni un
+    rastro: ni la copia viva, ni el archivo, ni una línea de estado prometiendo
+    algo que no pasó.
+    """
+    archivo = tmp_path / "config.toml"
+    archivo.write_text(_CONFIG_CON_EJECUCION, encoding="utf-8")
+
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        _enganchar_engranaje(monkeypatch, archivo, cancelar=True)
+
+        page._card._slippage_btn.click()
+
+        assert _SlippageFalso.abiertos == [50]
+        assert container.slippage.bps == 50
+        assert archivo.read_text(encoding="utf-8") == _CONFIG_CON_EJECUCION
+        assert not archivo.with_name("config.toml.bak").exists()
+        assert page._status.text() == ""
+
+
+async def test_si_el_guardado_falla_se_dice_y_la_tolerancia_rige_la_sesion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La escritura que falla se cuenta; callarla dejaría al usuario creyendo que sí.
+
+    El valor **sí** rige esta sesión —vive en la copia viva, que es la que lee el
+    motor—, y eso es cierto y se aplica; lo que no puede es darse por guardado.
+    El aviso dice las dos cosas: que no se pudo escribir y que vale hasta cerrar.
+    """
+    archivo = tmp_path / "config.toml"
+    archivo.write_text(_CONFIG_CON_EJECUCION, encoding="utf-8")
+
+    def _revienta(path: Path, bps: int) -> None:
+        raise OSError("disco lleno")
+
+    async with _pagina(
+        modo=OperationMode.EXECUTION, con_cartera=True, con_planificador=True
+    ) as (container, page):
+        _enganchar_engranaje(monkeypatch, archivo)
+        monkeypatch.setattr(prices_module, "set_execution_slippage_bps", _revienta)
+
+        page._card._slippage_btn.click()
+
+        # Se aplicó en el acto: la tolerancia de esta sesión es la nueva.
+        assert container.slippage.bps == 250
+        assert "No se pudo guardar en config.toml" in page._status.text()
+        assert "esta sesión" in page._status.text()
+        # Y el archivo quedó como estaba: no hay guardado a medias.
+        assert archivo.read_text(encoding="utf-8") == _CONFIG_CON_EJECUCION

@@ -8,12 +8,13 @@ toman las decisiones.
    y debajo las dos patas del par con su token, su importe y su saldo.
 2. **Las rutas.** Lo que contestaron los motores, con la comisión y el impacto de
    cada uno, y la ruta elegida escrita en una línea.
-3. **Lo que se puede hacer con ella.** Dos caminos de consecuencias opuestas y por
-   eso dos botones distintos: *Preparar swap* construye el payload y lo confirma
-   —no firma nada, y el resultado se puede guardar y firmar en otra cartera—, y
-   *Ejecutar* firma y emite. Están separados —y no en uno solo con una casilla—
-   porque la diferencia no es un grado: uno produce un fichero y el otro produce
-   una transacción en la red.
+3. **Lo que se puede hacer con ella.** Un solo botón, *Ejecutar*, que hace la
+   operación entera —preparar, pedir los permisos que falten, estimar el coste,
+   firmar y emitir— narrando cada fase en tiempo real hasta quedar en
+   «✓ Completado». Cada transacción real sigue pidiendo su propio «sí» en su
+   diálogo: lo que se quitó no es esa regla, es tener un botón por fase. Al
+   terminar, el panel de transacciones enseña qué se emitió, qué se rechazó y
+   con qué hash.
 
 ### Qué es de esta página y qué es de la tarjeta
 
@@ -36,15 +37,12 @@ revés.
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -52,10 +50,12 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
 from amigocompora.app.container import Container
+from amigocompora.app.usecases.execute_swap import StepState, StepUpdate, SwapStep
 from amigocompora.app.usecases.scan_opportunities import DEFAULT_MIN_NET_BPS
 from amigocompora.domain.chains import CHAINS
 from amigocompora.domain.errors import (
@@ -64,7 +64,6 @@ from amigocompora.domain.errors import (
 from amigocompora.domain.models import (
     BroadcastReceipt,
     Opportunity,
-    PlannedTransaction,
     PriceComparison,
     Quote,
     Token,
@@ -72,6 +71,8 @@ from amigocompora.domain.models import (
 )
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import BasisPoints
+from amigocompora.infra.config import config_file
+from amigocompora.infra.config_writer import set_execution_slippage_bps
 from amigocompora.ui.execution_gate import (
     cap_blockers,
     execution_blockers,
@@ -82,6 +83,8 @@ from amigocompora.ui.pages.swap_card import SwapCard, position_of
 from amigocompora.ui.pages.token_picker import TokenPickerDialog
 from amigocompora.ui.receipt_dialog import SwapReceiptDialog
 from amigocompora.ui.route_list import RouteDetail, RouteList
+from amigocompora.ui.slippage_dialog import SlippageDialog
+from amigocompora.ui.swap_steps import SwapStepsPanel
 from amigocompora.ui.theme import COLOR_DANGER
 from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import (
@@ -92,18 +95,15 @@ from amigocompora.ui.widgets import (
     tokens_for_chain,
 )
 
-#: Aviso que acompaña a todo payload exportado. Va dentro del fichero y no sólo en
-#: la pantalla: el fichero sobrevive a la sesión y viaja a otro sitio, y quien lo
-#: abra tiene que saber qué tiene entre manos.
-#:
-#: Dice **de este documento** y no de la aplicación, que es la corrección que hizo
-#: falta al añadir la ejecución: «Amigocompora no firma ni emite transacciones» era
-#: verdad cuando este texto se escribió y dejó de serlo. Lo que sigue siendo cierto
-#: pase lo que pase es que un fichero no firma nada por sí solo.
-_UNSIGNED_NOTICE = (
-    "Payload SIN FIRMAR: este documento no es una transacción emitida, y guardarlo "
-    "no emite nada. Revísalo y fírmalo con tu propia cartera."
-)
+#: Lo que dice el botón de operar cuando no hay nada en marcha. Es también el
+#: texto al que vuelve tras un rechazo o un fallo: el intento no consumió nada
+#: —lo ya concedido se reaprovecha—, así que se puede volver a pulsar.
+_EXEC_LABEL = "Ejecutar: firmar y emitir…"
+
+#: Lo que dice cuando la operación llegó al final por el camino bueno. Se queda
+#: puesto hasta que el usuario elige otra ruta o pulsa «Empezar de nuevo»: el
+#: desenlace era de la ruta que se firmó, y decirlo al lado de otra engañaría.
+_DONE_LABEL = "✓ Completado"
 
 #: Lo que dice la tabla de rutas cuando aún no se ha pedido nada. Se escribe aquí y
 #: no en el widget para que el mismo texto valga para el estado inicial y para el
@@ -139,12 +139,22 @@ class PricesPage(QWidget):
         #: `[ui] hide_quote_only_routes` las que no se pueden firmar no llegan a
         #: la tabla, y la selección tiene que apuntar a lo que sí se ve.
         self._shown_quotes: tuple[Quote, ...] = ()
-        self._prepared: PlannedTransaction | None = None
-        #: La ruta de la que salió `_prepared`. El panel de detalle reinicia su
-        #: coste al cambiar de ruta —la estimación era de otra— salvo cuando la
-        #: ruta elegida es justo ésta, que es el caso que se da al volver de
-        #: `_do_prepare` con la cifra recién estimada.
-        self._prepared_quote: Quote | None = None
+        #: La ruta cuyo coste de red se acaba de estimar. El panel de detalle
+        #: reinicia su coste al cambiar de ruta —la cifra era de otra— salvo
+        #: cuando la ruta elegida es ésta, que es el caso que se da al volver de
+        #: `_do_execute` con la estimación recién puesta por el paso ESTIMATE.
+        self._cost_quote: Quote | None = None
+        #: La operación en marcha. Mientras esté puesta, el botón narra y no se
+        #: puede volver a pulsar; el estado vive aquí y no en el botón porque
+        #: quien lo repinta —`_on_quote_selected`— corre en cada cambio de ruta.
+        self._exec_running = False
+        #: La operación terminó por el camino bueno y sigue en pantalla. El botón
+        #: queda en «✓ Completado» —apagado— hasta que se elija otra ruta o se
+        #: pulse «Empezar de nuevo».
+        self._exec_done = False
+        #: La ruta que produjo ese desenlace. Es la identidad que decide si el
+        #: estado terminal sigue siendo cierto para la ruta elegida ahora.
+        self._executed_quote: Quote | None = None
         #: La confirmación de la última operación emitida. Se guarda aquí para que no
         #: la recoja el recolector de basura antes de que se vea.
         self._recibo: SwapReceiptDialog | None = None
@@ -183,6 +193,14 @@ class PricesPage(QWidget):
         self._card = SwapCard(container, self._balances)
         self._converter = self._card
         lay.addWidget(self._card)
+
+        # El bloque de la operación va **entre la tarjeta del swap y las rutas**,
+        # centrado en la columna: es el botón que convierte lo de arriba en una
+        # operación real, así que vive pegado a lo que usa —el importe, el par,
+        # la ruta elegida— y por encima de la lista de rutas, que es información
+        # para elegir. Antes vivía dentro de la tarjeta de rutas, debajo del
+        # panel de detalle, a un scroll del importe que iba a firmarse.
+        lay.addWidget(self._build_execution())
 
         #: El panel lateral, a la derecha y con ancho fijo. Lo llena la ventana
         #: con la lista de la cartera —ver `set_side_panel`—; mientras nadie lo
@@ -233,6 +251,10 @@ class PricesPage(QWidget):
         self._card.token_picked.connect(self._on_token_picked)
         self._card.balances_requested.connect(self._refresh_balances)
         self._card.send_requested.connect(self._on_send)
+        # El engranaje de la tarjeta pide configurar el deslizamiento; abrir el
+        # diálogo, aplicarlo y guardarlo es de esta página, que es la que tiene
+        # el valor vivo y el camino a `config.toml`.
+        self._card.slippage_requested.connect(self._on_slippage)
         self._balances.subscribe(self._on_balances_changed)
 
         self._refresh_tokens()
@@ -369,6 +391,95 @@ class PricesPage(QWidget):
     # ------------------------------------------------------------------ #
     # Zona 2 — las rutas y lo que se puede hacer con ellas
     # ------------------------------------------------------------------ #
+    def _build_execution(self) -> QWidget:
+        """El bloque de la operación: botón, ruta elegida, aviso y transacciones.
+
+        Va entre la tarjeta del swap y la de rutas, centrado en la columna, y lo
+        que se firma, el botón que lo firma, por qué está apagado y lo que pasó
+        de verdad cuentan una sola historia: por eso viven juntos y no dentro de
+        la tarjeta de rutas, que es donde se elige lo de arriba.
+        """
+        bloque = QWidget()
+        lay = QVBoxLayout(bloque)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        # Un solo botón de operar, centrado: es el único que firma y lo que hace
+        # convierte el formulario de arriba en una operación real. Antes había
+        # tres —preparar, guardar y ejecutar— y había que saber cuál tocaba:
+        # preparar no firmaba, guardar sólo exportaba, y ejecutar era el de
+        # verdad. Ahora el botón hace la operación entera y va contando cada
+        # fase en su propio texto; el «sí» de cada transacción sigue viviendo en
+        # su diálogo, que es donde tiene que estar.
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self._exec_btn = QPushButton(_EXEC_LABEL)
+        self._exec_btn.setObjectName("danger")
+        self._exec_btn.setToolTip(
+            "Prepara la operación, pide los permisos que falten, estima el coste, "
+            "firma y emite. Es irreversible y sale dinero de tu cartera; cada "
+            "transacción pedirá su propia confirmación."
+        )
+        self._exec_btn.clicked.connect(self._on_execute)
+        self._exec_btn.setEnabled(False)
+        actions.addWidget(self._exec_btn)
+
+        # «Empezar de nuevo» no firma nada: limpia la lista de transacciones de
+        # la operación y deja el botón como estaba. Nace oculto y aparece en
+        # cuanto hay algo que limpiar.
+        self._new_btn = QPushButton("Empezar de nuevo")
+        self._new_btn.setObjectName("secondary")
+        self._new_btn.setToolTip(
+            "Limpia la lista de transacciones de la operación y vuelve al estado "
+            "inicial. No firma ni emite nada."
+        )
+        self._new_btn.clicked.connect(self._on_start_over)
+        self._new_btn.setVisible(False)
+        actions.addWidget(self._new_btn)
+        actions.addStretch()
+        lay.addLayout(actions)
+
+        # La ruta elegida, escrita, justo debajo del botón: es lo que el botón va
+        # a usar, y sin esta línea habría que deducir cuál de las filas
+        # resaltadas es. De una línea, aunque el texto sea largo: una `QLabel`
+        # con `wordWrap` publica un alto natural calculado para varias líneas y
+        # luego se dibuja en una, y esa diferencia quedaba como un hueco muerto
+        # al final de la tarjeta. El texto entero, por si se recorta, va en el
+        # tooltip.
+        self._chosen = QLabel("Selecciona una ruta para ejecutarla.")
+        self._chosen.setObjectName("hint")
+        self._chosen.setWordWrap(False)
+        lay.addWidget(self._chosen)
+
+        # Por qué «Ejecutar» está apagado, en la misma línea y no escondido en un
+        # tooltip. Un botón apagado sin motivo es lo que empuja a buscar la forma de
+        # saltárselo, así que aquí se dice qué falta exactamente — y se dice
+        # **antes** de que alguien lo intente, no cuando falla.
+        #
+        # Y cuando lo que falta es el modo, al lado va el atajo para cambiarlo: el
+        # mensaje decía «cambia a EJECUCIÓN» y dejaba al usuario buscando dónde. El
+        # modo sólo lo cambia una acción explícita del usuario, y un botón que se
+        # pulsa lo es; lo que no puede haber es que lo cambie el programa.
+        note_row = QHBoxLayout()
+        self._exec_note = QLabel("")
+        self._exec_note.setWordWrap(True)
+        self._exec_note.setStyleSheet(f"color: {COLOR_DANGER};")
+        note_row.addWidget(self._exec_note, stretch=1)
+
+        self._upgrade_btn = QPushButton("")
+        self._upgrade_btn.setObjectName("link")
+        self._upgrade_btn.clicked.connect(self._on_upgrade_mode)
+        self._upgrade_btn.setVisible(False)
+        note_row.addWidget(self._upgrade_btn)
+        lay.addLayout(note_row)
+
+        # Las transacciones de la operación, debajo de los botones y del aviso:
+        # una fila por transacción real, con su estado. Nace oculto y sólo
+        # aparece cuando hay algo que contar.
+        self._steps = SwapStepsPanel()
+        lay.addWidget(self._steps)
+        return bloque
+
     def _build_routes(self) -> QWidget:
         card = Card("Rutas encontradas")
         # Por defecto, 4 decimales: una cifra de 18 decimales no cabe en la tabla y
@@ -406,72 +517,6 @@ class PricesPage(QWidget):
         self._detail.setVisible(False)
         card.body().addWidget(self._detail)
 
-        # La ruta elegida, escrita. Entre la lista y los botones, porque es lo que
-        # los botones van a usar: sin esta línea, «Ejecutar» actúa sobre una fila
-        # resaltada entre otras y hay que deducir cuál.
-        self._chosen = QLabel("Selecciona una ruta para prepararla o firmarla.")
-        self._chosen.setObjectName("hint")
-        # De una línea, aunque el texto sea largo: una `QLabel` con `wordWrap`
-        # publica un alto natural calculado para varias líneas y luego se dibuja en
-        # una, y esa diferencia quedaba como un hueco muerto al final de la tarjeta.
-        # El texto entero, por si se recorta, va en el tooltip.
-        self._chosen.setWordWrap(False)
-        card.body().addWidget(self._chosen)
-
-        actions = QHBoxLayout()
-        self._swap_btn = QPushButton("Preparar swap…")
-        self._swap_btn.setObjectName("secondary")
-        self._swap_btn.setToolTip(
-            "Construye la transacción sin firmar de la ruta seleccionada. "
-            "Este botón no firma ni emite nada: para eso está el de al lado, que "
-            "es irreversible."
-        )
-        self._swap_btn.clicked.connect(self._on_prepare_swap)
-        self._swap_btn.setEnabled(False)
-        actions.addWidget(self._swap_btn)
-
-        self._exec_btn = QPushButton("Ejecutar: firmar y emitir…")
-        self._exec_btn.setObjectName("danger")
-        self._exec_btn.setToolTip(
-            "Firma la transacción y la emite a la red. Es irreversible y sale "
-            "dinero de tu cartera."
-        )
-        self._exec_btn.clicked.connect(self._on_execute)
-        self._exec_btn.setEnabled(False)
-        actions.addWidget(self._exec_btn)
-
-        self._save_btn = QPushButton("Guardar payload…")
-        self._save_btn.setObjectName("secondary")
-        self._save_btn.setToolTip(
-            "Exporta a JSON la última transacción sin firmar que confirmaste."
-        )
-        self._save_btn.clicked.connect(self._on_save_payload)
-        self._save_btn.setEnabled(False)
-        actions.addWidget(self._save_btn)
-        actions.addStretch()
-        card.add_row(actions)
-
-        # Por qué «Ejecutar» está apagado, en la misma línea y no escondido en un
-        # tooltip. Un botón apagado sin motivo es lo que empuja a buscar la forma de
-        # saltárselo, así que aquí se dice qué falta exactamente — y se dice
-        # **antes** de que alguien lo intente, no cuando falla.
-        #
-        # Y cuando lo que falta es el modo, al lado va el atajo para cambiarlo: el
-        # mensaje decía «cambia a EJECUCIÓN» y dejaba al usuario buscando dónde. El
-        # modo sólo lo cambia una acción explícita del usuario, y un botón que se
-        # pulsa lo es; lo que no puede haber es que lo cambie el programa.
-        note_row = QHBoxLayout()
-        self._exec_note = QLabel("")
-        self._exec_note.setWordWrap(True)
-        self._exec_note.setStyleSheet(f"color: {COLOR_DANGER};")
-        note_row.addWidget(self._exec_note, stretch=1)
-
-        self._upgrade_btn = QPushButton("")
-        self._upgrade_btn.setObjectName("link")
-        self._upgrade_btn.clicked.connect(self._on_upgrade_mode)
-        self._upgrade_btn.setVisible(False)
-        note_row.addWidget(self._upgrade_btn)
-        card.add_row(note_row)
         # Nace plegada: sin cotización no hay nada que enseñar, y desplegada
         # empujaba el resto fuera de la pantalla en la primera visita —que es justo
         # cuando el usuario viene a intercambiar, no a leer una lista vacía—. Se
@@ -970,13 +1015,12 @@ class PricesPage(QWidget):
         # que ocupa su sitio ya dice qué hacer y el panel sobraría.
         self._detail.clear()
         self._detail.setVisible(False)
-        # El borrador preparado era de lo anterior —otro importe, otro par—:
-        # dejarlo guardable sería ofrecer para firmar un swap que ya no está en
-        # pantalla. Se retira con lo demás y se vuelve a preparar cuando toque;
-        # la ruta de la que salió se olvida con él.
-        self._prepared = None
-        self._prepared_quote = None
-        self._save_btn.setEnabled(False)
+        # La ruta cuyo coste estaba estimado era de lo anterior —otro importe,
+        # otro par—: se olvida con lo demás para que el panel no conserve una
+        # cifra que ya no describe nada. Las transacciones de la lista de pasos
+        # **no** se tocan: son hechos que ocurrieron, y cambiar el importe no los
+        # deshace; se limpian con «Empezar de nuevo».
+        self._cost_quote = None
         set_empty(self._routes, self._routes_empty, motivo)
         set_empty(self._opp_table, self._opps_empty, motivo)
         self._routes.cap_height()
@@ -1005,9 +1049,19 @@ class PricesPage(QWidget):
     def _on_quote_selected(self) -> None:
         quote = self._selected_quote()
         firmable = quote is not None and self._container.prepare_swap.can_build(quote)
-        self._swap_btn.setEnabled(firmable)
         motivos = self._execution_blockers(quote.pair if quote is not None else None, quote)
-        self._exec_btn.setEnabled(quote is not None and not motivos)
+
+        # El desenlace que el botón enseña vale para **su** ruta: al elegir otra,
+        # lo que hubo que contar se retira aquí. Mientras corre una operación no
+        # se toca —el texto lo lleva la narración—, y al volver de `_do_execute`
+        # la ruta es la misma, así que el desenlace recién escrito se conserva.
+        if quote is not self._executed_quote and not self._exec_running:
+            self._exec_done = False
+            self._exec_btn.setText(_EXEC_LABEL)
+
+        self._exec_btn.setEnabled(
+            quote is not None and not motivos and not self._exec_running and not self._exec_done
+        )
 
         if quote is None:
             # Con la lista vacía el rótulo que ocupa su sitio ya dice qué hacer;
@@ -1015,7 +1069,7 @@ class PricesPage(QWidget):
             # tarjeta. La línea existe para cuando **sí** hay rutas y ninguna
             # elegida, que es cuando hace falta decir qué falta.
             self._chosen.setText(
-                "Selecciona una ruta para prepararla o firmarla."
+                "Selecciona una ruta para ejecutarla."
                 if self._routes.count() > 0
                 else ""
             )
@@ -1037,13 +1091,16 @@ class PricesPage(QWidget):
                 quote,
                 firmable=firmable,
                 owner=self._owner(),
-                slippage_bps=self._container.settings.execution.slippage_bps,
+                # El valor **vivo**, no el de la configuración cargada al
+                # arrancar: el engranaje lo cambia sin reiniciar, y esta fila
+                # tiene que decir la tolerancia que se aplicará de verdad.
+                slippage_bps=self._container.slippage.bps,
             )
-            # Al cambiar de ruta el coste vuelve a «se estima al preparar»: la
-            # cifra que hubiera era de otra ruta. La excepción es la ruta recién
-            # preparada, que es el caso que se da al volver de `_do_prepare` con
-            # la estimación recién puesta.
-            if quote is not self._prepared_quote:
+            # Al cambiar de ruta el coste vuelve a «se estima al ejecutar»: la
+            # cifra que hubiera era de otra ruta. La excepción es la ruta cuyo
+            # coste se acaba de estimar, que es el caso que se da al volver de
+            # `_do_execute` con el paso ESTIMATE recién pintado.
+            if quote is not self._cost_quote:
                 self._detail.reset_cost()
 
         # El motivo se enseña sólo cuando ya hay una cotización elegida: antes de eso
@@ -1155,55 +1212,7 @@ class PricesPage(QWidget):
         return recipient_candidates(self._container, chain_key)
 
     # ------------------------------------------------------------------ #
-    # Preparar el swap
-    # ------------------------------------------------------------------ #
-    def _on_prepare_swap(self) -> None:
-        quote = self._selected_quote()
-        if quote is None:
-            self._card.set_status("Selecciona primero una ruta de la tabla.")
-            return
-        destinatario = self._owner()
-        if not destinatario:
-            self._card.set_status(
-                "No hay ninguna cartera configurada, así que no hay a dónde preparar "
-                "el swap. Pon la clave privada en la pestaña de Motores, en "
-                "Credenciales."
-            )
-            return
-        self._swap_btn.setEnabled(False)
-        self._card.set_status("Construyendo la transacción sin firmar…")
-        spawn(self._do_prepare(quote, destinatario))
-
-    async def _do_prepare(self, quote: Quote, recipient: str) -> None:
-        try:
-            # El coste de red se estima desde la cartera que firmaría —y en este
-            # flujo la que firmaría es la misma que recibe— y **dentro** del caso
-            # de uso: es una llamada a la red por ruta y aquí ya hay una elegida.
-            # Un fallo de estimación no llega hasta aquí como excepción: viaja en
-            # `cost_error` y la preparación sigue.
-            prepared = await self._container.prepare_swap(
-                quote, recipient=recipient, sender=recipient
-            )
-            self._prepared = prepared.transaction
-            self._prepared_quote = quote
-            self._save_btn.setEnabled(True)
-            # Tal cual salió: la cifra, el motivo del fallo o —en Solana— la raya
-            # de «no aplica», que no es lo mismo que un cero.
-            self._detail.set_cost(prepared.network_cost, prepared.cost_error)
-            self._card.set_status(
-                "Transacción preparada y confirmada. Amigocompora NO la ha firmado ni "
-                "emitido: guárdala y fírmala en tu cartera."
-            )
-        except ConfirmationDeniedError:
-            # Decir «error» aquí sería mentir: el usuario hizo lo correcto.
-            self._card.set_status("Cancelaste la preparación. No se construyó nada.")
-        except Exception as error:
-            self._card.set_status(f"Error: {error}")
-        finally:
-            self._on_quote_selected()
-
-    # ------------------------------------------------------------------ #
-    # Ejecutar: firmar y emitir
+    # Ejecutar: un solo botón, y lo que va pasando
     # ------------------------------------------------------------------ #
     def _on_execute(self) -> None:
         quote = self._selected_quote()
@@ -1223,26 +1232,114 @@ class PricesPage(QWidget):
         if not destinatario:
             self._card.set_status("No hay cartera configurada, así que no hay con qué firmar.")
             return
+        self._exec_running = True
         self._exec_btn.setEnabled(False)
-        self._card.set_status("Firmando y emitiendo…")
+        self._exec_btn.setText("Preparando el swap…")
+        self._card.set_status(
+            "Operación en marcha: cada transacción pedirá su propia confirmación."
+        )
         spawn(self._do_execute(quote, destinatario))
 
+    def _on_step(self, update: StepUpdate, quote: Quote) -> None:
+        """Lo que el caso de uso cuenta mientras ejecuta: a la lista y al botón.
+
+        Corre en el hilo de la interfaz —`ExecuteSwap` avisa desde la misma
+        tarea— y no decide nada: pinta. El texto del botón sigue al último paso
+        que empezó, que es lo que da el avance en vivo sin abrir nada.
+        """
+        self._steps.record(update)
+        self._new_btn.setVisible(True)
+        if update.state is StepState.RUNNING:
+            self._exec_btn.setText(update.title)
+        # La fila «Coste de red» del panel de detalle se rellena aquí: la
+        # estimación vive ahora en el paso ESTIMATE, y lo que enseña es lo mismo
+        # que quedó en la lista —la cifra, el motivo o la raya de «no aplica»—.
+        if update.step is SwapStep.ESTIMATE and update.state is StepState.DONE:
+            self._cost_quote = quote
+            self._detail.set_cost(update.cost, update.cost_error)
+
     async def _do_execute(self, quote: Quote, recipient: str) -> None:
+        def narrar(update: StepUpdate) -> None:
+            self._on_step(update, quote)
+
+        # El panel arranca con la operación: vacía lo de la anterior —si la hubo—
+        # y fija la red, que es lo que hace falta para enlazar cada hash con su
+        # explorador.
+        self._steps.start(quote.pair.base.chain)
         try:
-            receipt = await self._container.execute_swap(quote, recipient=recipient)
+            receipt = await self._container.execute_swap(
+                quote, recipient=recipient, on_step=narrar
+            )
             # La línea de estado sigue, pero la confirmación real es la ventana: la
             # línea queda debajo de los importes y no se lee tras emitir un dinero.
+            self._exec_done = True
+            self._executed_quote = quote
+            self._exec_btn.setText(_DONE_LABEL)
             self._card.set_status(
                 f"Emitida {receipt.tx_hash} · estado {receipt.status.value}."
             )
             self._mostrar_recibo(quote, receipt, recipient)
         except ConfirmationDeniedError:
             # Decir «error» aquí sería mentir: el usuario hizo lo correcto.
+            self._exec_btn.setText(_EXEC_LABEL)
             self._card.set_status("Cancelaste la operación. No se firmó ni se emitió nada.")
         except Exception as error:
+            self._exec_btn.setText(_EXEC_LABEL)
             self._card.set_status(f"Error: {error}")
         finally:
+            self._exec_running = False
             self._on_quote_selected()
+
+    def _on_start_over(self) -> None:
+        """Vuelve al estado inicial: lista limpia y botón como recién llegado.
+
+        No toca la cotización ni la ruta elegida —el usuario sigue donde estaba—
+        y no firma nada: lo único que retira es el relato de la operación, que ya
+        cumplió su función.
+        """
+        self._steps.clear()
+        self._new_btn.setVisible(False)
+        self._exec_done = False
+        self._executed_quote = None
+        self._cost_quote = None
+        self._exec_btn.setText(_EXEC_LABEL)
+        self._card.set_status("")
+        self._on_quote_selected()
+
+    # ------------------------------------------------------------------ #
+    # El deslizamiento por defecto
+    # ------------------------------------------------------------------ #
+    def _on_slippage(self) -> None:
+        """Configura la tolerancia con la que se construyen los swaps.
+
+        El valor se aplica **en el acto** —vive en `DefaultSlippage`, que es lo
+        que lee el constructor del swap— y se guarda en `config.toml` para que
+        siga valiendo tras cerrar. Si la escritura falla, se dice: la tolerancia
+        rige esta sesión y eso es cierto, pero callar que no se guardó dejaría al
+        usuario creyendo que sí.
+        """
+        dialogo = SlippageDialog(self._container.slippage.bps, parent=self)
+        if dialogo.exec() != SlippageDialog.Accepted:
+            return
+        bps = dialogo.value_bps()
+        self._container.slippage.set(bps)
+        self._card.set_slippage_bps(bps)
+        porcentaje = BasisPoints(bps).as_percent()
+        aviso = ""
+        try:
+            set_execution_slippage_bps(config_file(), bps)
+        except Exception as error:
+            aviso = (
+                f" No se pudo guardar en config.toml ({error}): la tolerancia vale "
+                f"para esta sesión."
+            )
+        self._card.set_status(
+            f"Deslizamiento por defecto: {porcentaje:f} %. Se aplica al construir "
+            f"los swaps de esta sesión.{aviso}"
+        )
+        # La fila «Deslizamiento máx.» del panel de detalle enseña el valor
+        # vigente, así que se repinta con el nuevo.
+        self._on_quote_selected()
 
     # ------------------------------------------------------------------ #
     # Enviar: sacar fondos de la cartera
@@ -1289,7 +1386,7 @@ class PricesPage(QWidget):
             self._card.refresh_balances()
 
     # ------------------------------------------------------------------ #
-    # Guardar el payload
+    # La confirmación de la operación
     # ------------------------------------------------------------------ #
     def _mostrar_recibo(self, quote: Quote, receipt: BroadcastReceipt, recipient: str) -> None:
         """Abre la confirmación de la operación emitida, sin bloquear la pantalla.
@@ -1306,29 +1403,6 @@ class PricesPage(QWidget):
         ventana.show()
         ventana.raise_()
         ventana.activateWindow()
-
-    def _on_save_payload(self) -> None:
-        if self._prepared is None:
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Guardar transacción sin firmar",
-            "swap-sin-firmar.json",
-            "JSON (*.json)",
-        )
-        if not path:
-            return
-        try:
-            Path(path).write_text(
-                json.dumps(_payload_document(self._prepared), indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError as error:
-            self._card.set_status(f"No se pudo guardar: {error}")
-            return
-        self._card.set_status(
-            f"Guardada en {path}. Sigue SIN FIRMAR: nada se ha emitido."
-        )
 
 
 def _resumen_de(comparison: PriceComparison) -> str:
@@ -1385,17 +1459,3 @@ def _cap_height(table: QTableWidget, filas: int = 10) -> None:
     for row in range(visible):
         alto += table.rowHeight(row)
     table.setMaximumHeight(alto if visible else 0)
-
-
-def _payload_document(transaction: PlannedTransaction) -> dict[str, str]:
-    """Documento exportable de un payload sin firmar.
-
-    Se construye desde `describe()` —los mismos campos que se mostraron en el
-    diálogo de confirmación— y no volcando el objeto: lo que se exporta tiene que ser
-    exactamente lo que el usuario leyó y aprobó, no una representación interna que
-    puede cambiar sin que el diálogo cambie.
-    """
-    document: dict[str, str] = {"tipo": type(transaction).__name__}
-    document.update(dict(transaction.describe()))
-    document["aviso"] = _UNSIGNED_NOTICE
-    return document

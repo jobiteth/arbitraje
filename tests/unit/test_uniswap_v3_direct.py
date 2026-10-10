@@ -877,6 +877,24 @@ async def test_el_minimo_es_el_de_ahora_y_nunca_por_encima_de_lo_que_el_pool_da(
     assert minimo < SALIDA_RAW
 
 
+async def test_el_deslizamiento_fijado_cambia_el_minimo_del_calldata() -> None:
+    """El mínimo sale de la tolerancia que llega, no de la constante.
+
+    Es donde la tolerancia se convierte en dinero: un mínimo calculado con otra
+    cifra deja al swap expuesto a más deslizamiento del que el usuario aceptó.
+    Se lee del calldata como palabra, sin reconstruir con el codificador que se
+    está probando.
+    """
+    payload = await _motor(_Escenario()).plan_swap(
+        _cotizacion(), recipient=DESTINATARIO, slippage_bps=250
+    )
+
+    esperado = int(Decimal(SALIDA_RAW) * Decimal("0.975"))
+    cuerpo = payload.calldata[2 + 8 :]
+    assert int(cuerpo[5 * 64 : 6 * 64], 16) == esperado
+    assert "2.5 %" in payload.description
+
+
 async def test_el_minimo_no_puede_quedar_por_encima_de_lo_que_el_pool_entrega() -> None:
     """Es el caso que revierte: el mínimo tiene que ser menor que la salida real.
 

@@ -81,7 +81,9 @@ class _Planner(_Reader):
 
     __slots__ = ()
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction:
+    async def plan_swap(
+        self, quote: Quote, *, recipient: str, slippage_bps: int | None = None
+    ) -> UnsignedTransaction:
         """No se llega a llamar: estas pruebas miran **quién** sería elegido."""
         raise NotImplementedError
 

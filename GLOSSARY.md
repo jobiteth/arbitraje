@@ -41,6 +41,18 @@ no desviarse.
   `check_chain` al firmar y los avisos de la tarjeta de predicción: la pantalla
   y la firma dan la misma respuesta. La configuración acepta el comodín en la
   validación de nombres (`infra/config.py`), junto a las redes de verdad.
+- **Permiso encadenado por Permit2.** Hay routers que **no mueven el token ellos
+  mismos**: el swap lo cobra pidiéndoselo a Permit2
+  (`0x000000000022D473030F116dDEE9F6B43aC78BA3`), que es quien tiene permiso
+  sobre el ERC-20. En esas redes hacen falta **dos** transacciones de permiso
+  antes del swap —la aprobación del ERC-20 a Permit2 y la de Permit2 al
+  router—, y el payload lo tiene que **declarar** (`TokenApproval.spender` más
+  `via`): aprobar el token directamente contra el router es un permiso que ese
+  router nunca lee, y el swap revierte. Se midió con `eth_getCode` el
+  2026-10-09: los ocho routers del motor `uniswap` (agregado) lo llevan dentro;
+  los de `zeroex`, no, y por eso su camino directo no se toca. El gastador de la
+  primera aprobación es Permit2 —no el router— y el relato de los diálogos lo
+  distingue («Es la primera de dos aprobaciones…»).
 
 ## Carteras
 
@@ -134,6 +146,20 @@ no desviarse.
   de cerrar el viejo.
 - **Manifiesto.** Metadatos de un motor (id, tipo, capacidades, hosts
   permitidos, config), legibles sin instanciarlo.
+- **Alias de pantalla (`[engine_names]`).** El nombre con el que se enseña un
+  motor, editable con el lápiz de su fila en la pestaña de motores y guardado en
+  `config.toml`. Es sólo eso —pantalla—: el `engine_id`, su configuración y lo
+  que hace no cambian, y por eso las tres pantallas que enseñan nombres
+  (motores, APIs de configuración y credenciales) lo resuelven por el mismo
+  sitio (`app/engine_names.py`). Un alias en blanco **borra**: el motor vuelve a
+  su nombre de fábrica, y la tabla se retira del archivo si no queda ninguno.
+- **Encender suma, apagar retira.** El interruptor de cada fila de la pestaña de
+  motores: encender un motor lo **añade** a su ranura sin apagar los demás
+  —varios por ranura es lo que permite comparar precios— y apagar retira sólo a
+  ése. Apagar el último deja la ranura escrita **vacía** (`dex_quotes = []`),
+  que es «apagada a propósito»; borrar la clave en vez de vaciarla haría volver
+  el motor por omisión al reiniciar. Quién responde primero no lo cambia este
+  gesto: lo decide la prioridad del manifiesto.
 - **Centinela del nativo.** La dirección con la que cada API agregada nombra la
   moneda de la red, que no tiene contrato: la **dirección cero** en la de Uniswap
   y `0xEeee…` en la de 0x. Medido: cada una responde «sin ruta» con la del otro,
@@ -377,13 +403,47 @@ no desviarse.
 - **Coste de red estimado.** Lo que puede costar emitir el swap, en la moneda
   nativa de su red: `gas_limit × max_fee_per_gas`, la misma semántica que
   `SignedTransaction.max_cost_wei`, así que es un **techo**, no un cobro. Se
-  estima **al preparar** —es una llamada a la red por ruta, y cotizar compara
-  muchas— desde la cartera que firmaría y con el mismo mapa de emisores que
-  firma. Sus estados no se confunden entre sí: «se estima al preparar» antes de
-  preparar, la cifra con «≈», «no se pudo estimar» con el motivo en el tooltip
-  —un revert no frustra la preparación: el borrador sale igual— y «—» para lo
-  que no aplica (Solana no tiene `eth_estimateGas`). No incluye la aprobación
-  del token, que sería otra transacción. Ver `app/usecases/estimate_cost.py`.
+  estima en el **paso ESTIMATE de la ejecución** —una llamada a la red por
+  operación, y cotizar compara muchas— desde la cartera que firmaría y con el
+  mismo mapa de emisores que firma. Va después de los permisos —concedidos
+  éstos, la estimación ya no revierte por allowance— y antes del último «sí»:
+  la cifra entra en el diálogo del swap y en la fila del panel. Sus estados no
+  se confunden entre sí: «se estima al preparar» antes de que el paso llegue, la
+  cifra con «≈», «no se pudo estimar» con el motivo en el tooltip —un fallo de
+  estimación no frustra la operación: se decide con el motivo a la vista— y «—»
+  para lo que no aplica (Solana no tiene `eth_estimateGas`). No incluye las
+  aprobaciones del token, que son otras transacciones. Ver
+  `app/usecases/estimate_cost.py` y `app/usecases/execute_swap.py`.
+- **Deslizamiento por defecto.** La tolerancia con la que se construyen los
+  swaps —el mínimo que un swap acepta recibir—, en puntos básicos. Se cambia con
+  el **engranaje** de la cabecera de la tarjeta de intercambio, vive en
+  `DefaultSlippage` (la configuración es inmutable, así que el número vivo no
+  cabe en `Settings`, se lee sin reiniciar) y se guarda en `[execution]
+  slippage_bps` de `config.toml`. Viaja **de verdad**: los seis motores que
+  construyen reciben `slippage_bps` al construir el payload, y el panel de
+  detalle enseña el valor vigente —no el de la configuración cargada—. Si la
+  escritura del archivo falla, se dice: rige esta sesión, pero no se guardó.
+  Ver `app/slippage.py`, `ui/slippage_dialog.py` e `infra/config_writer.py`.
+- **Paso de ejecución.** Cada fase de una operación, narrada en vivo por el
+  botón único (`SwapStep`: preparar, permiso del ERC-20, permiso en Permit2,
+  coste de red, swap) y listada bajo los botones con su glifo (… corriendo, ✓
+  hecho, ✕ rechazado o fallado), su hash —acortado, entero en el tooltip— y su
+  enlace al explorador de la red cuando existe. Un **rechazo** del usuario y un
+  **fallo** se listan los dos, pero no se pintan igual: decidir que no no es una
+  avería. El panel no decide nada —pinta lo que le llega del caso de uso— y un
+  observador que falle no tumba la transacción en marcha. «Empezar de nuevo»
+  barre la lista y devuelve el botón al estado inicial sin perder la ruta
+  elegida.
+- **Saldo del token vendido.** Lo primero que la ejecución comprueba después de
+  construir el payload y **antes** de aprobar nada: si la cartera no tiene lo
+  que el swap va a mover, se corta con las dos cifras delante («tienes 0.550579
+  pUSD y la operación mueve 1 pUSD») y no se firma ni se estima nada. Qué saldo
+  se mira sale del mismo criterio que decide a quién se aprueba: el ERC-20 que
+  el router moverá, o el nativo del `value` cuando es él quien viaja. Sin este
+  corte, un déficit solo se descubría al estimar, como un `execution reverted:
+  STF` del router que no dice ni cuánto hay ni cuánto falta —medido el
+  2026-10-10, con pUSD en Polygon—. Ver `InsufficientBalanceError` en
+  `domain/errors.py` y `_require_sold_balance` en `app/usecases/execute_swap.py`.
 - **Píldora del token.** La cara visible de la elección de token dentro de una
   pata. En «Entre redes» es un desplegable —la lista es la de una red— y en swaps
   un botón que abre el selector con buscador.

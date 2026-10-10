@@ -906,6 +906,35 @@ async def test_el_plan_vuelve_a_cotizar_y_usa_lo_fresco_para_el_minimo() -> None
     assert str(esperado) in plan.description
 
 
+async def test_el_deslizamiento_fijado_cambia_el_minimo_del_calldata() -> None:
+    """El mínimo sale de la tolerancia que llega, no de la constante.
+
+    Es donde la tolerancia se convierte en dinero: un mínimo calculado con otra
+    cifra deja al swap expuesto a más deslizamiento del que el usuario aceptó.
+    Se lee del calldata como palabra, sin reconstruir con el codificador que se
+    está probando.
+    """
+    lector = _escenario_base()
+    base = _weth()
+    par = _par(base, _stable("USDC", "base"))
+    motor = _motor(lector)
+    cotizacion = (await motor.quote(par, _entrada(ENTRADA_BASE, base)))[0]
+
+    fresca = 444_000_000
+    lector.salidas[abi.get_amounts_out(ENTRADA_BASE, (_dir(base), _dir(par.quote)))] = (
+        ENTRADA_BASE,
+        fresca,
+    )
+    plan = await motor.plan_swap(cotizacion, recipient=DESTINATARIO, slippage_bps=250)
+
+    esperado = TokenAmount(fresca, 6, "USDC").scaled_by(
+        EXACT.subtract(Decimal(1), BasisPoints(250).as_ratio()), rounding=ROUND_DOWN
+    )
+    cuerpo = plan.calldata[10:]
+    assert cuerpo[64:128] == _palabra_uint(esperado.raw)
+    assert "2.5 %" in plan.description
+
+
 async def test_la_deriva_mas_alla_de_lo_tolerado_no_construye() -> None:
     """Entre pintar la tabla y pulsar el botón el precio se mueve: se corta."""
     lector = _escenario_base()

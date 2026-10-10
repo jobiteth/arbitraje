@@ -49,7 +49,14 @@ from amigocompora.app.execution_policy import (
 )
 from amigocompora.app.mode_guard import ModeGuard
 from amigocompora.app.registry import EngineRegistry
-from amigocompora.app.usecases.execute_swap import ExecuteSwap, _token_to_approve
+from amigocompora.app.usecases.estimate_cost import EstimateNetworkCost
+from amigocompora.app.usecases.execute_swap import (
+    ExecuteSwap,
+    StepState,
+    StepUpdate,
+    SwapStep,
+    _token_to_approve,
+)
 from amigocompora.app.usecases.prepare_swap import PrepareSwap
 from amigocompora.app.usecases.value_in_reference import ReferenceValuation
 from amigocompora.domain.chains import chain
@@ -58,6 +65,7 @@ from amigocompora.domain.errors import (
     ConfirmationDeniedError,
     ExecutionError,
     ExecutionLimitExceededError,
+    InsufficientBalanceError,
     ModeNotPermittedError,
     UnsupportedOperationError,
 )
@@ -100,6 +108,14 @@ CALLDATA = "0x415565b0" + "ab" * 32
 #: definición pública del estándar y no pedido a `build_approve_calldata`:
 #: comprobar el camino con la misma función que usa el camino no comprueba nada.
 SELECTOR_APPROVE_ERC20 = "095ea7b3"
+#: Selector ERC-20 de `balanceOf(address)`, por la misma razón que el de arriba:
+#: a `eth_call` llegan el saldo y el permiso por el **mismo** método JSON-RPC, y
+#: lo único que los distingue en la petición es esta calldata.
+SELECTOR_BALANCE_OF = "70a08231"
+#: Saldo de sobra para los importes de estas pruebas —1 WETH, 10**18—: las
+#: lecturas de saldo se contestan con esto salvo en las pruebas que miden,
+#: precisamente, la falta de saldo.
+SALDO_DE_SOBRA = 10**18
 #: El máximo de `uint256`, que es lo que **no** puede aparecer en un `approve`.
 MAXIMO_UINT256 = "f" * 64
 #: Cuenta 0 de Hardhat. Publicada en la documentación de Hardhat y Anvil, sin
@@ -196,7 +212,9 @@ class _Planner:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         return ()
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction:
+    async def plan_swap(
+        self, quote: Quote, *, recipient: str, slippage_bps: int | None = None
+    ) -> UnsignedTransaction:
         self._construidos += 1
         return UnsignedTransaction(
             chain_id=CHAIN_ID,
@@ -282,6 +300,16 @@ def _hash_of(params: list[Any]) -> str:
     return "0x" + keccak(bytes.fromhex(raw_hex[2:])).hex()
 
 
+def _palabra(valor: int) -> str:
+    """Un entero como lo devuelve la cadena: una palabra ABI de 32 bytes.
+
+    `token_balance` exige el retorno ABI **completo** y rechaza uno más corto
+    —«el contrato al que se preguntó no es el que se cree», y tiene razón—, así
+    que el nodo de mentira contesta como contestaría uno de verdad.
+    """
+    return "0x" + f"{valor:064x}"
+
+
 def _permiso_tras_aprobar(importe: int) -> Callable[[list[Any]], str]:
     """`eth_call` que contesta cero y, desde la segunda vez, el importe aprobado.
 
@@ -290,13 +318,21 @@ def _permiso_tras_aprobar(importe: int) -> Callable[[list[Any]], str]:
     aprobó y el permiso no llegó»: el código vuelve a leer la autorización a
     propósito, y un nodo que contestara siempre cero haría fallar también el
     camino bueno.
+
+    Las lecturas de **saldo** se contestan de sobra y sin contar: el saldo y el
+    permiso llegan por el mismo `eth_call` y lo que los distingue es la
+    calldata, igual que en la cadena. Sin esta distinción, el chequeo de saldo
+    que precede a la aprobación se comería la primera respuesta —un cero— y
+    haría fallar la prueba por un déficit que no existe.
     """
     estado = {"llamadas": 0}
 
     def handler(params: list[Any]) -> str:
-        del params
+        data = str(params[0].get("data", ""))
+        if data.startswith("0x" + SELECTOR_BALANCE_OF):
+            return _palabra(SALDO_DE_SOBRA)
         estado["llamadas"] += 1
-        return "0x0" if estado["llamadas"] == 1 else hex(importe)
+        return _palabra(0) if estado["llamadas"] == 1 else _palabra(importe)
 
     return handler
 
@@ -315,10 +351,17 @@ def _permiso_encadenado(
     Y cada una cambia tras su aprobación, por la misma razón que
     `_permiso_tras_aprobar`: el camino vuelve a leer a propósito, y un nodo que
     contestara siempre cero haría fallar también el camino bueno.
+
+    Y, como allí, las lecturas de **saldo** se contestan de sobra antes de mirar
+    a qué contrato van: viajan al token, que es también el destino del permiso
+    del ERC-20, así que sin la calldata delante se confundirían con él.
     """
     estado = {"erc20": 0, "permit2": 0}
 
     def handler(params: list[Any]) -> str:
+        data = str(params[0].get("data", ""))
+        if data.startswith("0x" + SELECTOR_BALANCE_OF):
+            return _palabra(SALDO_DE_SOBRA)
         destino = str(params[0].get("to", "")).lower()
         if destino == permit2.lower():
             estado["permit2"] += 1
@@ -329,7 +372,7 @@ def _permiso_encadenado(
             f"la prueba sólo espera preguntas al token o a Permit2, no a {destino}"
         )
         estado["erc20"] += 1
-        return "0x0" if estado["erc20"] == 1 else hex(importe)
+        return _palabra(0) if estado["erc20"] == 1 else _palabra(importe)
 
     return handler
 
@@ -358,7 +401,7 @@ def _node(**overrides: Any) -> FakeNode:
         "eth_estimateGas": "0x30d40",
         "eth_getBlockByNumber": {"baseFeePerGas": "0x3b9aca00"},
         "eth_maxPriorityFeePerGas": "0x3b9aca",
-        "eth_call": hex(10**18),  # allowance de sobra por omisión
+        "eth_call": _palabra(10**18),  # permiso y saldo de sobra por omisión
         "eth_sendRawTransaction": _hash_of,
         "eth_getTransactionReceipt": {"blockNumber": "0x10", "status": "0x1"},
     }
@@ -473,8 +516,14 @@ async def _armed(
     node: FakeNode | None = None,
     answer: bool = True,
     valuation: ReferenceValuation | None = None,
+    estimate: bool = False,
 ) -> tuple[ExecuteSwap, FakeNode, ExecutionLedger, RecordingPrompt, FakeKey]:
-    """Un `ExecuteSwap` completo, con emisor **real** sobre un nodo de mentira."""
+    """Un `ExecuteSwap` completo, con emisor **real** sobre un nodo de mentira.
+
+    `estimate` enciende el estimador de coste, que por omisión va apagado: sin él
+    el paso de estimación narra «no se intentó», que es lo que quieren casi
+    todas las pruebas —las del coste en sí no.
+    """
     clock = FrozenClock(AHORA)
     ledger = ExecutionLedger(tmp_path / "executions.jsonl", clock=clock)
     keys = FakeKey()
@@ -497,7 +546,13 @@ async def _armed(
 
     fake = node or _node()
     execute = ExecuteSwap(
-        prepare=PrepareSwap(registry=registry, gateway=gateway),
+        prepare=PrepareSwap(
+            registry=registry,
+            gateway=gateway,
+            estimate=(
+                EstimateNetworkCost({"base": _broadcaster(fake)}) if estimate else None
+            ),
+        ),
         gateway=gateway,
         keys=keys,
         policy=policy,
@@ -884,6 +939,74 @@ async def test_si_la_aprobacion_no_cuaja_no_se_firma_el_swap(tmp_path: Path) -> 
     assert len(node.sent_raw()) == 1, "sólo se emitió la aprobación fallida"
 
 
+# --------------------------------------------------------------------------- #
+# 6b. El saldo
+# --------------------------------------------------------------------------- #
+def _saldo_y_permiso(saldo: int) -> Callable[[list[Any]], str]:
+    """`eth_call` que distingue la lectura del saldo de la del permiso.
+
+    Al permiso le contesta de sobra: lo que se quiere medir es que un déficit
+    de **saldo** corta antes de aprobar, y un permiso que también faltara
+    cortaría por otro motivo y la prueba no distinguiría por cuál.
+    """
+
+    def handler(params: list[Any]) -> str:
+        data = str(params[0].get("data", ""))
+        if data.startswith("0x" + SELECTOR_BALANCE_OF):
+            return _palabra(saldo)
+        return _palabra(10**18)
+
+    return handler
+
+
+async def test_sin_saldo_no_se_aprueba_ni_se_estima(tmp_path: Path) -> None:
+    """El déficit de saldo corta antes de gastar gas, y con las dos cifras.
+
+    Medido el 2026-10-10, Polygon: una cartera con 0.550579 pUSD intentando
+    mover 1 pUSD pasaba la cotización y la aprobación —ninguna de las dos mira
+    saldos— y solo se descubría al estimar, como un «execution reverted: STF»
+    del nodo que no dice ni cuánto hay ni cuánto falta. Aquí se mide que el
+    corte llega **antes** de cualquier transacción: no se aprueba, no se
+    estima y no se firma nada.
+    """
+    node = _node(eth_call=_saldo_y_permiso(10**18 // 2))
+    execute, fake, ledger, prompt, _ = await _armed(tmp_path, node=node, estimate=True)
+
+    with pytest.raises(InsufficientBalanceError) as caught:
+        await execute(_quote(), recipient=DESTINO)
+
+    # El mensaje lleva las dos cifras tal como se ven en la interfaz: la salida
+    # —reducir el importe o traer saldo— la decide el usuario con ellas delante.
+    assert "0.5 WETH" in str(caught.value)
+    assert "1 WETH" in str(caught.value)
+    assert fake.sent_raw() == [], "no se firmó ni una transacción"
+    assert fake.called("eth_estimateGas") == [], "ni se estimó el swap"
+    assert prompt.asked == [], "ni se pidió confirmación"
+    assert not ledger.entries(), "y nada quedó anotado como ocurrido"
+
+
+async def test_la_venta_de_nativo_se_mide_contra_el_saldo_nativo(tmp_path: Path) -> None:
+    """Cuando el payload paga con `value`, el saldo que se mira es el nativo.
+
+    No el del envoltorio que el par nombra: el router lo envuelve él, así que de
+    la cartera sale ETH y no WETH — el mismo criterio con el que
+    `_token_to_approve` decide que ahí no hay nada que aprobar. Mirar el saldo
+    del WETH dejara pasar swaps que la cartera no puede pagar.
+    """
+    execute, fake, _, _, _ = await _armed(
+        tmp_path,
+        planner=_Planner(value=10**18),
+        node=_node(eth_getBalance=hex(10**18 - 1)),
+    )
+
+    with pytest.raises(InsufficientBalanceError, match="ETH") as caught:
+        await execute(_quote(), recipient=DESTINO)
+
+    assert "1 ETH" in str(caught.value)
+    assert fake.called("eth_getBalance"), "se preguntó por el saldo nativo"
+    assert fake.sent_raw() == [], "no se firmó ni una transacción"
+
+
 @pytest.mark.parametrize(
     ("token", "value", "esperado"),
     [
@@ -1062,3 +1185,133 @@ async def test_cuando_el_par_toca_el_tope_no_se_valora_nada(tmp_path: Path) -> N
     assert valoracion.preguntas == 0
     (asiento,) = ledger.entries()
     assert asiento.notional_symbol == "USDC"
+
+
+# --------------------------------------------------------------------------- #
+# 8. La narración del progreso
+# --------------------------------------------------------------------------- #
+async def test_los_pasos_llegan_en_orden_y_el_swap_con_su_hash(tmp_path: Path) -> None:
+    """La secuencia que pinta el botón: preparar, los dos permisos, coste y swap.
+
+    Se afirma la lista entera de `(fase, estado)` porque es **lo que la interfaz
+    usa** para narrar: un paso que se saltara o llegara en otro orden dejaría el
+    botón contando una operación que no es la que está pasando.
+    """
+    token = wrapped_native("base")
+    assert token is not None
+    assert token.address is not None
+    execute, _, _, _, _ = await _armed(
+        tmp_path,
+        planner=_Planner(approval=TokenApproval(spender=ROUTER_PERMIT2, via=PERMIT2)),
+        node=_node(eth_call=_permiso_encadenado(token.address, PERMIT2, 10**18)),
+        estimate=True,
+    )
+    pasos: list[StepUpdate] = []
+
+    receipt = await execute(_quote(), recipient=DESTINO, on_step=pasos.append)
+
+    assert receipt.status is BroadcastStatus.SUCCESS
+    assert [(paso.step, paso.state) for paso in pasos] == [
+        (SwapStep.PREPARE, StepState.RUNNING),
+        (SwapStep.PREPARE, StepState.DONE),
+        (SwapStep.APPROVE, StepState.RUNNING),
+        (SwapStep.APPROVE, StepState.DONE),
+        (SwapStep.APPROVE_PERMIT2, StepState.RUNNING),
+        (SwapStep.APPROVE_PERMIT2, StepState.DONE),
+        (SwapStep.ESTIMATE, StepState.RUNNING),
+        (SwapStep.ESTIMATE, StepState.DONE),
+        (SwapStep.SWAP, StepState.RUNNING),
+        (SwapStep.SWAP, StepState.RUNNING),
+        (SwapStep.SWAP, StepState.DONE),
+    ]
+    # Sólo las transacciones reales llevan hash —el de verdad, el que quedó en el
+    # recibo—, que es lo que el panel convierte en enlace al explorador.
+    con_hash = [paso for paso in pasos if paso.tx_hash]
+    assert len(con_hash) == 3, "dos permisos y el swap"
+    assert con_hash[-1].tx_hash == receipt.tx_hash
+    # Y el paso del coste llega con la cifra, no con el texto de «no se intentó».
+    coste = next(
+        paso
+        for paso in pasos
+        if paso.step is SwapStep.ESTIMATE and paso.state is StepState.DONE
+    )
+    assert coste.cost is not None
+    assert coste.cost_error is None
+
+
+async def test_un_rechazo_se_narra_como_decision_no_como_fallo(tmp_path: Path) -> None:
+    """El usuario dijo que no: `REJECTED`, sin un solo `FAILED` por medio.
+
+    La distinción no es de matiz para quien mira el botón: un fallo pide
+    reintentar o arreglar algo; un rechazo es una decisión y no hay nada roto.
+    """
+    execute, node, _, _, _ = await _armed(tmp_path, answer=False)
+    pasos: list[StepUpdate] = []
+
+    with pytest.raises(ConfirmationDeniedError):
+        await execute(_quote(), recipient=DESTINO, on_step=pasos.append)
+
+    assert pasos[-1].step is SwapStep.SWAP
+    assert pasos[-1].state is StepState.REJECTED
+    assert "rechazaste" in pasos[-1].detail
+    assert all(paso.state is not StepState.FAILED for paso in pasos)
+    assert node.sent_raw() == []
+
+
+async def test_rechazar_el_permiso_para_la_operacion_sin_emitir_nada(tmp_path: Path) -> None:
+    """El primer «no» —el del permiso— detiene todo y queda narrado en su paso."""
+    execute, node, _, _, _ = await _armed(
+        tmp_path,
+        answer=False,
+        node=_node(eth_call=_permiso_tras_aprobar(10**18)),
+    )
+    pasos: list[StepUpdate] = []
+
+    with pytest.raises(ConfirmationDeniedError):
+        await execute(_quote(), recipient=DESTINO, on_step=pasos.append)
+
+    assert pasos[-1].step is SwapStep.APPROVE
+    assert pasos[-1].state is StepState.REJECTED
+    assert node.sent_raw() == []
+
+
+async def test_un_swap_que_mina_en_rojo_se_narra_con_su_hash(tmp_path: Path) -> None:
+    """El hash existe y lleva al explorador: se narra el fallo, con él.
+
+    No se lanza porque el recibo es la respuesta —el gas ya se pagó—, así que el
+    aviso es lo único que puede contar que la transacción no llegó a término.
+    """
+    execute, _, _, _, _ = await _armed(
+        tmp_path,
+        node=_node(eth_getTransactionReceipt={"blockNumber": "0x10", "status": "0x0"}),
+    )
+    pasos: list[StepUpdate] = []
+
+    receipt = await execute(_quote(), recipient=DESTINO, on_step=pasos.append)
+
+    assert receipt.status is BroadcastStatus.REVERTED
+    assert pasos[-1].step is SwapStep.SWAP
+    assert pasos[-1].state is StepState.FAILED
+    assert pasos[-1].tx_hash
+    assert pasos[-1].tx_hash == receipt.tx_hash
+
+
+async def test_un_observador_que_falla_no_tumba_la_operacion(tmp_path: Path) -> None:
+    """El aviso es para la interfaz; una interfaz rota no puede abortar el swap.
+
+    Este caso de uso mueve dinero: su curso no puede depender de que alguien
+    pinte bien un botón. El fallo se anota en el registro y la operación sigue.
+    """
+    execute, node, _, _, _ = await _armed(tmp_path)
+
+    def roto(update: StepUpdate) -> None:
+        raise RuntimeError(f"la interfaz se rompió pintando {update.step}")
+
+    with capture_logs() as registros:
+        receipt = await execute(_quote(), recipient=DESTINO, on_step=roto)
+
+    assert receipt.status is BroadcastStatus.SUCCESS
+    assert len(node.sent_raw()) == 1
+    assert any(
+        registro.get("event") == "execution.step_observer_failed" for registro in registros
+    )

@@ -18,6 +18,13 @@ falso, y ninguno se detecta solo:
   nombra con la dirección cero —con el centinela de 0x responde
   `NoRouteFoundError`—. Se afirma la dirección que viaja en la petición porque
   equivocarla es dejar sin ruta justo a vender la moneda de la red.
+- **El permiso del token.** El router de este motor cobra vía Permit2 —medido
+  en su bytecode—: el payload tiene que declararlo o el ejecutor aprueba a
+  quien nunca cobra, y el swap revierte al estimar el gas.
+- **El deslizamiento efectivo.** El configurado manda, en el cuerpo de la
+  petición y en el texto del payload; sin él se conserva la constante del
+  motor, y la tolerancia entra en la clave de caché para que dos tolerancias
+  no compartan construcción.
 
 `plan_swap` va contra el `JsonSource` real con `respx` por debajo, así que se
 ejercitan de verdad la lista blanca de hosts, la caché por `cache_key`, el mapeo
@@ -44,16 +51,26 @@ from amigocompora.domain.errors import (
     SourceResponseError,
     UnsupportedOperationError,
 )
-from amigocompora.domain.models import Measurement, Quote, Token, TradingPair, Venue, VenueKind
+from amigocompora.domain.models import (
+    Measurement,
+    Quote,
+    Token,
+    TokenApproval,
+    TradingPair,
+    Venue,
+    VenueKind,
+)
 from amigocompora.domain.money import BasisPoints, TokenAmount
 from amigocompora.engines.catalog import native_token, quote_token, wrapped_native
 from amigocompora.engines.uniswap.engine import (
     CONFIG_API_KEY,
     MANIFEST,
+    PERMIT2,
     PROVIDER,
     QUOTE_SWAPPER,
     QUOTE_URL,
     ROUTERS,
+    SLIPPAGE_PCT,
     SWAP_URL,
     UniswapEngine,
 )
@@ -135,35 +152,33 @@ async def test_el_build_del_nativo_lleva_el_value() -> None:
     lector del `value` ya existía; lo que faltaba era llegar hasta aquí.
     """
     native = native_token("polygon")
-    stable = _pair("polygon").base
-    pair = TradingPair(base=native, quote=stable)
-    amount = TokenAmount(10**18, native.decimals, native.symbol)
-    quote = Quote(
-        venue=Venue(
-            venue_id="uniswap@polygon",
-            name="Uniswap (agregado, polygon)",
-            kind=VenueKind.DEX,
-            chain="polygon",
-        ),
-        engine_id=MANIFEST.engine_id,
-        pair=pair,
-        amount_in=amount,
-        amount_out=TokenAmount(int(_OUT_RAW), stable.decimals, stable.symbol),
-        fee_bps=None,
-        fee_basis=None,
-        price_impact_bps=BasisPoints(1),
-        observed_at=NOW,
-        impact_basis=Measurement.REPORTED,
-    )
     _mock_quote(in_raw=str(10**18))
     _mock_swap(to=ROUTERS["polygon"], value="0x0de0b6b3a7640000")
 
     async with _engine() as engine:
-        transaction = await engine.plan_swap(quote, recipient=_RECIPIENT)
+        transaction = await engine.plan_swap(_quote_nativo(), recipient=_RECIPIENT)
 
     assert transaction.value.raw == 10**18
     assert transaction.value.symbol == native.symbol
     assert transaction.to_address == ROUTERS["polygon"]
+
+
+async def test_al_vender_nativo_no_hay_permiso_de_token_que_declarar() -> None:
+    """El nativo se paga como `value`, así que no hay ERC-20 que aprobar.
+
+    Declarar aquí un permiso pediría un `approve` de un token que la
+    transacción no mueve —el primer diálogo hablaría de un permiso que no
+    existe—, y la descripción lo dice para que quien lea el payload no lo eche
+    de menos.
+    """
+    _mock_quote(in_raw=str(10**18))
+    _mock_swap(to=ROUTERS["polygon"], value="0x0de0b6b3a7640000")
+
+    async with _engine() as engine:
+        transaction = await engine.plan_swap(_quote_nativo(), recipient=_RECIPIENT)
+
+    assert transaction.approval is None
+    assert "no hay permiso de token que conceder" in transaction.description
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +454,78 @@ async def test_cotizar_dos_veces_no_gasta_cuota() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# El permiso del token: este router cobra vía Permit2
+# --------------------------------------------------------------------------- #
+async def test_el_payload_declara_el_permiso_encadenado_por_permit2() -> None:
+    """Medido el 2026-10-09: los ocho routers llevan Permit2 dentro.
+
+    El router no mueve el token con un `transferFrom` propio: se lo pide a
+    Permit2. Sin declarar el permiso en el payload, el ejecutor aprueba directo
+    al router —que nunca cobra así— y el swap revierte al estimar el gas. Es la
+    declaración lo que desencadena los dos permisos encadenados: el ERC-20 a
+    Permit2 y Permit2 al router.
+    """
+    _mock_quote()
+    _mock_swap()
+    async with _engine() as engine:
+        tx = await engine.plan_swap(_quote(), recipient=_RECIPIENT)
+
+    assert tx.approval is not None
+    assert tx.approval == TokenApproval(spender=ROUTERS["ethereum"], via=PERMIT2)
+    # El `approve` directo es a Permit2, no al router: es el primer eslabón.
+    assert tx.approval.target == PERMIT2
+    assert "encadenado por Permit2" in tx.description
+    assert PERMIT2 in tx.description
+
+
+# --------------------------------------------------------------------------- #
+# El deslizamiento: manda el configurado; sin él, la constante del motor
+# --------------------------------------------------------------------------- #
+async def test_el_deslizamiento_configurado_manda_en_la_peticion_y_en_el_texto() -> None:
+    """La API construye con el `slippageTolerance` que se le entregue.
+
+    La cifra del texto sale del valor **efectivo** —el configurado—, no de la
+    constante: un payload que dijera 0,5 % mientras el cuerpo pide 2,5 % haría
+    firmar una tolerancia que no es la que se aplica.
+    """
+    quote_route = _mock_quote()
+    _mock_swap()
+    async with _engine() as engine:
+        tx = await engine.plan_swap(_quote(), recipient=_RECIPIENT, slippage_bps=250)
+
+    assert _body_of(quote_route.calls[-1].request)["slippageTolerance"] == 2.5
+    assert "2.5 % de deslizamiento tolerado" in tx.description
+
+
+async def test_sin_deslizamiento_configurado_sigue_siendo_el_del_motor() -> None:
+    """El parámetro es opcional: sin él, todo queda exactamente como estaba."""
+    quote_route = _mock_quote()
+    _mock_swap()
+    async with _engine() as engine:
+        tx = await engine.plan_swap(_quote(), recipient=_RECIPIENT)
+
+    assert _body_of(quote_route.calls[-1].request)["slippageTolerance"] == SLIPPAGE_PCT
+    assert f"{SLIPPAGE_PCT:g} % de deslizamiento tolerado" in tx.description
+
+
+async def test_dos_deslizamientos_no_comparten_la_cotizacion_en_cache() -> None:
+    """La tolerancia entra en la clave de caché: son construcciones distintas.
+
+    Compartir la cotización entre dos tolerancias serviría el cuerpo de la
+    segunda con la tolerancia de la primera, sin que nadie lo notara.
+    """
+    quote_route = _mock_quote()
+    _mock_swap()
+    async with _engine() as engine:
+        await engine.plan_swap(_quote(), recipient=_RECIPIENT, slippage_bps=10)
+        await engine.plan_swap(_quote(), recipient=_RECIPIENT, slippage_bps=250)
+
+    assert quote_route.call_count == 2
+    tolerancias = [_body_of(call.request)["slippageTolerance"] for call in quote_route.calls]
+    assert tolerancias == [0.1, 2.5]
+
+
+# --------------------------------------------------------------------------- #
 # Configuración
 # --------------------------------------------------------------------------- #
 def test_el_proveedor_declara_la_clave_como_obligatoria() -> None:
@@ -502,6 +589,34 @@ def _quote(*, chain_key: str = "ethereum", out_raw: int = int(_OUT_RAW)) -> Quot
         pair=pair,
         amount_in=TokenAmount(int(_IN_RAW), pair.base.decimals, pair.base.symbol),
         amount_out=TokenAmount(out_raw, pair.quote.decimals, pair.quote.symbol),
+        fee_bps=None,
+        fee_basis=None,
+        price_impact_bps=BasisPoints(1),
+        observed_at=NOW,
+        impact_basis=Measurement.REPORTED,
+    )
+
+
+def _quote_nativo(chain_key: str = "polygon") -> Quote:
+    """La cotización de vender el nativo: el caso sin permiso de token.
+
+    Se construye a mano —y no con `_quote`— porque el par tiene el nativo de
+    base, que es lo que hace que el build lo pague como `value`.
+    """
+    native = native_token(chain_key)
+    stable = _pair(chain_key).base
+    pair = TradingPair(base=native, quote=stable)
+    return Quote(
+        venue=Venue(
+            venue_id=f"uniswap@{chain_key}",
+            name=f"Uniswap (agregado, {chain_key})",
+            kind=VenueKind.DEX,
+            chain=chain_key,
+        ),
+        engine_id=MANIFEST.engine_id,
+        pair=pair,
+        amount_in=TokenAmount(10**18, native.decimals, native.symbol),
+        amount_out=TokenAmount(int(_OUT_RAW), stable.decimals, stable.symbol),
         fee_bps=None,
         fee_basis=None,
         price_impact_bps=BasisPoints(1),

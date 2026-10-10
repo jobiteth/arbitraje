@@ -20,7 +20,7 @@ from amigocompora.domain.modes import Capability, OperationMode
 from amigocompora.domain.money import BasisPoints
 from amigocompora.domain.protocols import EngineKind
 from amigocompora.engines.catalog import quote_token, wrapped_native
-from amigocompora.infra.config import Settings
+from amigocompora.infra.config import ExecutionSettings, Settings
 from amigocompora.infra.secrets import (
     AUTONOMY_PASSPHRASE_SECRET,
     PRIVATE_KEY_SECRET,
@@ -537,5 +537,28 @@ async def test_a_typo_late_in_the_list_does_not_take_down_the_engine_before_it()
     try:
         pila = container.registry.active_stack(EngineKind.DEX_QUOTES)
         assert [engine.manifest.engine_id for engine in pila] == ["uniswap_v3"]
+    finally:
+        await container.aclose()
+
+
+async def test_el_deslizamiento_vive_en_el_contenedor_y_es_el_que_construye() -> None:
+    """Una sola instancia: la que el engranaje cambia es la que el motor lee.
+
+    Nace de `execution.slippage_bps` de la configuración, y `PrepareSwap` tiene
+    que ver **esa misma** —no una copia—: si fueran dos, el engranaje cambiaría
+    la que se enseña mientras los swaps se seguirían construyendo con la otra.
+    """
+    container = await build_container(
+        Settings(execution=ExecutionSettings(slippage_bps=250)),
+        secret_store=InMemorySecretStore(),
+        configure_logs=False,
+    )
+    try:
+        assert container.slippage.bps == 250
+        assert container.prepare_swap.slippage is container.slippage
+        # El engranaje cambia el valor vivo sin reiniciar: el contenedor no se
+        # reconstruye, así que el cambio tiene que verse en el sitio compartido.
+        container.slippage.set(75)
+        assert container.slippage.bps == 75
     finally:
         await container.aclose()

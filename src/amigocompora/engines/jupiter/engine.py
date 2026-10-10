@@ -148,9 +148,13 @@ VENUE: Final = Venue(
     chain=CHAIN_KEY,
 )
 
-#: Tolerancia de deslizamiento que se pide al simular. No se ejecuta nada, así
-#: que no protege de nada: es un parámetro obligatorio de la API y afecta sólo a
-#: `otherAmountThreshold`, que este motor no lee. 50 bps es su valor habitual.
+#: Tolerancia de deslizamiento que se pide a la API cuando nadie fija otra. En la
+#: cotización de pantalla no se ejecuta nada, así que no protege de nada: es un
+#: parámetro obligatorio de la API y afecta sólo a `otherAmountThreshold`, que
+#: este motor no lee. Al **construir** es la que viaja dentro del
+#: `quoteResponse` con el que la API arma la transacción, y `plan_swap` la
+#: sustituye cuando llega `slippage_bps` —el deslizamiento que el usuario haya
+#: fijado—.
 SLIPPAGE_BPS: Final = 50
 
 #: Jupiter lee el importe como un u64 de Solana. Un valor mayor devuelve
@@ -250,7 +254,11 @@ class JupiterEngine:
         return () if quote is None else (quote,)
 
     async def _quote_payload(
-        self, pair: TradingPair, amount_in: TokenAmount
+        self,
+        pair: TradingPair,
+        amount_in: TokenAmount,
+        *,
+        slippage_bps: int = SLIPPAGE_BPS,
     ) -> Mapping[str, Any] | None:
         """La cotización **cruda** de la fuente, o `None` si no hay nada que cotizar.
 
@@ -271,7 +279,7 @@ class JupiterEngine:
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount_in.raw),
-                "slippageBps": str(SLIPPAGE_BPS),
+                "slippageBps": str(slippage_bps),
                 "swapMode": "ExactIn",
                 # Restringe los tokens intermedios a los de liquidez probada.
                 # Lo recomienda la propia API para que la ruta simulada sea la
@@ -285,10 +293,20 @@ class JupiterEngine:
             return None
         return as_mapping(raw, "respuesta", SOURCE_NAME)
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedSolanaTransaction:
+    async def plan_swap(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        slippage_bps: int | None = None,
+    ) -> UnsignedSolanaTransaction:
         """Construye la transacción sin firmar del swap que describe `quote`.
 
         No firma ni emite: devuelve el payload para que el usuario lo revise.
+
+        `slippage_bps` es la tolerancia que viaja dentro del `quoteResponse` con
+        el que la API arma la transacción; `None` deja el comportamiento de
+        siempre: la constante del módulo.
 
         ### Por qué vuelve a cotizar
 
@@ -311,7 +329,10 @@ class JupiterEngine:
 
         # 1. Cotización fresca, y comprobación de que sigue siendo la misma
         #    operación que el usuario decidió.
-        payload = await self._quote_payload(quote.pair, quote.amount_in)
+        effective_bps = SLIPPAGE_BPS if slippage_bps is None else slippage_bps
+        payload = await self._quote_payload(
+            quote.pair, quote.amount_in, slippage_bps=effective_bps
+        )
         if payload is None:
             raise NoQuotesError(
                 f"«{quote.pair.symbol}» ya no tiene ruta en {SOURCE_NAME}: la que "
@@ -336,7 +357,7 @@ class JupiterEngine:
             },
         )
         body = as_mapping(response, "respuesta de swap", SOURCE_NAME)
-        return self._to_unsigned(quote, body, fresh_raw, recipient)
+        return self._to_unsigned(quote, body, fresh_raw, recipient, slippage_bps=effective_bps)
 
     def expected_destination(self, chain_key: str) -> str | None:
         """`None`: en Solana no hay una tabla de routers que contrastar.
@@ -383,6 +404,8 @@ class JupiterEngine:
         body: Mapping[str, Any],
         fresh_raw: int,
         recipient: str,
+        *,
+        slippage_bps: int = SLIPPAGE_BPS,
     ) -> UnsignedSolanaTransaction:
         """Traduce la respuesta del swap, o falla diciendo qué campo no cuadró."""
         payload = body.get("swapTransaction")
@@ -424,7 +447,7 @@ class JupiterEngine:
             fee_payer=recipient,
             description=(
                 f"Swap en {quote.venue.name}: entregas {quote.amount_in} y recibes "
-                f"{fresh} según la ruta simulada, con {SLIPPAGE_BPS} bps de "
+                f"{fresh} según la ruta simulada, con {slippage_bps} bps de "
                 f"deslizamiento tolerado. La transacción caduca en la altura "
                 f"{height}."
             ),

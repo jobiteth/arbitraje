@@ -35,6 +35,7 @@ import httpx
 from amigocompora.app.confirmation import ConfirmationGateway, RecordingPrompt
 from amigocompora.app.mode_guard import ModeGuard
 from amigocompora.app.registry import EngineRegistry
+from amigocompora.app.slippage import DefaultSlippage
 from amigocompora.app.usecases.estimate_cost import EstimateNetworkCost
 from amigocompora.app.usecases.prepare_swap import PreparedSwap, PrepareSwap
 from amigocompora.domain.clock import FrozenClock
@@ -151,6 +152,9 @@ class _FakePlanner:
 
     def __init__(self) -> None:
         self.planned: list[tuple[Quote, str]] = []
+        #: El deslizamiento con el que se le pidió cada payload, en el mismo orden
+        #: que `planned`. `None` significa «el que decida el motor».
+        self.slippages: list[int | None] = []
 
     @property
     def manifest(self) -> EngineManifest:
@@ -166,8 +170,11 @@ class _FakePlanner:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         return ()
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
+    async def plan_swap(
+        self, quote: Quote, *, recipient: str, slippage_bps: int | None = None
+    ) -> PlannedTransaction:
         self.planned.append((quote, recipient))
+        self.slippages.append(slippage_bps)
         if quote.pair.chain == "solana":
             return UnsignedSolanaTransaction(
                 transaction_b64=base64.b64encode(b"\x01" * 64).decode(),
@@ -220,6 +227,22 @@ async def _prepare(
     registry.register(_Provider(_FakePlanner()))
     await registry.activate("fake_dex")
     return PrepareSwap(registry=registry, gateway=gateway, estimate=estimate)
+
+
+async def _prepare_con_planificador(
+    *, slippage: DefaultSlippage | None
+) -> tuple[PrepareSwap, _FakePlanner]:
+    """Como `_prepare`, pero dejando el doble a la vista para leerle lo anotado."""
+    guard = ModeGuard(OperationMode.ASSISTED)
+    gateway = ConfirmationGateway(guard, prompt=RecordingPrompt(answer=True))
+    registry = EngineRegistry(guard)
+    planner = _FakePlanner()
+    registry.register(_Provider(planner))
+    await registry.activate("fake_dex")
+    return (
+        PrepareSwap(registry=registry, gateway=gateway, estimate=None, slippage=slippage),
+        planner,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -327,6 +350,55 @@ async def test_sin_estimador_la_preparacion_sigue_siendo_la_de_antes() -> None:
     assert prepared.cost_error is None
     detalles = prepare.gateway.history[-1].action.details
     assert not any("Coste de red" in detalle for detalle in detalles)
+
+
+# --------------------------------------------------------------------------- #
+# El deslizamiento vigente y el contrato público de `estimate_cost`
+# --------------------------------------------------------------------------- #
+async def test_el_build_pasa_el_deslizamiento_vigente_al_motor() -> None:
+    """Con la tolerancia viva puesta, el motor la recibe; sin ella, `None`.
+
+    `None` es «lo que decida el motor», y es lo que deja idénticas a las
+    llamadas anteriores al engranaje: se afirman las dos ramas para que la
+    omisión no pueda convertirse en un cero sigiloso.
+    """
+    con, planificador = await _prepare_con_planificador(slippage=DefaultSlippage(250))
+    await con.build(_evm_quote(), recipient=DESTINO)
+
+    sin, planificador_sin = await _prepare_con_planificador(slippage=None)
+    await sin.build(_evm_quote(), recipient=DESTINO)
+
+    assert planificador.slippages == [250]
+    assert planificador_sin.slippages == [None]
+
+
+async def test_estimate_cost_publico_devuelve_los_dos_desuenlaces_sin_lanzar() -> None:
+    """Es el contrato que usa la ejecución, llamado sin pasar por el diálogo.
+
+    Cifra con motivo en `None`, o motivo con cifra en `None`: nunca lanza, que
+    es lo que permite llamarlo antes del último sí sin que un nodo caído
+    frustre la operación.
+    """
+    prepare = await _prepare(
+        estimate=EstimateNetworkCost({"ethereum": _broadcaster(_node())})
+    )
+    transaccion = await prepare.build(_evm_quote(), recipient=DESTINO)
+    assert isinstance(transaccion, UnsignedTransaction)
+
+    coste, error = await prepare.estimate_cost(transaccion, _evm_quote(), CARTERA)
+    assert coste is not None
+    assert str(coste.native) == COSTE_ESPERADO
+    assert error is None
+
+    caido = await _prepare(
+        estimate=EstimateNetworkCost(
+            {"ethereum": _broadcaster(_node(eth_estimateGas=_RpcError("execution reverted")))}
+        )
+    )
+    coste, error = await caido.estimate_cost(transaccion, _evm_quote(), CARTERA)
+    assert coste is None
+    assert error is not None
+    assert "revertiría" in error
 
 
 # --------------------------------------------------------------------------- #

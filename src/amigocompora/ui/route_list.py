@@ -497,9 +497,10 @@ class RouteDetail(QWidget):
             "deslizamiento",
             f"{slippage_bps} bps",
             tooltip=(
-                "Tolerancia configurada en execution.slippage_bps. Al construir el "
-                "payload, cada motor fija además el mínimo que acepta: esta cifra "
-                "no cambia lo que el swap aceptaría."
+                "Tolerancia con la que se construye el swap: el mínimo que aceptas "
+                "recibir, fijado con el engranaje de la tarjeta de intercambio y "
+                "guardado en config.toml. Cuanto más baja, más te protege de un "
+                "movimiento del precio y más fácil es que la operación revierta."
             ),
         )
         if owner:

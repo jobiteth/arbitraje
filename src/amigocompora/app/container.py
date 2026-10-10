@@ -20,6 +20,7 @@ import structlog
 
 from amigocompora.app.alerts import AlertCenter, AlertKind, severity_for_bps
 from amigocompora.app.confirmation import ConfirmationGateway
+from amigocompora.app.engine_names import EngineNames
 from amigocompora.app.execution_policy import (
     AutonomyPolicy,
     ExecutionLedger,
@@ -29,6 +30,7 @@ from amigocompora.app.execution_policy import (
 from amigocompora.app.mode_guard import ModeGuard
 from amigocompora.app.registry import EngineRegistry, sole_engine_for
 from amigocompora.app.scheduler import Scheduler
+from amigocompora.app.slippage import DefaultSlippage
 from amigocompora.app.usecases.analyze_prediction_market import AnalyzePredictionMarkets
 from amigocompora.app.usecases.analyze_with_ai import AnalyzeWithAi
 from amigocompora.app.usecases.claim_bridge import ClaimBridge
@@ -120,6 +122,15 @@ class Container:
     analyze_markets: AnalyzePredictionMarkets
     find_prediction_opportunities: FindPredictionOpportunities
     prepare_swap: PrepareSwap
+    #: La tolerancia de deslizamiento **viva**, la misma que usa `prepare_swap` al
+    #: construir. La interfaz la lee para pintarla y la cambia con el engranaje:
+    #: es mutable a propósito porque `Settings` se lee una vez al arrancar y esto
+    #: tiene que cambiar sin reiniciar.
+    slippage: DefaultSlippage
+    #: Alias de pantalla de los motores, editables desde la pestaña de motores.
+    #: Es mutable —como `slippage`— porque un nombre se cambia sin reiniciar; la
+    #: instancia es única para que todas las pantallas digan el mismo nombre.
+    engine_names: EngineNames
     #: Construye el payload sin firmar de un puente. Es al camino de puentes lo
     #: que `prepare_swap` es al de swaps, y por la misma razón: poder mirar qué se
     #: haría sin que nada ocurra.
@@ -314,10 +325,21 @@ async def build_container(
         gas_policy=effective_settings.execution.gas.to_policy(),
         clock=effective_clock,
     )
+    # La tolerancia viva con la que se construyen los swaps. Nace de la
+    # configuración y el engranaje de la pantalla la cambia sin reiniciar: por eso
+    # es un objeto compartido y no un campo de `Settings` (que es inmutable). Una
+    # sola instancia, la que `PrepareSwap` lee al construir, para que lo que el
+    # engranaje enseña y lo que el motor aplica no puedan separarse.
+    slippage = DefaultSlippage(effective_settings.execution.slippage_bps)
+    # Los alias de pantalla de los motores. Nacen de la configuración y la
+    # pestaña de motores los edita sin reiniciar; una sola instancia, para que
+    # todas las pantallas que enseñan nombres digan el mismo.
+    engine_names = EngineNames(effective_settings.engine_names)
     prepare_swap = PrepareSwap(
         registry=registry,
         gateway=gateway,
         estimate=EstimateNetworkCost(broadcasters),
+        slippage=slippage,
     )
     prepare_bridge = PrepareBridge(registry=registry, gateway=gateway)
     execution = _build_execution(
@@ -347,6 +369,8 @@ async def build_container(
             clock=effective_clock,
         ),
         prepare_swap=prepare_swap,
+        slippage=slippage,
+        engine_names=engine_names,
         prepare_bridge=prepare_bridge,
         execute_swap=execution.execute_swap,
         execute_bridge=execution.execute_bridge,

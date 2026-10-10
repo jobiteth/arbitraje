@@ -30,6 +30,7 @@ import structlog
 
 from amigocompora.app.confirmation import ConfirmationGateway
 from amigocompora.app.registry import EngineRegistry
+from amigocompora.app.slippage import DefaultSlippage
 from amigocompora.app.usecases.estimate_cost import EstimateNetworkCost, NetworkCost
 from amigocompora.domain.addresses import require_evm_address, require_solana_address, shorten
 from amigocompora.domain.chains import AddressFormat, chain
@@ -67,6 +68,10 @@ class PrepareSwap:
     #: las pruebas que no van del coste, y es la razón de que el campo tenga
     #: valor por omisión en vez de ser obligatorio.
     estimate: EstimateNetworkCost | None = None
+    #: La tolerancia viva que el engranaje cambia. Sin ella se construye con la
+    #: constante de cada motor, que es lo que hacían las llamadas antes de que
+    #: este campo existiera: las pruebas que construyen a mano no cambian.
+    slippage: DefaultSlippage | None = None
 
     def is_available(self, chain_key: str | None = None) -> bool:
         """Si hay algún motor activo capaz de construir un swap.
@@ -110,8 +115,15 @@ class PrepareSwap:
         destination = destination_for(quote, recipient)
         engine = self.planner_for(quote)
         # El motor reúne el payload y responde de que corresponde a la
-        # cotización que se le pasa: es él quien detecta la deriva de precio.
-        return await engine.plan_swap(quote, recipient=destination)
+        # cotización que se le pasa: es él quien detecta la deriva de precio. El
+        # deslizamiento es el vigente —el del engranaje, o el del motor si no
+        # hay ninguno fijado—: es la tolerancia con la que se firma el mínimo,
+        # así que no puede quedarse en la constante mientras la interfaz dice
+        # otra cosa.
+        slippage_bps = None if self.slippage is None else self.slippage.bps
+        return await engine.plan_swap(
+            quote, recipient=destination, slippage_bps=slippage_bps
+        )
 
     async def __call__(
         self, quote: Quote, *, recipient: str, sender: str | None = None
@@ -127,8 +139,8 @@ class PrepareSwap:
 
         # 2b. El coste de red, con el payload ya construido: la estimación
         #     necesita el calldata exacto, así que no puede ir antes. Y no
-        #     frustra la preparación si falla —ver `_estimate_cost`—.
-        coste, cost_error = await self._estimate_cost(transaction, quote, sender)
+        #     frustra la preparación si falla —ver `estimate_cost`—.
+        coste, cost_error = await self.estimate_cost(transaction, quote, sender)
 
         # 3. Y ahora sí, pedir el sí explícito, con el payload real delante.
         details = [
@@ -161,10 +173,15 @@ class PrepareSwap:
             transaction=transaction, network_cost=coste, cost_error=cost_error
         )
 
-    async def _estimate_cost(
+    async def estimate_cost(
         self, transaction: PlannedTransaction, quote: Quote, sender: str | None
     ) -> tuple[NetworkCost | None, str | None]:
         """El coste de red, o el motivo por el que no lo hay. Nunca lanza.
+
+        Es público porque el camino de ejecución lo usa **después** de conceder
+        los permisos y antes del último sí: con el allowance ya dado, la
+        estimación no revierte por eso y la cifra que entra en el diálogo de
+        confirmación es la de la transacción que de verdad se va a firmar.
 
         Se estima **desde la cartera que firmaría** (`sender`), no desde el
         destino: el gas depende de quién envía —un swap sin allowance revierte

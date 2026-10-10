@@ -491,6 +491,12 @@ class Settings(BaseSettings):
     #: instalado para ella, se autoactiva.
     active_engines: dict[str, str | tuple[str, ...]] = Field(default_factory=dict)
 
+    #: Alias de pantalla por id de motor: `{"uniswap_v3": "Uniswap V3"}`. Es sólo
+    #: el nombre que se enseña —el motor sigue siendo el mismo id y hace lo
+    #: mismo— y lo edita la pestaña de motores, que lo guarda aquí para que siga
+    #: puesto tras cerrar.
+    engine_names: dict[str, str] = Field(default_factory=dict)
+
     #: Direcciones **de sólo lectura** que el usuario quiere observar. La
     #: aplicación no guarda claves privadas y no puede operar con ellas.
     watch_addresses: tuple[str, ...] = ()

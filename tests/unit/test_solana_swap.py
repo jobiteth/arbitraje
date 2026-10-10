@@ -64,6 +64,7 @@ from amigocompora.domain.money import BasisPoints, TokenAmount
 from amigocompora.domain.protocols import EngineKind, EngineManifest
 from amigocompora.engines.jupiter.engine import (
     QUOTE_URL,
+    SLIPPAGE_BPS,
     SWAP_URL,
     VENUE,
     JupiterEngine,
@@ -281,6 +282,43 @@ async def test_tolera_la_deriva_dentro_del_margen() -> None:
 
 
 @respx.mock
+async def test_el_deslizamiento_fijado_viaja_en_la_recotizacion_y_en_el_texto() -> None:
+    """La API de swap no tiene campo de deslizamiento: lo lee del `quoteResponse`.
+
+    Por eso la tolerancia viaja en la re-cotización, que es la que se entrega
+    dentro del cuerpo; el texto la dice con la cifra efectiva, no con la
+    constante.
+    """
+    quote_route = respx.get(QUOTE_URL).mock(
+        return_value=httpx.Response(200, json=_quote_response("150000000"))
+    )
+    respx.post(SWAP_URL).mock(return_value=httpx.Response(200, json=_swap_body()))
+
+    async with _engine() as engine:
+        tx = await engine.plan_swap(
+            _solana_quote(out_raw=150_000_000), recipient=WSOL, slippage_bps=250
+        )
+
+    assert dict(quote_route.calls[-1].request.url.params)["slippageBps"] == "250"
+    assert "con 250 bps" in tx.description
+
+
+@respx.mock
+async def test_sin_deslizamiento_fijado_se_pide_el_del_motor() -> None:
+    """El parámetro es opcional: sin él, la petición queda exactamente igual."""
+    quote_route = respx.get(QUOTE_URL).mock(
+        return_value=httpx.Response(200, json=_quote_response("150000000"))
+    )
+    respx.post(SWAP_URL).mock(return_value=httpx.Response(200, json=_swap_body()))
+
+    async with _engine() as engine:
+        await engine.plan_swap(_solana_quote(out_raw=150_000_000), recipient=WSOL)
+
+    params = dict(quote_route.calls[-1].request.url.params)
+    assert params["slippageBps"] == str(SLIPPAGE_BPS)
+
+
+@respx.mock
 async def test_sin_ruta_no_sigue_con_la_cotizacion_vieja() -> None:
     """Un 400 `TOKEN_NOT_TRADABLE` es «ya no hay ruta», no «usa la de antes»."""
     respx.get(QUOTE_URL).mock(
@@ -423,6 +461,16 @@ def _quote_response(out_raw: str) -> dict[str, Any]:
     }
 
 
+def _swap_body(*, tx: str | None = None, height: int | None = _VALID_HEIGHT) -> dict[str, Any]:
+    """El cuerpo medido de `POST /swap`, para las pruebas que montan sus rutas."""
+    body: dict[str, Any] = {
+        "swapTransaction": tx if tx is not None else base64.b64encode(_TX_BYTES).decode(),
+    }
+    if height is not None:
+        body["lastValidBlockHeight"] = height
+    return body
+
+
 def _mock_api(
     *,
     fresh_out: str,
@@ -431,12 +479,9 @@ def _mock_api(
 ) -> Any:
     """Simula los dos endpoints y devuelve la ruta del POST, para comprobarla."""
     respx.get(QUOTE_URL).mock(return_value=httpx.Response(200, json=_quote_response(fresh_out)))
-    body: dict[str, Any] = {
-        "swapTransaction": tx if tx is not None else base64.b64encode(_TX_BYTES).decode(),
-    }
-    if height is not None:
-        body["lastValidBlockHeight"] = height
-    return respx.post(SWAP_URL).mock(return_value=httpx.Response(200, json=body))
+    return respx.post(SWAP_URL).mock(
+        return_value=httpx.Response(200, json=_swap_body(tx=tx, height=height))
+    )
 
 
 class _FakePlanner:
@@ -459,7 +504,9 @@ class _FakePlanner:
     async def quote(self, pair: TradingPair, amount_in: TokenAmount) -> Sequence[Quote]:
         return ()
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
+    async def plan_swap(
+        self, quote: Quote, *, recipient: str, slippage_bps: int | None = None
+    ) -> PlannedTransaction:
         self.planned.append((quote, recipient))
         # Devuelve la forma que corresponde a su red, igual que el motor real: es
         # lo que la UI tiene que saber pintar sin preguntar de qué tipo es.

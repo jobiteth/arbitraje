@@ -382,7 +382,11 @@ class ConfiguracionPage(QWidget):
                 f"{opcion}: {self._estado_clave(secret_key(manifest.engine_id, opcion))}"
                 for opcion in manifest.config_options
             )
-            celdas = (manifest.name, hosts, claves or "—")
+            celdas = (
+                self._container.engine_names.resolve(manifest.engine_id, manifest.name),
+                hosts,
+                claves or "—",
+            )
             for columna, texto in enumerate(celdas):
                 celda = QTableWidgetItem(texto)
                 if columna == 0:

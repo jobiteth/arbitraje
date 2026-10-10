@@ -157,7 +157,9 @@ class _Builder(_Engine):
     con la del que sólo cotiza deja la fila sin poder firmarse.
     """
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> PlannedTransaction:
+    async def plan_swap(
+        self, quote: Quote, *, recipient: str, slippage_bps: int | None = None
+    ) -> PlannedTransaction:
         raise AssertionError("comparar no construye nada")
 
     def expected_destination(self, chain_key: str) -> str | None:

@@ -53,6 +53,11 @@ directo queda de respaldo.
   direcciones distintas en ocho redes** (polygon y bsc comparten una). Por eso no
   se puede fijar un router único: se fija una **tabla medida por red** y se
   rechaza cualquier otra. Ver `ROUTERS`.
+- **Los ocho routers cobran el token vía Permit2.** Medido el 2026-10-09 con
+  `eth_getCode`: los ocho llevan `0x0000…78BA3` dentro de su bytecode (24 381
+  bytes idénticos), así que **no** hacen `transferFrom` ellos mismos. El payload
+  declara el permiso encadenado (`TokenApproval(via=PERMIT2)`); sin él, aprobar
+  directo al router no sirve de nada y el swap revierte al estimar el gas.
 
 ### La defensa que esto permite, y por qué es necesaria
 
@@ -92,6 +97,7 @@ from amigocompora.domain.models import (
     Measurement,
     Quote,
     Token,
+    TokenApproval,
     TradingPair,
     UnsignedTransaction,
     Venue,
@@ -143,6 +149,16 @@ ROUTERS: Final[Mapping[str, str]] = {
 #: ofrecer un botón que falla al pulsarlo.
 SWAP_CHAINS: Final = frozenset(ROUTERS)
 
+#: Permit2. Se **midió** el 2026-10-09: los ocho routers de `ROUTERS` llevan
+#: esta dirección dentro de su bytecode desplegado (los ocho, 24 381 bytes
+#: idénticos, con `eth_getCode`), así que cobran el token pidiéndoselo a Permit2
+#: y **no** con un `transferFrom` propio. Sin declarar el permiso encadenado, la
+#: aprobación directa al router no sirve de nada y el swap revierte al estimar
+#: el gas —pasó de verdad, con pUSD contra POL—. Es la misma dirección en todas
+#: las redes porque se desplegó con CREATE2 (igual que en uniswap_v3 y v4, que
+#: también lo declaran); cada motor escribe la suya para no depender de otro.
+PERMIT2: Final = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+
 #: Dirección con la que se **cotiza**. No es la del usuario y no puede serlo:
 #: `cotizar` no recibe destinatario, y la API exige uno. Se usa un centinela
 #: fijo en vez de la del usuario por una razón concreta: la cotización es
@@ -160,9 +176,11 @@ QUOTE_SWAPPER: Final = "0x1111111111111111111111111111111111111111"
 #: al nativo como quiere, y este archivo usa la de esta.
 NATIVE_ADDRESS: Final = "0x0000000000000000000000000000000000000000"
 
-#: Tolerancia de deslizamiento que se pide. No se ejecuta nada, así que no
-#: protege de nada: es un parámetro obligatorio y afecta al mínimo garantizado
-#: que la API calcula dentro del payload, no a la cifra que se muestra.
+#: Tolerancia de deslizamiento que se pide **al cotizar** (la pantalla). No se
+#: ejecuta nada, así que no protege de nada: es un parámetro obligatorio y afecta
+#: al mínimo garantizado que la API calcula dentro del payload, no a la cifra que
+#: se muestra. Al **construir** manda la que traiga `plan_swap` —la que el
+#: usuario haya fijado con el engranaje— y ésta sólo es el respaldo.
 SLIPPAGE_PCT: Final = 0.5
 
 #: Preferencia de ruteo. `BEST_PRICE` es lo que se midió; cambiarla cambiaría el
@@ -267,7 +285,13 @@ class UniswapEngine:
         quote = self._to_quote(payload, pair, amount_in)
         return () if quote is None else (quote,)
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction:
+    async def plan_swap(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        slippage_bps: int | None = None,
+    ) -> UnsignedTransaction:
         """Construye la transacción sin firmar del swap que describe `quote`.
 
         No firma ni emite: devuelve el payload para que el usuario lo revise.
@@ -285,7 +309,12 @@ class UniswapEngine:
         Si el `swapper` influyera en el precio, la comparación lo detectaría y se
         negaría a construir — que es la forma correcta de fallar ante algo que no
         se ha medido.
+
+        `slippage_bps` es la tolerancia con la que se fija el mínimo garantizado
+        dentro del payload. Sin él se usa la constante del módulo: es lo que
+        piden las pruebas y quien llame sin configurar nada.
         """
+        slippage_pct = SLIPPAGE_PCT if slippage_bps is None else slippage_bps / 100
         if quote.pair.chain not in SWAP_CHAINS:
             raise UnsupportedOperationError(
                 f"este motor sólo construye swaps en las redes EVM que tiene "
@@ -294,7 +323,9 @@ class UniswapEngine:
             )
 
         # 1. Cotización fresca, a nombre de quien va a recibir.
-        payload = await self._quote_payload(quote.pair, quote.amount_in, swapper=recipient)
+        payload = await self._quote_payload(
+            quote.pair, quote.amount_in, swapper=recipient, slippage_pct=slippage_pct
+        )
         if payload is None:
             raise NoQuotesError(
                 f"«{quote.pair.symbol}» ya no tiene ruta en {SOURCE_NAME}: la que "
@@ -313,10 +344,15 @@ class UniswapEngine:
         #    payload describe una transacción y no se puede reutilizar.
         response = await self._source.post_json(SWAP_URL, json_body={"quote": payload})
         body = as_mapping(response, "respuesta de swap", SOURCE_NAME)
-        return self._to_unsigned(quote, body, fresh_raw)
+        return self._to_unsigned(quote, body, fresh_raw, slippage_pct=slippage_pct)
 
     async def _quote_payload(
-        self, pair: TradingPair, amount_in: TokenAmount, *, swapper: str
+        self,
+        pair: TradingPair,
+        amount_in: TokenAmount,
+        *,
+        swapper: str,
+        slippage_pct: float = SLIPPAGE_PCT,
     ) -> Mapping[str, Any] | None:
         """El objeto `quote` **crudo** de la API, o `None` si no hay ruta.
 
@@ -324,6 +360,10 @@ class UniswapEngine:
         endpoint de swap necesita: ésta es una lectura derivada y no conserva
         los campos —`quoteId`, `route`, `blockNumber`— que la API espera de
         vuelta. Ver `plan_swap`.
+
+        `slippage_pct` entra en la petición y en la clave de caché: la respuesta
+        lleva dentro el mínimo garantizado, así que dos tolerancias distintas
+        no pueden compartir entrada.
         """
         chain_key = pair.chain
         chain_id = _chain_id(chain_key)
@@ -336,7 +376,7 @@ class UniswapEngine:
             "amount": str(amount),
             "type": "EXACT_INPUT",
             "swapper": swapper,
-            "slippageTolerance": SLIPPAGE_PCT,
+            "slippageTolerance": slippage_pct,
             "routingPreference": ROUTING,
         }
         raw = await self._source.post_json(
@@ -346,7 +386,7 @@ class UniswapEngine:
             # respuesta. El `swapper` entra porque la cotización lleva dentro
             # los datos de permiso de **esa** dirección: compartir la entrada
             # entre destinatarios devolvería un payload a nombre de otro.
-            cache_key=_cache_key(chain_key, pair, amount_in, swapper),
+            cache_key=_cache_key(chain_key, pair, amount_in, swapper, slippage_pct),
         )
         envelope = as_mapping(raw, "respuesta", SOURCE_NAME)
         quote = envelope.get("quote")
@@ -394,6 +434,8 @@ class UniswapEngine:
         quote: Quote,
         body: Mapping[str, Any],
         fresh_raw: int,
+        *,
+        slippage_pct: float = SLIPPAGE_PCT,
     ) -> UnsignedTransaction:
         """Traduce la respuesta del swap, o falla diciendo qué campo no cuadró."""
         payload = as_mapping(body.get("swap"), "swap", SOURCE_NAME)
@@ -426,6 +468,17 @@ class UniswapEngine:
         gas_limit = _positive_int(payload.get("gasLimit"))
         out_token = quote.pair.quote
         fresh = TokenAmount(fresh_raw, out_token.decimals, out_token.symbol)
+        # El nativo se paga como `value` —y entonces no hay ERC-20 que aprobar—;
+        # todo lo demás lo cobra el router vía Permit2 (medido en su bytecode,
+        # ver `PERMIT2`). Declararlo aquí es lo que hace que el ejecutor conceda
+        # los dos permisos encadenados antes de firmar; sin esta línea aprobaba
+        # directo al router, que nunca cobra así, y el swap revertía.
+        pays_native = value_raw > 0
+        approval = (
+            None
+            if pays_native
+            else TokenApproval(spender=destination, via=PERMIT2)
+        )
         _log.info(
             "uniswap.swap_planned",
             pair=quote.pair.symbol,
@@ -433,6 +486,7 @@ class UniswapEngine:
             out_raw=fresh_raw,
             destination=destination,
             value_raw=value_raw,
+            approval_via=approval.via if approval is not None else None,
         )
         return UnsignedTransaction(
             chain_id=spec.require_eip155_id(),
@@ -440,12 +494,22 @@ class UniswapEngine:
             calldata=calldata,
             value=TokenAmount(value_raw, spec.native_decimals, spec.native_symbol),
             gas_limit=gas_limit,
+            approval=approval,
             description=(
                 f"Swap en {quote.venue.name}: entregas {quote.amount_in} y recibes "
-                f"{fresh}, con {SLIPPAGE_PCT} % de deslizamiento tolerado. El "
+                f"{fresh}, con {slippage_pct:g} % de deslizamiento tolerado. El "
                 f"contrato de destino es {destination}, el que «{SOURCE_NAME}» "
-                f"tiene medido para {spec.name}. Esta transacción no incluye la "
-                f"aprobación previa del token, si hiciera falta."
+                f"tiene medido para {spec.name}. "
+                + (
+                    "Se entrega el nativo de la red, así que no hay permiso de "
+                    "token que conceder."
+                    if pays_native
+                    else (
+                        f"El permiso del token, si hiciera falta, va encadenado "
+                        f"por Permit2 ({PERMIT2}): este router no mueve el token "
+                        f"él mismo."
+                    )
+                )
             ),
         )
 
@@ -540,6 +604,7 @@ def _cache_key(
     pair: TradingPair,
     amount_in: TokenAmount,
     swapper: str,
+    slippage_pct: float,
 ) -> str:
     """Clave de caché de una cotización: todo lo que la respuesta depende de.
 
@@ -553,6 +618,7 @@ def _cache_key(
             _api_address(pair.quote),
             str(amount_in.raw),
             swapper.lower(),
+            str(slippage_pct),
         )
     )
 

@@ -58,6 +58,7 @@ from amigocompora.app.container import Container
 from amigocompora.domain.chains import CHAINS
 from amigocompora.domain.execution import ANY_TOKEN
 from amigocompora.domain.models import Token
+from amigocompora.domain.money import BasisPoints
 from amigocompora.ui import icons
 from amigocompora.ui.theme import (
     COLOR_ACCENT,
@@ -289,6 +290,8 @@ class SwapCard(QWidget):
     balances_requested = Signal()
     #: Hay que firmar y emitir la retirada que describe el formulario de envío.
     send_requested = Signal()
+    #: Se pulsó el engranaje: hay que configurar el deslizamiento por defecto.
+    slippage_requested = Signal()
 
     def __init__(
         self,
@@ -358,6 +361,17 @@ class SwapCard(QWidget):
         )
         self._refresh_btn.clicked.connect(self.balances_requested.emit)
         card.header.addWidget(self._refresh_btn)
+
+        # El engranaje del deslizamiento, en la esquina superior derecha. Está en
+        # la cabecera —y no escondido en Ajustes— porque es un número que cambia
+        # lo que se firma: el mínimo que un swap acepta recibir. El tooltip dice
+        # el valor vigente, para no tener que abrir el diálogo sólo para mirarlo.
+        self._slippage_btn = QPushButton("⚙")
+        self._slippage_btn.setObjectName("link")
+        self._slippage_btn.setMinimumWidth(28)
+        self._slippage_btn.clicked.connect(self.slippage_requested.emit)
+        card.header.addWidget(self._slippage_btn)
+        self.set_slippage_bps(self._container.slippage.bps)
 
         card.add_row(self._build_segment())
         self._forms = QStackedWidget()
@@ -1003,6 +1017,20 @@ class SwapCard(QWidget):
         """La cifra de la pata que se recibe, o su ausencia."""
         self._want.set_readout(text, bright=known)
 
+    def set_slippage_bps(self, bps: int) -> None:
+        """El deslizamiento vigente, en el tooltip del engranaje.
+
+        Se enseña aquí porque es un número que cambia lo que se firma —el mínimo
+        que el swap acepta recibir— y comprobarlo no debería costar abrir un
+        diálogo. Lo que se pinta es el valor **vivo**, el mismo que usará el
+        motor al construir: si dijera otro, sería una etiqueta que miente.
+        """
+        self._slippage_btn.setToolTip(
+            f"Deslizamiento por defecto: {BasisPoints(bps).as_percent():f} %.\n\n"
+            "Es la tolerancia con la que se construye el swap: el mínimo que "
+            "aceptas recibir. Se configura aquí y se guarda en config.toml."
+        )
+
     def set_status(self, text: str) -> None:
         self._status.setText(text)
         self._status.setStyleSheet("")
@@ -1082,6 +1110,10 @@ class SwapCard(QWidget):
     @property
     def send_btn(self) -> QPushButton:
         return self._send_btn
+
+    @property
+    def slippage_btn(self) -> QPushButton:
+        return self._slippage_btn
 
 
 def qr_pixmap(address: str) -> QPixmap:

@@ -335,7 +335,8 @@ class CredentialsCard(QWidget):
                     self._secrets_grid,
                     position,
                     secret_key(manifest.engine_id, option),
-                    f"{manifest.name} — {option}",
+                    f"{self._container.engine_names.resolve(manifest.engine_id, manifest.name)}"
+                    f" — {option}",
                     (
                         "Obligatoria: sin ella este motor no arranca."
                         if required

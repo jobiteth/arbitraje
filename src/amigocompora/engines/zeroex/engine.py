@@ -138,9 +138,11 @@ QUOTE_TAKER: Final = "0x1111111111111111111111111111111111111111"
 #: API tiene su convención y este archivo usa la de esta.
 NATIVE_SENTINEL: Final = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 
-#: Tolerancia de deslizamiento que se pide en la cotización. Afecta al
+#: Tolerancia de deslizamiento que se pide cuando nadie fija otra. Afecta al
 #: `minBuyAmount` que la API calcula dentro del payload, no a la cifra que se
 #: muestra. Medido: con 50 el mínimo es exactamente el 99,5 % del importe.
+#: `plan_swap` lo sustituye cuando llega `slippage_bps` —el deslizamiento que el
+#: usuario haya fijado—.
 SLIPPAGE_BPS: Final = 50
 
 #: Deriva máxima tolerada entre la cotización mostrada y la del momento de
@@ -265,10 +267,19 @@ class ZeroExEngine:
         quote = self._to_quote(payload, pair, amount_in)
         return () if quote is None else (quote,)
 
-    async def plan_swap(self, quote: Quote, *, recipient: str) -> UnsignedTransaction:
+    async def plan_swap(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        slippage_bps: int | None = None,
+    ) -> UnsignedTransaction:
         """Construye la transacción sin firmar del swap que describe `quote`.
 
         No firma ni emite: devuelve el payload para que el usuario lo revise.
+
+        `slippage_bps` es la tolerancia que se le pide a la API; `None` deja el
+        comportamiento de siempre: la constante del módulo.
 
         Si el build está apagado no se construye **nada**, y el mensaje dice por
         qué: no es una avería, es que cada swap por aquí paga la comisión de
@@ -291,7 +302,10 @@ class ZeroExEngine:
         # Cotización fresca, a nombre de quien va a recibir: el `taker` entra en
         # el calldata, así que la que se mostró —con el centinela— no sirve para
         # construir. Se usa esta misma respuesta para comparar y para construir.
-        payload = await self._quote_payload(quote.pair, quote.amount_in, taker=recipient)
+        effective_bps = SLIPPAGE_BPS if slippage_bps is None else slippage_bps
+        payload = await self._quote_payload(
+            quote.pair, quote.amount_in, taker=recipient, slippage_bps=effective_bps
+        )
         if payload is None:
             raise NoQuotesError(
                 f"«{quote.pair.symbol}» ya no tiene ruta en {SOURCE_NAME}: la que "
@@ -305,10 +319,15 @@ class ZeroExEngine:
                 f"legible; no se puede construir nada con ella."
             )
         self._require_same_price(quote, fresh_raw)
-        return self._to_unsigned(quote, payload, fresh_raw)
+        return self._to_unsigned(quote, payload, fresh_raw, slippage_bps=effective_bps)
 
     async def _quote_payload(
-        self, pair: TradingPair, amount_in: TokenAmount, *, taker: str
+        self,
+        pair: TradingPair,
+        amount_in: TokenAmount,
+        *,
+        taker: str,
+        slippage_bps: int = SLIPPAGE_BPS,
     ) -> Mapping[str, Any] | None:
         """El cuerpo de la respuesta, o `None` si la fuente dice que no hay ruta.
 
@@ -326,7 +345,7 @@ class ZeroExEngine:
                 "buyToken": _api_token(pair.quote),
                 "sellAmount": str(amount_in.raw),
                 "taker": taker,
-                "slippageBps": str(SLIPPAGE_BPS),
+                "slippageBps": str(slippage_bps),
             },
         )
         body = as_mapping(raw, "respuesta", SOURCE_NAME)
@@ -378,6 +397,8 @@ class ZeroExEngine:
         quote: Quote,
         payload: Mapping[str, Any],
         fresh_raw: int,
+        *,
+        slippage_bps: int = SLIPPAGE_BPS,
     ) -> UnsignedTransaction:
         """Traduce el `transaction` de la respuesta, o falla diciendo qué falló."""
         raw_transaction = payload.get("transaction")
@@ -431,7 +452,7 @@ class ZeroExEngine:
             gas_limit=gas_limit,
             description=(
                 f"Swap en {quote.venue.name}: entregas {quote.amount_in} y recibes "
-                f"{fresh}, con un {SLIPPAGE_BPS / 100:g} % de deslizamiento "
+                f"{fresh}, con un {slippage_bps / 100:g} % de deslizamiento "
                 f"tolerado. El contrato de destino es {destination}, el que "
                 f"«{SOURCE_NAME}» tiene medido para {spec.name}. Esta transacción "
                 f"no incluye la aprobación previa del token, si hiciera falta."

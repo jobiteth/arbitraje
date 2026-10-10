@@ -5,6 +5,108 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Cambiado — La pestaña de motores enciende y apaga por fila, y el nombre se edita
+
+- **El desplegable y el botón «Activar» de la pestaña de motores se sustituyen
+  por un interruptor en cada fila, y cada motor se puede renombrar.** Pedido por
+  el usuario: «un slide en cada motor para activar/desactivar en vez de un combo
+  y un botón […] que permita editar nombres […] sin romper lo que tenemos».
+  Encender **suma** a la ranura —los motores de una ranura se comparan entre sí,
+  así que apagar los demás al encender uno sería lo contrario de para lo que
+  están— y apagar retira sólo ese motor. Apagar el último deja la ranura escrita
+  **vacía** (`dex_quotes = []`), que en la carga significa «apagada a
+  propósito»: si se borrara la clave, el motor por omisión volvería al
+  reiniciar. Cada gesto escribe **sólo esa ranura** en `config.toml` —con
+  `tomlkit`, sin llevarse comentarios ni claves ajenas— y, si la escritura
+  falla, se dice: rige esta sesión, pero no se guardó.
+- **El nombre de un motor es un alias de pantalla editable con el lápiz de su
+  fila**, guardado en la nueva tabla `[engine_names]` y resuelto por las tres
+  pantallas que enseñan nombres (motores, APIs de configuración y credenciales):
+  el `engine_id`, su configuración y lo que hace no cambian, y borrar el alias
+  devuelve el nombre de fábrica. Un motor que no arranca deja su interruptor
+  apagado con el motivo a la vista, y el repintado —la tabla se reconstruye
+  entera desde el registro, que es la única verdad— no arrastra a los que ya
+  estaban. La presentación se adapta al contenido: cada columna mide lo suyo, el
+  nombre se lleva el ancho que sobra y las filas tienen aire para el
+  interruptor. Ver `ui/pages/engines.py`, `ui/widgets.py` (`Switch`),
+  `app/engine_names.py` e `infra/config_writer.py` (`set_active_engines`,
+  `set_engine_names`).
+
+### Arreglado — La ejecución mira el saldo antes de aprobar, y el déficit se dice con sus cifras
+
+- **«1 pUSD → POL» moría al estimar con «execution reverted: STF» sin decir
+  por qué.** Medido el 2026-10-10 en Polygon, con las lecturas de `balanceOf` y
+  `allowance` delante: la cartera tenía **0.550579 pUSD** e intentaba mover
+  **1 pUSD** — el permiso directo al router estaba de sobra y el router, al
+  cobrar más de lo que hay, revierte con su `STF` (*safe transfer from*), que no
+  dice ni cuánto hay ni cuánto falta. Ni la cotización ni la aprobación miran
+  saldos (la cotización cotiza para un centinela; aprobar es un permiso, no un
+  gasto), así que el déficit solo se descubría al final. Ahora `ExecuteSwap`
+  comprueba el saldo del token que el payload va a mover **después de construir
+  y antes de aprobar** —aprobar para un swap impagable era una transacción de
+  gas para nada— y lo corta con las dos cifras en el mensaje («tienes 0.550579
+  pUSD y la operación mueve 1 pUSD»), sin firmar ni estimar nada. Qué se mira
+  sale del mismo criterio con el que se decide a quién aprobar: el ERC-20 que
+  el router moverá, o el nativo del `value` cuando es él quien viaja. Ver
+  `domain/errors.py` (`InsufficientBalanceError`) y
+  `app/usecases/execute_swap.py` (`_require_sold_balance`).
+
+### Arreglado — El swap de Uniswap (agregado) ya no revierte: su router cobra por Permit2
+
+- **«pUSD → POL» revertía al estimar el gas («execution reverted») y no se
+  firmaba.** La causa se midió en la cadena, no se supuso: los **ocho routers**
+  del motor `uniswap` (agregado) llevan
+  `0x000000000022D473030F116dDEE9F6B43aC78BA3` (Permit2) dentro de su bytecode
+  —cobran el token pidiéndoselo a Permit2, no con un `transferFrom` propio—, y
+  la aplicación aprobaba el ERC-20 directamente contra el router: un permiso que
+  ese router nunca lee (quedó en la cadena, es inofensivo y no se revoca). El
+  payload del motor ahora **declara el permiso**
+  (`TokenApproval(spender=router, via=Permit2)`) y la máquina de dos permisos
+  encadenados —que ya existía y ya usaba Base— concede los dos con importe
+  exacto, cada uno con su diálogo y su relato de «primera/segunda de dos
+  aprobaciones». Cuando lo que se entrega es el nativo no hay permiso que
+  declarar: se paga como `value`. Los routers de `zeroex` se midieron igual y
+  **no** llevan Permit2: su camino directo se queda como estaba. Ver
+  `engines/uniswap/engine.py` (`PERMIT2`, `_to_unsigned`).
+
+### Cambiado — Un solo botón de ejecución, que narra la operación y la deja listada
+
+- **«Preparar swap…», «Guardar payload…» y el botón de firmar se funden en uno
+  solo.** Pedido por el usuario: «un solo botón con estados, cada estado va
+  cambiando a medida que voy avanzando […] hasta completar». Una pulsación
+  arranca la operación entera y cada transacción real conserva su propio «sí»
+  —la regla de la casa no cambia—; el texto del botón sigue a la fase en curso
+  («Aprobando pUSD (1 de 2)…», «Esperando tu confirmación…», «Firmando y
+  emitiendo…») y termina en «✓ Completado». El bloque entero —botón, ruta
+  elegida y panel— vive **entre la tarjeta del swap y las rutas**, centrado:
+  pegado al importe y al par que va a firmarse, y por encima de la lista de
+  rutas, que es información para elegir. El panel lista las
+  **transacciones realmente realizadas** con su glifo, su hash —acortado, entero
+  en el tooltip— y el enlace a su explorador; los rechazos y los fallos también,
+  con su motivo, porque un «no» del usuario y un revert son parte del resultado.
+  Un **rechazo no se cuenta como error** («Cancelaste la operación…», y el botón
+  vuelve: los permisos ya concedidos se reaprovechan) y «Empezar de nuevo» barre
+  el relato sin tocar la ruta elegida. La estimación del coste de red pasó al
+  paso ESTIMATE de la ejecución —después de los permisos, con los que ya no
+  revierte por allowance— y su cifra entra en el diálogo del swap. La narración
+  es opcional y **no puede tumbar la operación**: un observador que falle queda
+  en el log. Ver `app/usecases/execute_swap.py` (`SwapStep`, `StepUpdate`),
+  `app/usecases/prepare_swap.py` (`estimate_cost`) y `ui/swap_steps.py`.
+
+### Añadido — Engranaje del deslizamiento por defecto, aplicado de verdad al construir
+
+- **La cabecera de la tarjeta de intercambio trae un engranaje que fija la
+  tolerancia de deslizamiento** —el mínimo que un swap acepta recibir—, la
+  guarda en `[execution] slippage_bps` de `config.toml` y **se aplica de
+  verdad**: los seis motores que construyen reciben `slippage_bps` al construir
+  el payload (el mínimo del calldata en V2/V3/V4 y el `slippageTolerance`/
+  `slippageBps` de la recotización en agregado, zeroex y Júpiter). Si sólo
+  cambiara la etiqueta sería mentir en el sitio donde más importa. El valor vive
+  en `DefaultSlippage` —la configuración es inmutable, así que el número vivo no
+  cabe en `Settings`—, el panel de detalle enseña el vigente y, si la escritura
+  del archivo falla, se dice: rige esta sesión, pero no se guardó. Ver
+  `app/slippage.py`, `ui/slippage_dialog.py` e `infra/config_writer.py`.
+
 ### Arreglado — Cotizar pregunta a los motores a la vez, y una sola vez por ronda
 
 - **La comparación de precios consulta todos los motores en paralelo y el

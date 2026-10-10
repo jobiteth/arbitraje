@@ -16,10 +16,12 @@ lo que hay aquí está ordenado por esa consecuencia.
 4. **El payload.** Del mismo motor que observó la cotización, y sin firmar.
 5. **El destino.** Contrastado contra la tabla medida que declara el motor. Un
    payload cuyo `to` no sea uno de sus routers no se firma.
-6. **La aprobación de ERC-20**, si hace falta, como operación propia.
-7. **El permiso**: el «sí» del usuario, o la política de autonomía si está
+6. **El coste de red**, estimado con los permisos ya concedidos —una estimación
+   sin allowance revierte, y lo que se enseña tiene que ser lo que pasará—.
+7. **La aprobación de ERC-20**, si hace falta, como operación propia.
+8. **El permiso**: el «sí» del usuario, o la política de autonomía si está
    armada y la operación cabe.
-8. Firmar, emitir y anotar.
+9. Firmar, emitir y anotar.
 
 ### Dos barreras, no una
 
@@ -27,6 +29,15 @@ El destino se contrasta en el paso 5 y **otra vez** al emitir, dentro de
 `EvmBroadcaster.send(expected_to=...)`. No es desconfianza del propio código: son
 dos momentos distintos y entre ellos el motor pide red. Lo que se firma tiene que
 seguir siendo lo que se comprobó.
+
+### El progreso se narra, y narrarlo no puede romper nada
+
+`__call__` acepta un observador opcional —`on_step`— que recibe qué fase empieza
+y cómo termina cada una, incluida cada transacción real con su hash. Existe para
+que la interfaz pueda contar la operación en vivo en vez de quedarse muda hasta
+el final. Las llamadas al observador van envueltas: un fallo pintando un aviso
+**no** puede tumbar una transacción que ya está en marcha, así que se anota y se
+sigue.
 
 ### La clave privada se pide al final y se suelta
 
@@ -42,19 +53,26 @@ dos veces es más barato que tenerla viva durante toda la operación.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 import structlog
 
 from amigocompora.app.confirmation import ConfirmationGateway
 from amigocompora.app.execution_policy import AutonomyPolicy, PrivateKeySource
+from amigocompora.app.usecases.estimate_cost import NetworkCost
 from amigocompora.app.usecases.prepare_swap import PrepareSwap, destination_for
 from amigocompora.app.usecases.value_in_reference import ReferenceValuation
 from amigocompora.domain.addresses import shorten
 from amigocompora.domain.chains import ChainSpec, chain
 from amigocompora.domain.clock import Clock, SystemClock
-from amigocompora.domain.errors import ExecutionError, UnsupportedOperationError
+from amigocompora.domain.errors import (
+    ConfirmationDeniedError,
+    ExecutionError,
+    InsufficientBalanceError,
+    UnsupportedOperationError,
+)
 from amigocompora.domain.models import (
     BroadcastReceipt,
     BroadcastStatus,
@@ -90,6 +108,56 @@ _EMPTY_CALLDATA = frozenset({"", "0x"})
 #: firmarse. Treinta días es lo que usa el propio frontend de Uniswap, y aquí el
 #: importe ya es lo que de verdad limita.
 PERMIT2_EXPIRATION_SECONDS = 30 * 24 * 60 * 60
+
+
+class SwapStep(StrEnum):
+    """Las fases de una ejecución, en el orden en que ocurren.
+
+    Las cinco existen para poder narrarlas todas, pero sólo tres son
+    transacciones reales —`APPROVE`, `APPROVE_PERMIT2` y `SWAP`—: las otras dos
+    son narración para que el usuario no crea que la aplicación se quedó muda.
+    """
+
+    PREPARE = "prepare"
+    APPROVE = "approve"
+    APPROVE_PERMIT2 = "approve_permit2"
+    ESTIMATE = "estimate"
+    SWAP = "swap"
+
+
+class StepState(StrEnum):
+    """En qué punto está un paso, o cómo terminó."""
+
+    RUNNING = "running"
+    DONE = "done"
+    #: El usuario lo rechazó en su diálogo: no es un fallo, es una decisión.
+    REJECTED = "rejected"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class StepUpdate:
+    """Un aviso de progreso, para que la interfaz lo pinte mientras ocurre.
+
+    `title` es lo que está pasando ahora —en presente si corre, en resultado si
+    terminó—; `detail` añade el motivo cuando algo sale mal o la cifra cuando la
+    hay. `tx_hash` sólo viaja en los pasos que son una transacción real, que son
+    los únicos que se pueden enlazar en un explorador, y `cost`/`cost_error` sólo
+    en el paso de la estimación, que es su desenlace.
+
+    `cost_error` se separa de `detail` aunque suelan contar lo mismo: `detail`
+    es texto para leer y `cost_error` es el dato con el que quien pinta decide
+    —«se intentó y no salió» frente a «no se intentó»—, que es una distinción
+    que el panel de la ruta ya sabe enseñar y no puede adivinar del texto.
+    """
+
+    step: SwapStep
+    state: StepState
+    title: str
+    detail: str = ""
+    tx_hash: str = ""
+    cost: NetworkCost | None = None
+    cost_error: str | None = None
 
 
 def reference_notional(quote: Quote) -> TokenAmount | None:
@@ -140,7 +208,13 @@ class ExecuteSwap:
     #: operar los pares que sí la tocan.
     valuation: ReferenceValuation | None = None
 
-    async def __call__(self, quote: Quote, *, recipient: str) -> BroadcastReceipt:
+    async def __call__(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        on_step: Callable[[StepUpdate], None] | None = None,
+    ) -> BroadcastReceipt:
         spec = chain(quote.pair.chain)
 
         # 1. El modo primero: antes de gastar red, y antes de pedir la clave.
@@ -167,23 +241,75 @@ class ExecuteSwap:
         wallet = destination_for(quote, recipient)
 
         # 4. Y 5. El payload, del motor que cotizó, y el router que declara.
-        transaction, router = await self._build_checked(quote, recipient)
+        self._announce(on_step, SwapStep.PREPARE, StepState.RUNNING, "Preparando el swap…")
+        try:
+            transaction, router = await self._build_checked(quote, recipient)
+        except Exception as error:
+            self._announce(
+                on_step,
+                SwapStep.PREPARE,
+                StepState.FAILED,
+                "Preparación del swap",
+                detail=str(error),
+            )
+            raise
+        self._announce(on_step, SwapStep.PREPARE, StepState.DONE, "Swap preparado")
+
+        # 5b. El saldo que este payload va a mover, antes de gastar gas en
+        #     permisos: aprobar un permiso para un swap que la cartera no puede
+        #     pagar es una transacción entera para nada, y el nodo, al estimar,
+        #     contesta un «execution reverted: STF» que no dice a nadie qué
+        #     pasa. Ver `_require_sold_balance`.
+        await self._require_sold_balance(quote, transaction, broadcaster)
 
         # 6. La aprobación, si el token entregado la necesita. Puede volver con
         #    un payload nuevo: entre aprobar y firmar pasa una transacción.
         transaction, router = await self._ensure_allowance(
-            quote, transaction, recipient, router, broadcaster
+            quote, transaction, recipient, router, broadcaster, on_step
         )
 
+        # 6b. El coste de red, ya con los permisos concedidos: sin ellos la
+        #     estimación revertiría y enseñaría un fallo del allowance como si
+        #     fuera un problema del swap. Entra en el diálogo del último «sí»
+        #     porque es parte de lo que se decide.
+        cost, cost_error = await self._estimate_step(on_step, quote, transaction, wallet)
+
         # 7. El permiso. Con la operación entera delante, o por la política.
-        await self._authorize(quote, transaction, router, wallet, intent)
+        await self._authorize(
+            quote, transaction, router, wallet, intent, on_step, cost=cost, cost_error=cost_error
+        )
 
         # 8. Firmar, emitir, anotar. El destino esperado es el **router** que el
         #    motor declara en su tabla medida, que es un dato independiente del
         #    `to` del payload: contrastarlos es lo que detecta que el payload se
         #    desvió.
-        receipt = await self._sign_and_send(transaction, broadcaster, expected_to=router)
+        swap_title = f"Swap en {quote.venue.name}"
+        self._announce(on_step, SwapStep.SWAP, StepState.RUNNING, "Firmando y emitiendo…")
+        try:
+            receipt = await self._sign_and_send(transaction, broadcaster, expected_to=router)
+        except Exception as error:
+            self._announce(
+                on_step, SwapStep.SWAP, StepState.FAILED, swap_title, detail=str(error)
+            )
+            raise
         self.policy.ledger.record_receipt(receipt, intent)
+        if receipt.status is BroadcastStatus.SUCCESS:
+            self._announce(
+                on_step, SwapStep.SWAP, StepState.DONE, swap_title, tx_hash=receipt.tx_hash
+            )
+        else:
+            # La transacción salió y minó en rojo: el hash existe y lleva al
+            # explorador, donde se puede ver qué pasó. No se lanza porque el
+            # recibo es la respuesta —el gas ya se pagó— y quien llama decide
+            # qué hacer con él.
+            self._announce(
+                on_step,
+                SwapStep.SWAP,
+                StepState.FAILED,
+                swap_title,
+                detail=f"la transacción no llegó a buen término ({receipt.status.value})",
+                tx_hash=receipt.tx_hash,
+            )
         _log.info(
             "execution.recorded",
             chain=quote.pair.chain,
@@ -192,6 +318,88 @@ class ExecuteSwap:
             status=receipt.status.value,
         )
         return receipt
+
+    async def _estimate_step(
+        self,
+        on_step: Callable[[StepUpdate], None] | None,
+        quote: Quote,
+        transaction: UnsignedTransaction,
+        wallet: str,
+    ) -> tuple[NetworkCost | None, str | None]:
+        """Narra la estimación del coste y devuelve su resultado.
+
+        La cuenta vive en `PrepareSwap.estimate_cost`, que **nunca lanza**: un
+        fallo de la red se cuenta como motivo, no como cero, y no frustra la
+        ejecución. Aquí sólo se le pone la narración alrededor.
+        """
+        self._announce(on_step, SwapStep.ESTIMATE, StepState.RUNNING, "Estimando el coste de red…")
+        cost, cost_error = await self.prepare.estimate_cost(transaction, quote, wallet)
+        if cost is not None:
+            self._announce(
+                on_step,
+                SwapStep.ESTIMATE,
+                StepState.DONE,
+                "Coste de red",
+                detail=f"≈ {cost.native} (estimación de gas)",
+                cost=cost,
+            )
+        else:
+            # Dos desenlaces sin cifra, y no son el mismo: se intentó y la red
+            # dijo que no, o no se intentó —sin estimador, sin cartera desde la
+            # que medir, o una transacción de Solana, que no tiene
+            # `eth_estimateGas`—. El segundo se pinta con raya, así que aquí no
+            # puede llevar el texto del primero.
+            self._announce(
+                on_step,
+                SwapStep.ESTIMATE,
+                StepState.DONE,
+                "Coste de red",
+                detail=(
+                    f"sin cifra: {cost_error}" if cost_error is not None else "no se intentó"
+                ),
+                cost_error=cost_error,
+            )
+        return cost, cost_error
+
+    def _announce(
+        self,
+        on_step: Callable[[StepUpdate], None] | None,
+        step: SwapStep,
+        state: StepState,
+        title: str,
+        *,
+        detail: str = "",
+        tx_hash: str = "",
+        cost: NetworkCost | None = None,
+        cost_error: str | None = None,
+    ) -> None:
+        """Cuenta en qué punto va la operación. **Nunca puede romperla.**
+
+        El observador es la interfaz, y un fallo suyo no puede tumbar una
+        transacción que ya está en marcha: si el aviso falla, se anota en el
+        registro y se sigue. No es defensa contra la UI de este repositorio, es
+        que este caso de uso mueve dinero y su curso no puede depender de que
+        alguien pinte bien un botón.
+        """
+        if on_step is None:
+            return
+        update = StepUpdate(
+            step=step,
+            state=state,
+            title=title,
+            detail=detail,
+            tx_hash=tx_hash,
+            cost=cost,
+            cost_error=cost_error,
+        )
+        try:
+            on_step(update)
+        except Exception:
+            _log.warning(
+                "execution.step_observer_failed",
+                step=step.value,
+                state=state.value,
+            )
 
     # --------------------------------------------------------------- pasos  #
     async def _intent(self, quote: Quote, recipient: str) -> ExecutionIntent:
@@ -328,6 +536,66 @@ class ExecuteSwap:
 
         return transaction, declared
 
+    async def _require_sold_balance(
+        self,
+        quote: Quote,
+        transaction: UnsignedTransaction,
+        broadcaster: EvmBroadcaster,
+    ) -> None:
+        """Corta si la cartera no tiene el token que el payload va a mover.
+
+        ### Qué se mira, y por qué es el mismo criterio que el de aprobar
+
+        Quién paga lo decide la **misma** función que decide a quién se aprueba
+        (`_token_to_approve`): si devuelve una dirección, ese ERC-20 sale de la
+        cartera con `transferFrom` y se mide su saldo; si devuelve `None` —el
+        nativo, o el envoltorio que el router envuelve él—, lo que viaja es el
+        nativo del propio `value`. Así se mira siempre el saldo del token que de
+        verdad se mueve, no el que el par nombra.
+
+        ### Por qué va aquí, y no más tarde
+
+        Después de construir —hace falta el payload para saber qué se mueve— pero
+        **antes** de aprobar nada: un permiso para un swap que la cartera no
+        puede pagar es una transacción entera de gas para nada. Y es la única
+        comprobación que faltaba: la cotización no mira saldos (cotiza para un
+        centinela) y la aprobación tampoco (es un permiso, no un gasto), así que
+        el déficit se descubría al estimar, como un `execution reverted: STF`
+        del nodo —medido el 2026-10-10, Polygon: 0.550579 pUSD en la cartera
+        intentando mover 1 pUSD—, que no dice ni cuánto hay ni cuánto falta.
+
+        El mensaje lleva las dos cifras tal como se ven en la interfaz, porque
+        la salida —reducir el importe o traer saldo— la decide el usuario.
+        """
+        spec = chain(quote.pair.chain)
+        sold = quote.pair.base
+        owner = address_from_key(self.keys.require())
+        moved = _token_to_approve(transaction, sold, spec)
+        if moved is None:
+            available = TokenAmount(
+                await broadcaster.native_balance(owner),
+                spec.native_decimals,
+                spec.native_symbol,
+            )
+            required = TokenAmount(
+                transaction.value.raw, spec.native_decimals, spec.native_symbol
+            )
+        else:
+            available = TokenAmount(
+                await broadcaster.token_balance(moved, owner), sold.decimals, sold.symbol
+            )
+            required = quote.amount_in
+        if available.raw >= required.raw:
+            return
+        _log.info(
+            "execution.insufficient_balance",
+            pair=quote.pair.symbol,
+            token=sold.symbol,
+            available_raw=available.raw,
+            required_raw=required.raw,
+        )
+        raise InsufficientBalanceError(available=str(available), required=str(required))
+
     # ---------------------------------------------------- aprobación ERC-20  #
     async def _ensure_allowance(
         self,
@@ -336,6 +604,7 @@ class ExecuteSwap:
         recipient: str,
         router: str,
         broadcaster: EvmBroadcaster,
+        on_step: Callable[[StepUpdate], None] | None = None,
     ) -> tuple[UnsignedTransaction, str]:
         """Deja los permisos del token listos, y devuelve el payload a firmar.
 
@@ -389,6 +658,7 @@ class ExecuteSwap:
                 owner,
                 broadcaster,
                 chained=approval.is_chained,
+                on_step=on_step,
             )
             approved = True
 
@@ -397,7 +667,7 @@ class ExecuteSwap:
         #    permisos distintos sobre contratos distintos, y tener uno no dice
         #    nada del otro.
         if approval.is_chained and await self._grant_permit2(
-            approval, address, sold, quote, owner, broadcaster
+            approval, address, sold, quote, owner, broadcaster, on_step=on_step
         ):
             approved = True
 
@@ -415,6 +685,8 @@ class ExecuteSwap:
         quote: Quote,
         owner: str,
         broadcaster: EvmBroadcaster,
+        *,
+        on_step: Callable[[StepUpdate], None] | None = None,
     ) -> bool:
         """Concede a Permit2 permiso para entregar el token al router.
 
@@ -459,23 +731,51 @@ class ExecuteSwap:
                 f"{token.symbol} al router {shorten(approval.spender)}"
             ),
         )
-        await self.gateway.authorize(
-            Capability.BROADCAST_TX,
-            f"Aprobar {token.symbol} en Permit2 para el swap",
-            details=(
-                f"Token: {token.symbol}",
-                f"Importe autorizado: {quote.amount_in} (el justo, no ilimitado)",
-                f"Cobrarlo puede: {shorten(approval.spender)} (el router)",
-                f"Vía: Permit2 ({shorten(permit2)})",
-                f"Caduca: en {PERMIT2_EXPIRATION_SECONDS // 86_400} días",
-                f"Desde la cartera: {shorten(owner)}",
-                "Es la segunda de dos aprobaciones: el router no mueve el token "
-                "él mismo en esta red.",
-                "Es una transacción real: cuesta gas y no se puede deshacer.",
-            ),
-            transaction=grant,
+        title = f"Permiso de {token.symbol} en Permit2 (2 de 2)"
+        self._announce(
+            on_step,
+            SwapStep.APPROVE_PERMIT2,
+            StepState.RUNNING,
+            f"Aprobando {token.symbol} en Permit2 (2 de 2)…",
         )
-        receipt = await self._sign_and_send(grant, broadcaster, expected_to=permit2)
+        try:
+            await self.gateway.authorize(
+                Capability.BROADCAST_TX,
+                f"Aprobar {token.symbol} en Permit2 para el swap",
+                details=(
+                    f"Token: {token.symbol}",
+                    f"Importe autorizado: {quote.amount_in} (el justo, no ilimitado)",
+                    f"Cobrarlo puede: {shorten(approval.spender)} (el router)",
+                    f"Vía: Permit2 ({shorten(permit2)})",
+                    f"Caduca: en {PERMIT2_EXPIRATION_SECONDS // 86_400} días",
+                    f"Desde la cartera: {shorten(owner)}",
+                    "Es la segunda de dos aprobaciones: el router no mueve el token "
+                    "él mismo en esta red.",
+                    "Es una transacción real: cuesta gas y no se puede deshacer.",
+                ),
+                transaction=grant,
+            )
+        except ConfirmationDeniedError:
+            self._announce(
+                on_step,
+                SwapStep.APPROVE_PERMIT2,
+                StepState.REJECTED,
+                title,
+                detail="lo rechazaste en el diálogo: no se firmó nada",
+            )
+            raise
+        except Exception as error:
+            self._announce(
+                on_step, SwapStep.APPROVE_PERMIT2, StepState.FAILED, title, detail=str(error)
+            )
+            raise
+        try:
+            receipt = await self._sign_and_send(grant, broadcaster, expected_to=permit2)
+        except Exception as error:
+            self._announce(
+                on_step, SwapStep.APPROVE_PERMIT2, StepState.FAILED, title, detail=str(error)
+            )
+            raise
         # Se anota **antes** de mirar el estado, igual que la aprobación del
         # ERC-20: la transacción salió, se pagó su gas y el permiso existe en la
         # cadena aunque haya minado en rojo. Un asiento que sólo se escribe
@@ -498,12 +798,23 @@ class ExecuteSwap:
             via=permit2,
         )
         if receipt.status is not BroadcastStatus.SUCCESS:
+            self._announce(
+                on_step,
+                SwapStep.APPROVE_PERMIT2,
+                StepState.FAILED,
+                title,
+                detail=f"la transacción no llegó a buen término ({receipt.status.value})",
+                tx_hash=receipt.tx_hash,
+            )
             raise ExecutionError(
                 f"la aprobación de {token.symbol} en Permit2 no llegó a buen "
                 f"término ({receipt.status.value}, {receipt.tx_hash}). Sin ese "
                 f"permiso el router no puede cobrar el token y el swap revertiría, "
                 f"así que no se firma."
             )
+        self._announce(
+            on_step, SwapStep.APPROVE_PERMIT2, StepState.DONE, title, tx_hash=receipt.tx_hash
+        )
         # Se relee, por la misma razón que en la aprobación del ERC-20: la
         # transacción pudo minar bien y el permiso no ser el que se pidió.
         after = await broadcaster.read_permit2_allowance(
@@ -527,6 +838,7 @@ class ExecuteSwap:
         broadcaster: EvmBroadcaster,
         *,
         chained: bool,
+        on_step: Callable[[StepUpdate], None] | None = None,
     ) -> BroadcastReceipt:
         """Aprueba el importe **exacto** que hace falta, como operación propia.
 
@@ -552,32 +864,54 @@ class ExecuteSwap:
                 f"de tu {token.symbol}"
             ),
         )
-        await self.gateway.authorize(
-            Capability.BROADCAST_TX,
-            f"Aprobar {token.symbol} para el swap",
-            details=(
-                f"Token: {token.symbol}",
-                f"Importe autorizado: {quote.amount_in} (el justo, no ilimitado)",
-                (
-                    f"Se autoriza a: Permit2 ({shorten(spender)}), que es quien "
-                    f"entrega el token al router"
-                    if chained
-                    else f"Autorizado a gastarlo: {shorten(spender)}"
-                ),
-                f"Desde la cartera: {shorten(owner)}",
-                (
-                    "Es la primera de dos aprobaciones: con ésta sola el router "
-                    "todavía no puede cobrar el token."
-                    if chained
-                    else ""
-                ),
-                "Es una transacción real: cuesta gas y no se puede deshacer.",
-            ),
-            transaction=approval,
+        numbered = " (1 de 2)" if chained else ""
+        title = f"Permiso de {token.symbol}{numbered}"
+        self._announce(
+            on_step, SwapStep.APPROVE, StepState.RUNNING, f"Aprobando {token.symbol}{numbered}…"
         )
-        receipt = await self._sign_and_send(
-            approval, broadcaster, expected_to=token_address
-        )
+        try:
+            await self.gateway.authorize(
+                Capability.BROADCAST_TX,
+                f"Aprobar {token.symbol} para el swap",
+                details=(
+                    f"Token: {token.symbol}",
+                    f"Importe autorizado: {quote.amount_in} (el justo, no ilimitado)",
+                    (
+                        f"Se autoriza a: Permit2 ({shorten(spender)}), que es quien "
+                        f"entrega el token al router"
+                        if chained
+                        else f"Autorizado a gastarlo: {shorten(spender)}"
+                    ),
+                    f"Desde la cartera: {shorten(owner)}",
+                    (
+                        "Es la primera de dos aprobaciones: con ésta sola el router "
+                        "todavía no puede cobrar el token."
+                        if chained
+                        else ""
+                    ),
+                    "Es una transacción real: cuesta gas y no se puede deshacer.",
+                ),
+                transaction=approval,
+            )
+        except ConfirmationDeniedError:
+            self._announce(
+                on_step,
+                SwapStep.APPROVE,
+                StepState.REJECTED,
+                title,
+                detail="lo rechazaste en el diálogo: no se firmó nada",
+            )
+            raise
+        except Exception as error:
+            self._announce(on_step, SwapStep.APPROVE, StepState.FAILED, title, detail=str(error))
+            raise
+        try:
+            receipt = await self._sign_and_send(
+                approval, broadcaster, expected_to=token_address
+            )
+        except Exception as error:
+            self._announce(on_step, SwapStep.APPROVE, StepState.FAILED, title, detail=str(error))
+            raise
         self.policy.ledger.record_approval(
             receipt,
             pair=quote.pair.symbol,
@@ -587,11 +921,20 @@ class ExecuteSwap:
             granted_raw=quote.amount_in.raw,
         )
         if receipt.status is not BroadcastStatus.SUCCESS:
+            self._announce(
+                on_step,
+                SwapStep.APPROVE,
+                StepState.FAILED,
+                title,
+                detail=f"la transacción no llegó a buen término ({receipt.status.value})",
+                tx_hash=receipt.tx_hash,
+            )
             raise ExecutionError(
                 f"la aprobación de {token.symbol} no llegó a buen término "
                 f"({receipt.status.value}, {receipt.tx_hash}). Sin ese permiso el "
                 f"swap revertiría, así que no se firma."
             )
+        self._announce(on_step, SwapStep.APPROVE, StepState.DONE, title, tx_hash=receipt.tx_hash)
         # Se vuelve a leer en vez de darlo por hecho: la aprobación pudo minar con
         # éxito y aun así no ser suficiente si el token cobra comisión al mover.
         after = await broadcaster.read_allowance(token_address, owner, spender)
@@ -611,6 +954,10 @@ class ExecuteSwap:
         router: str,
         wallet: str,
         intent: ExecutionIntent,
+        on_step: Callable[[StepUpdate], None] | None = None,
+        *,
+        cost: NetworkCost | None = None,
+        cost_error: str | None = None,
     ) -> None:
         """El permiso para emitir, con todo delante.
 
@@ -624,24 +971,53 @@ class ExecuteSwap:
         contrato al que se llama y la de la cartera que recibe. Son cosas
         diferentes y el usuario que confirma tiene que poder ver las dos, no una
         etiquetada como «destino» que valdría para cualquiera de las dos.
+
+        El coste de red entra en los detalles porque es parte de lo que se decide:
+        quien confirma una transacción real merece ver lo que cuesta emitirla. Si
+        no se pudo estimar se dice eso, no un cero.
         """
-        await self.gateway.authorize(
-            Capability.BROADCAST_TX,
-            f"Emitir swap en {quote.venue.name}",
-            details=(
-                f"Red: {quote.pair.chain}",
-                f"Par: {quote.pair.symbol}",
-                f"Entregas: {quote.amount_in}",
-                f"Recibes (estimado): {quote.amount_out}",
-                f"Importe de referencia: {intent.notional}",
-                f"Motor que construye: {quote.engine_id}",
-                f"Contrato que ejecuta: {shorten(router)}",
-                f"Fondos a tu cartera: {shorten(wallet)}",
-                f"Firma la cartera: {self.address() or 'sin clave configurada'}",
-                "Es una operación real e irreversible: se firma y se emite.",
-            ),
-            transaction=transaction,
-        )
+        if cost is not None:
+            cost_line = f"Coste de red: ≈ {cost.native} (estimación de gas)"
+        elif cost_error is not None:
+            cost_line = (
+                "Coste de red: la red no pudo estimarlo ahora mismo; se "
+                "reintenta al emitir."
+            )
+        else:
+            cost_line = "Coste de red: sin estimador configurado."
+        title = f"Swap en {quote.venue.name}"
+        self._announce(on_step, SwapStep.SWAP, StepState.RUNNING, "Esperando tu confirmación…")
+        try:
+            await self.gateway.authorize(
+                Capability.BROADCAST_TX,
+                f"Emitir swap en {quote.venue.name}",
+                details=(
+                    f"Red: {quote.pair.chain}",
+                    f"Par: {quote.pair.symbol}",
+                    f"Entregas: {quote.amount_in}",
+                    f"Recibes (estimado): {quote.amount_out}",
+                    f"Importe de referencia: {intent.notional}",
+                    f"Motor que construye: {quote.engine_id}",
+                    f"Contrato que ejecuta: {shorten(router)}",
+                    f"Fondos a tu cartera: {shorten(wallet)}",
+                    f"Firma la cartera: {self.address() or 'sin clave configurada'}",
+                    cost_line,
+                    "Es una operación real e irreversible: se firma y se emite.",
+                ),
+                transaction=transaction,
+            )
+        except ConfirmationDeniedError:
+            self._announce(
+                on_step,
+                SwapStep.SWAP,
+                StepState.REJECTED,
+                title,
+                detail="lo rechazaste en el diálogo: no se firmó nada",
+            )
+            raise
+        except Exception as error:
+            self._announce(on_step, SwapStep.SWAP, StepState.FAILED, title, detail=str(error))
+            raise
 
     async def _sign_and_send(
         self,
