@@ -327,8 +327,8 @@ class MainWindow(QMainWindow):
         self._autonomy_label.setToolTip(
             "La ejecución desatendida está armada: dentro de las listas blancas y "
             "los topes declarados, la aplicación firma y emite sin pedirte "
-            "confirmación. Para detenerla, desarma la autonomía con "
-            "`AutonomyPolicy.disarm()`."
+            "confirmación. Para detenerla, desármala en la pestaña «Copiloto IA», "
+            "en la tira de autonomía."
         )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]

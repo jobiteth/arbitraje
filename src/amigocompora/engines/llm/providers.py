@@ -38,8 +38,13 @@ from amigocompora.domain.protocols import (
     EngineManifest,
     EngineProvider,
 )
+from amigocompora.infra.http import build_client
 
 _log = structlog.get_logger(__name__)
+
+#: Los motivos de fallo se enseñan en el chat: se recortan para que quepan en
+#: una burbuja sin dejar de llevar el diagnóstico dentro.
+MAX_REASON_CHARS: Final = 200
 
 ADVISOR_CAPABILITIES: Final = frozenset({Capability.QUERY_AI})
 
@@ -80,7 +85,12 @@ def _build_user_prompt(request: AnalysisRequest) -> str:
 
 
 def _offline_result(request: AnalysisRequest) -> AnalysisResult:
-    """Resultado determinista sin LLM: fallback y base del asistente offline."""
+    """Resultado determinista sin LLM: es el asistente offline.
+
+    Sólo lo usa `StubAdvisor`. Un proveedor con API **no** cae aquí cuando falla:
+    un fallo se dice con su motivo (ver `_sin_respuesta`), porque un texto que
+    ningún modelo escribió no puede ocupar el sitio de una respuesta.
+    """
     bullets: list[str] = []
     for key, value in request.context.items():
         lowered = f"{key} {value}".lower()
@@ -110,6 +120,45 @@ def _offline_result(request: AnalysisRequest) -> AnalysisResult:
     )
 
 
+def _motivo_de_fallo(error: httpx.HTTPError, *, timeout_seconds: float) -> str:
+    """El motivo de un fallo de red, en una línea que quepa en el chat.
+
+    Los fallos de TLS llegan como `ConnectError` con el texto de OpenSSL dentro,
+    y ese texto **es** el diagnóstico —«certificate verify failed» explica por sí
+    solo por qué el modelo no contestó—, así que se conserva; lo que se recorta
+    es la longitud.
+    """
+    if isinstance(error, httpx.TimeoutException):
+        return f"no contestó en {timeout_seconds:g} s"
+    texto = str(error).strip() or type(error).__name__
+    if len(texto) <= MAX_REASON_CHARS:
+        return texto
+    return f"{texto[:MAX_REASON_CHARS]}…"
+
+
+def _sin_respuesta(*, nombre: str, motivo: str) -> AnalysisResult:
+    """Lo que se devuelve cuando el modelo no contestó: el motivo, no un análisis.
+
+    Antes caía aquí el respaldo offline, que copiaba el principio de la pregunta
+    como si fuera una respuesta. Con el protocolo del copiloto dentro de esa
+    pregunta, lo que se leía en el chat era el protocolo en JSON: la pantalla
+    decía «Copiloto» y debajo había un texto que ningún modelo había escrito. Un
+    fallo puede dejarse ver —y aquí se ve, con su motivo—; lo que no puede es
+    disfrazarse de respuesta. Sin advertencia: no hay análisis del que avisar.
+
+    Quien llama ya dejó el fallo en el registro con su motor y su causa
+    (`llm.request_failed`, `llm.http_error`, `llm.empty_completion`).
+    """
+    return AnalysisResult(
+        summary=(
+            f"El modelo «{nombre}» no respondió: {motivo}.\n\n"
+            "No hay análisis que enseñar. Comprueba la clave y la conexión en la "
+            "pestaña Motores —o elige otro modelo— y vuelve a intentarlo."
+        ),
+        disclaimer="",
+    )
+
+
 def _extract_openai_text(payload: dict[str, Any]) -> str:
     try:
         choices = payload.get("choices") or []
@@ -130,15 +179,15 @@ def _extract_openai_delta(chunk: dict[str, Any]) -> str:
         return ""
 
 
-def _result_from_text(text: str, request: AnalysisRequest, *, engine_id: str) -> AnalysisResult:
-    """Lo que dijo el modelo, o el respaldo offline si no dijo nada.
+def _result_from_text(text: str, *, engine_id: str, nombre: str) -> AnalysisResult:
+    """Lo que dijo el modelo; si no dijo nada, se dice por qué.
 
-    El respaldo es deliberado —sin red la aplicación tiene que seguir sirviendo—
-    pero **no puede ser mudo**. Medido el 2026-10-07: los modelos de DeepSeek
-    razonan antes de escribir, y con el tope de tokens corto se lo gastan entero
-    en razonar y devuelven `content` vacío con un 200. Eso daba un análisis sin
-    una sola línea del modelo, idéntico en apariencia a uno bueno, y sin nada en
-    el registro que explicara por qué. El aviso deja la causa escrita.
+    El respaldo offline **no** cabe aquí. Medido el 2026-10-07: los modelos de
+    DeepSeek razonan antes de escribir, y con el tope de tokens corto se lo
+    gastan entero en razonar y devuelven `content` vacío con un 200. Eso daba un
+    análisis sin una sola línea del modelo, idéntico en apariencia a uno bueno,
+    y sin nada en el registro que explicara por qué. El aviso deja la causa
+    escrita y el texto lo dice con el nombre del motor delante.
     """
     limpio = text.strip()
     if limpio:
@@ -147,11 +196,11 @@ def _result_from_text(text: str, request: AnalysisRequest, *, engine_id: str) ->
         "llm.empty_completion",
         engine_id=engine_id,
         hint=(
-            "la respuesta llegó vacía y se usa el análisis offline. Si el modelo "
-            "razona, suele ser el tope de tokens consumido en razonar."
+            "la respuesta llegó vacía. Si el modelo razona, suele ser el tope de "
+            "tokens consumido en razonar."
         ),
     )
-    return _offline_result(request)
+    return _sin_respuesta(nombre=nombre, motivo="la respuesta llegó con el texto vacío")
 
 
 def _extract_anthropic_text(payload: dict[str, Any]) -> str:
@@ -184,9 +233,15 @@ class OpenAiCompatibleEngine:
 
     async def aopen(self) -> None:
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout_seconds),
-                headers={"User-Agent": "Amigocompora"},
+            # El mismo cliente que usa el resto de motores: el contexto TLS de la
+            # app —almacén del sistema **y** certifi— y los hosts del manifiesto.
+            # Un `httpx.AsyncClient` a secas verifica sólo contra certifi, y en
+            # una máquina cuyo antivirus intercepta el TLS eso es
+            # `CERTIFICATE_VERIFY_FAILED`: el copiloto no contesta y el motivo no
+            # está en ninguna parte. Medido el 2026-10-10 con DeepSeek.
+            self._client = build_client(
+                allowed_hosts=self.manifest.allowed_hosts,
+                timeout_seconds=self.timeout_seconds,
             )
 
     async def aclose(self) -> None:
@@ -229,8 +284,13 @@ class OpenAiCompatibleEngine:
         self,
         body: dict[str, Any],
         headers: Mapping[str, str],
-    ) -> dict[str, Any] | None:
-        """Envía la petición y devuelve el JSON, o `None` si algo falló."""
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Envía la petición y devuelve el JSON y, si no lo hubo, el motivo.
+
+        El motivo se devuelve en vez de quedarse en el registro porque acaba en
+        la pantalla: es la diferencia entre «el copiloto no contesta» y «el
+        copiloto no contesta porque el certificado no se pudo verificar».
+        """
         if self._client is None:
             raise RuntimeError(f"motor «{self.manifest.engine_id}» no está abierto")
         try:
@@ -241,26 +301,36 @@ class OpenAiCompatibleEngine:
                 engine_id=self.manifest.engine_id,
                 reason=str(error),
             )
-            return None
+            return None, _motivo_de_fallo(error, timeout_seconds=self.timeout_seconds)
         if response.status_code >= 400:
             _log.warning(
                 "llm.http_error",
                 engine_id=self.manifest.engine_id,
                 status=response.status_code,
             )
-            return None
+            return None, f"la API respondió HTTP {response.status_code}"
         try:
             payload = response.json()
         except ValueError:
-            return None
-        return payload if isinstance(payload, dict) else None
+            _log.warning("llm.bad_payload", engine_id=self.manifest.engine_id, reason="no json")
+            return None, "la respuesta no era JSON"
+        if not isinstance(payload, dict):
+            _log.warning(
+                "llm.bad_payload",
+                engine_id=self.manifest.engine_id,
+                reason=type(payload).__name__,
+            )
+            return None, "la respuesta no era un objeto JSON"
+        return payload, ""
 
     async def analyze(self, request: AnalysisRequest) -> AnalysisResult:
-        payload = await self._post_json(self._body(request), self._headers())
+        payload, motivo = await self._post_json(self._body(request), self._headers())
         if payload is None:
-            return _offline_result(request)
+            return _sin_respuesta(nombre=self.manifest.name, motivo=motivo)
         return _result_from_text(
-            _extract_openai_text(payload), request, engine_id=self.manifest.engine_id
+            _extract_openai_text(payload),
+            engine_id=self.manifest.engine_id,
+            nombre=self.manifest.name,
         )
 
     async def analyze_stream(self, request: AnalysisRequest) -> AsyncIterator[str]:
@@ -274,7 +344,10 @@ class OpenAiCompatibleEngine:
             )
             async with stream as response:
                 if response.status_code >= 400:
-                    yield _offline_result(request).summary
+                    yield _sin_respuesta(
+                        nombre=self.manifest.name,
+                        motivo=f"la API respondió HTTP {response.status_code}",
+                    ).summary
                     return
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -295,7 +368,10 @@ class OpenAiCompatibleEngine:
                 engine_id=self.manifest.engine_id,
                 reason=str(error),
             )
-            yield _offline_result(request).summary
+            yield _sin_respuesta(
+                nombre=self.manifest.name,
+                motivo=_motivo_de_fallo(error, timeout_seconds=self.timeout_seconds),
+            ).summary
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +399,13 @@ class ClaudeEngine(OpenAiCompatibleEngine):
             "anthropic-version": ANTHROPIC_VERSION,
             "Content-Type": "application/json",
         }
-        payload = await self._post_json(body, headers)
+        payload, motivo = await self._post_json(body, headers)
         if payload is None:
-            return _offline_result(request)
+            return _sin_respuesta(nombre=self.manifest.name, motivo=motivo)
         return _result_from_text(
-            _extract_anthropic_text(payload), request, engine_id=self.manifest.engine_id
+            _extract_anthropic_text(payload),
+            engine_id=self.manifest.engine_id,
+            nombre=self.manifest.name,
         )
 
 

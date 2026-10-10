@@ -619,4 +619,56 @@ QMenu {{
 }}
 QMenu::item {{ padding: 6px 18px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {COLOR_ACCENT_SOFT}; }}
+
+/* ------------------------------------------------------------- copiloto -- */
+/* Una fila del historial. El estado «elegida» va por propiedad y no por
+   `:checked` porque lo que se pinta es una fila entera —fondo y borde—, y un
+   botón de Qt no repinta el marco que lo contiene. */
+QFrame#chatRow {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {RADIUS_SM}px;
+}}
+QFrame#chatRow:hover {{ background: {COLOR_ELEVATED}; }}
+QFrame#chatRow[selected="true"] {{
+    background: {COLOR_ACCENT_SOFT};
+    border-color: {COLOR_ACCENT};
+}}
+/* El título de una fila del historial: es el botón que la elige, así que se
+   comporta como un enlace y no como un botón —sin relleno ni relieve—. */
+QPushButton#chatTitle {{
+    background: transparent;
+    border: none;
+    color: {COLOR_TEXT};
+    font-weight: 600;
+    text-align: left;
+    padding: 0;
+}}
+QPushButton#chatTitle:hover {{ color: {COLOR_ACCENT}; }}
+QLabel#chatPreview {{ color: {COLOR_MUTED}; font-size: 11px; }}
+/* Las burbujas del chat. La del usuario va con el acento —es lo que se escribió
+   y se reconoce de un vistazo— y la del copiloto con el fondo elevado, que es
+   la misma jerarquía que el resto de la aplicación. */
+QFrame#bubbleUser {{
+    background: {COLOR_ACCENT_SOFT};
+    border: 1px solid {COLOR_ACCENT};
+    border-radius: {RADIUS}px;
+}}
+QFrame#bubbleCopilot {{
+    background: {COLOR_ELEVATED};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: {RADIUS}px;
+}}
+/* La fila de lo que el copiloto consulta mientras piensa: una línea por paso,
+   sin caja, porque es lo que está pasando y no un resultado. */
+QFrame#toolEvent {{
+    background: transparent;
+    border: none;
+}}
+/* El cajón donde se lee lo que la herramienta devolvió, en crudo. */
+QFrame#toolDetail {{
+    background: {COLOR_BG};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: {RADIUS_SM}px;
+}}
 """

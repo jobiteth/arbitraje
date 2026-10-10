@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
 from amigocompora.domain.protocols import AnalysisRequest
@@ -41,6 +42,7 @@ from amigocompora.engines.llm.providers import (
     ChatGPTProvider,
     DeepSeekEngine,
 )
+from amigocompora.infra.http import AllowlistTransport, HostNotAllowedError
 from amigocompora.infra.secrets import env_var_name
 
 PREGUNTA = AnalysisRequest(question="¿compensa?", context={"spread": "40 bps"})
@@ -153,9 +155,10 @@ async def test_una_respuesta_con_texto_se_devuelve_tal_cual() -> None:
 async def test_una_respuesta_vacia_no_se_hace_pasar_por_analisis() -> None:
     """Es el fallo que tenía el motor: 200, `content` vacío y nadie se enteraba.
 
-    Se sigue cayendo al respaldo offline —sin red la aplicación tiene que
-    funcionar— pero el respaldo es reconocible por su prefijo, y el registro
-    deja dicho por qué.
+    Y se dice tal cual —el modelo no contestó, y con qué motivo— en vez de
+    devolver el respaldo offline: con el protocolo del copiloto dentro de la
+    pregunta, el respaldo copiaba el protocolo y lo hacía pasar por la respuesta
+    del modelo.
     """
     respx.post(DEEPSEEK_ENDPOINT).mock(
         return_value=httpx.Response(
@@ -176,12 +179,61 @@ async def test_una_respuesta_vacia_no_se_hace_pasar_por_analisis() -> None:
     )
     async with _abierto(_motor()) as motor:
         resultado = await motor.analyze(PREGUNTA)
-    assert resultado.summary.startswith("Análisis offline de:")
+    assert resultado.summary.startswith("El modelo «DeepSeek» no respondió")
+    assert "vacío" in resultado.summary
+    assert resultado.disclaimer == "", "no hay análisis del que advertir"
 
 
 @respx.mock
-async def test_un_error_de_la_api_tambien_cae_al_respaldo() -> None:
+async def test_un_error_de_la_api_se_dice_con_su_http() -> None:
     respx.post(DEEPSEEK_ENDPOINT).mock(return_value=httpx.Response(500, text="boom"))
     async with _abierto(_motor()) as motor:
         resultado = await motor.analyze(PREGUNTA)
-    assert resultado.summary.startswith("Análisis offline de:")
+    assert "«DeepSeek» no respondió" in resultado.summary
+    assert "HTTP 500" in resultado.summary
+
+
+# --------------------------------------------------------------------------- #
+# El cliente: el de la app, con su TLS y su allowlist
+# --------------------------------------------------------------------------- #
+async def test_el_motor_abre_con_el_cliente_de_la_app() -> None:
+    """Un `httpx.AsyncClient` a secas verifica sólo contra certifi.
+
+    Medido el 2026-10-10 en esta máquina: los demás motores contestaban 200 y
+    DeepSeek no, porque el antivirus intercepta el TLS y su CA está en el almacén
+    del sistema —que el contexto de `infra.http` carga— y no en certifi. El
+    copiloto se quedaba sin respuesta y sin motivo visible.
+
+    El transporte es lo que se afirma, y no las palabras con las que se pidió:
+    `AllowlistTransport` sólo lo construye `build_client`, así que encontrarlo
+    aquí significa que el motor usa el mismo cliente —TLS de la app y hosts del
+    manifiesto— que el resto de motores.
+    """
+    motor = _motor()
+    await motor.aopen()
+    try:
+        cliente = motor._client
+        assert cliente is not None
+        # `_transport` es privado de httpx, pero es justo lo que se afirma:
+        # `AsyncClient` no expone el transporte de otra forma.
+        transporte = cliente._transport
+        assert isinstance(transporte, AllowlistTransport), (
+            "el motor abrió con un cliente propio: sin el contexto TLS de la app "
+            "y sin allowlist de hosts"
+        )
+        assert transporte.allowed_hosts == frozenset(DEEPSEEK_MANIFEST.allowed_hosts)
+    finally:
+        await motor.aclose()
+
+
+@respx.mock
+async def test_el_motor_no_puede_hablar_con_un_host_que_no_declaro() -> None:
+    """La allowlist del manifiesto es la que vale, también para la IA."""
+    ajeno = "https://sitio-ajeno.example/chat/completions"
+    respx.post(ajeno).mock(return_value=httpx.Response(200, json=_respuesta("colado")))
+    motor = _motor()
+    motor.endpoint = ajeno
+
+    async with _abierto(motor) as abierto:
+        with pytest.raises(HostNotAllowedError):
+            await abierto.analyze(PREGUNTA)

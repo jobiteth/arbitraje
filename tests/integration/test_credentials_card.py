@@ -1,17 +1,21 @@
-"""La pestaña de motores: las credenciales, y lo que de ellas se enseña.
+"""La tarjeta de credenciales de la aplicación, y lo que de ellas se enseña.
 
-Esta pestaña no existía en las pruebas y es la que custodia la clave que firma.
-Lo que se comprueba aquí es lo que se puede afirmar de un secreto sin repetirlo:
-que se guarda donde tiene que guardarse, que el campo se vacía **siempre**, que
-el estado dice «configurada» y no el valor, y que una máquina sin llavero —que es
-el caso de cualquier servidor, y el de esta aplicación desplegada— sigue diciendo
-al usuario dónde poner la credencial.
+La tarjeta custodia la clave que firma. Lo que se comprueba aquí es lo que se
+puede afirmar de un secreto sin repetirlo: que se guarda donde tiene que
+guardarse, que el campo se vacía **siempre**, que el estado dice «configurada» y
+no el valor, y que una máquina sin llavero —que es el caso de cualquier
+servidor, y el de esta aplicación desplegada— sigue diciendo al usuario dónde
+poner la credencial.
 
 Esa última es la que motivó la prueba: el llavero que no responde sustituía la
 ayuda por el error, y con ella se perdía el nombre de la variable de entorno, que
 es lo único que funciona en una máquina así. El propio mensaje del botón de
 guardar manda a leer esa ayuda («usa la variable de entorno que se indica en su
 descripción»), así que sin ella la frase señalaba a un texto que ya no estaba.
+
+Desde el 2026-10-10 la tarjeta sólo lleva lo de la aplicación: las claves de
+motor se editan en «APIs de motores» y la de cada nodo en la ventana del nodo
+(`tests/integration/test_api_keys_panel.py` y `test_settings_page.py`).
 
 Ninguna prueba de este fichero firma, emite ni sale a la red.
 """
@@ -56,7 +60,7 @@ CLAVE_PRIVADA = app_secret_key(PRIVATE_KEY_SECRET)
 class SinLlavero:
     """Un almacén que se comporta como un servidor sin Secret Service.
 
-    No es un caso raro: es **esta** máquina, y cualquier contenedor. La pestaña
+    No es un caso raro: es **esta** máquina, y cualquier contenedor. La tarjeta
     tiene que seguir siendo útil en ella, no sólo no romperse.
     """
 
@@ -84,7 +88,7 @@ async def _pagina(
     *,
     ajustes: dict[str, object] | None = None,
 ) -> AsyncIterator[tuple[Container, CredentialsCard]]:
-    """La pestaña montada sobre un contenedor de verdad.
+    """La tarjeta montada sobre un contenedor de verdad.
 
     El contenedor es el de verdad y no un doble porque lo que se mide incluye
     **dónde acaba guardándose** la credencial, y eso lo decide el contenedor.
@@ -110,7 +114,7 @@ _APAGADO: dict[str, object] = {"execution": {"allow_env_key": False}}
 
 
 def _textos(pagina: CredentialsCard) -> list[str]:
-    """Todo el texto visible de la pestaña: rótulos y campos.
+    """Todo el texto visible de la tarjeta: rótulos y campos.
 
     La ayuda emergente no entra: es lo que se lee a propósito al pasar por encima,
     y es donde vive el nombre de la variable de entorno.
@@ -232,7 +236,7 @@ async def test_guardar_un_campo_vacio_no_escribe_nada() -> None:
 
 
 async def test_borrar_quita_la_credencial_y_avisa() -> None:
-    """Borrar deja la pestaña diciendo que ya no está, y avisa a las demás."""
+    """Borrar deja la tarjeta diciendo que ya no está, y avisa a las demás."""
     store = InMemorySecretStore()
     store.set(CLAVE_PRIVADA, CLAVE_DE_DESARROLLO)
     async with _pagina(store) as (_, pagina):
@@ -356,26 +360,12 @@ async def test_con_el_respaldo_encendido_la_variable_se_ofrece_sin_condiciones()
         assert "allow_env_key" not in ayuda
 
 
-async def test_una_credencial_de_motor_nombra_su_variable_sin_condiciones() -> None:
-    """Las de motor no llevan la condición: ésas sí se leen del entorno siempre.
-
-    El registro de motores resuelve sus claves con el respaldo encendido por
-    omisión —es la única vía en un despliegue sin llavero y no firma nada—, así
-    que condicionarlas sería contar un requisito que no existe.
-    """
-    async with _pagina(SinLlavero()) as (container, pagina):
-        de_motor = [k for k in pagina._secret_notes if not k.startswith("app:")]
-        assert de_motor, "el catálogo trae motores con credenciales declaradas"
-        assert all("allow_env_key" not in pagina._secret_notes[k] for k in de_motor)
-        assert container.settings.execution.allow_env_key is False
-
-
 # --------------------------------------------------------------------------- #
-# Las claves de los nodos RPC
+# Las claves de los nodos RPC, leídas de la configuración
 # --------------------------------------------------------------------------- #
 #: Configuración con un nodo propio cuya clave viaja dentro de la URL. Es el caso
 #: de Infura, de Alchemy y de cualquier proveedor de RPC: la clave no es una
-#: credencial de motor y no tenía ninguna casilla donde escribirse.
+#: credencial de motor y se escribe en la ventana de su nodo.
 _CON_NODO_PROPIO: dict[str, object] = {
     "execution": {"allow_env_key": False},
     "chains": [
@@ -412,42 +402,21 @@ def test_un_nodo_sin_marcador_no_pide_ninguna_credencial() -> None:
     """Un nodo público no lleva clave: ofrecerle una casilla sería inventar un paso."""
     from amigocompora.ui.pages.credentials import rpc_secret_usage
 
-    ajustes =Settings.model_validate(
+    ajustes = Settings.model_validate(
         {"chains": [{"chain": "ethereum", "endpoints": [{"url": "https://rpc.libre/eth"}]}]}
     )
     assert rpc_secret_usage(ajustes) == {}
 
 
-async def test_la_clave_del_nodo_tiene_su_casilla() -> None:
-    """Y la casilla dice en qué nodo se usa, que es lo que se rompe si falta."""
-    async with _pagina(InMemorySecretStore(), ajustes=_CON_NODO_PROPIO) as (_, pagina):
-        clave = app_secret_key("INFURA_API_KEY")
-
-        assert clave in pagina._secret_fields, "la clave del nodo se puede escribir"
-        assert pagina._secret_states[clave].text() == "sin configurar"
-        assert "infura" in pagina._secret_notes[clave]
-
-
-async def test_la_clave_del_nodo_no_arrastra_la_condicion_de_la_firma() -> None:
-    """Su variable de entorno se lee siempre: la resuelve el contenedor al arrancar.
-
-    `allow_env_key` gobierna a los proveedores que firman, no a los marcadores de
-    `config.toml`. Contar aquí ese requisito mandaría a encender una opción que no
-    tiene nada que ver con esta credencial.
-    """
-    async with _pagina(InMemorySecretStore(), ajustes=_CON_NODO_PROPIO) as (container, pagina):
-        nota = pagina._secret_notes[app_secret_key("INFURA_API_KEY")]
-
-        assert app_env_var_name("INFURA_API_KEY") in nota
-        assert "allow_env_key" not in nota
-        assert container.settings.execution.allow_env_key is False
-
-
+# --------------------------------------------------------------------------- #
+# La fila «Otra credencial»
+# --------------------------------------------------------------------------- #
 async def test_se_puede_guardar_una_clave_que_el_fichero_aun_no_menciona() -> None:
     """El huevo y la gallina: la clave se guarda antes de que la URL la nombre.
 
-    Sin esto, la casilla sólo aparece cuando `config.toml` ya tiene el marcador, y
-    el marcador no se puede probar hasta que la clave está guardada.
+    La ventana de un nodo guarda la clave de ese nodo, pero una credencial que
+    todavía no referencia ninguna URL no tiene ventana donde ponerse. Aquí se
+    guarda por su nombre, en cualquier orden.
     """
     async with _pagina(InMemorySecretStore()) as (container, pagina):
         pagina._custom_name.setText("ALCHEMY_API_KEY")
@@ -493,7 +462,7 @@ async def test_un_nombre_que_no_se_puede_referenciar_no_se_guarda() -> None:
 
 async def test_guardar_sin_nombre_no_escribe_nada() -> None:
     """Un valor sin nombre no se puede ni guardar ni leer después."""
-    async with _pagina(InMemorySecretStore()) as (_, pagina):
+    async with (_pagina(InMemorySecretStore())) as (_, pagina):
         pagina._custom_value.setText("clave-de-prueba")
         pagina._on_save_custom()
 

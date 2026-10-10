@@ -19,7 +19,10 @@ import httpx
 import structlog
 
 from amigocompora.app.alerts import AlertCenter, AlertKind, severity_for_bps
+from amigocompora.app.chat_store import ChatStore
 from amigocompora.app.confirmation import ConfirmationGateway
+from amigocompora.app.copilot import Copilot
+from amigocompora.app.copilot_tools import CopilotTools
 from amigocompora.app.engine_names import EngineNames
 from amigocompora.app.execution_policy import (
     AutonomyPolicy,
@@ -176,6 +179,13 @@ class Container:
     #: «el llavero no responde»: cierto, y llevaba a la conclusión contraria.
     passphrase: AutonomyPassphraseProvider
     analyze_with_ai: AnalyzeWithAi
+    #: El copiloto con herramientas: es lo que usa la pestaña del chat. Se
+    #: construye siempre, aunque no haya ningún asesor de IA activo —lo dice al
+    #: preguntarle, con un mensaje accionable—, por la misma razón que el resto.
+    copilot: Copilot
+    #: El historial de chats. Un fichero por chat, bajo el directorio de
+    #: configuración; el mismo criterio y el mismo sitio que `executions.jsonl`.
+    chats: ChatStore
     alert_center: AlertCenter
     scheduler: Scheduler
     watch_scan: WatchScan
@@ -353,6 +363,9 @@ async def build_container(
         registry=registry,
     )
 
+    analyze_with_ai = AnalyzeWithAi(registry=registry, gateway=gateway)
+    token_lookup = TokenLookup(rpc=rpc_registry)
+
     return Container(
         settings=effective_settings,
         clock=effective_clock,
@@ -385,12 +398,28 @@ async def build_container(
         policy=execution.policy,
         keys=execution.keys,
         passphrase=execution.passphrase,
-        analyze_with_ai=AnalyzeWithAi(registry=registry, gateway=gateway),
+        analyze_with_ai=analyze_with_ai,
+        # El copiloto: el mismo análisis de IA de siempre, pero con las cuatro
+        # herramientas de sólo lectura delante para que pueda consultar los datos
+        # en vez de esperarlos pegados a mano. El bucle y el contrato viven en
+        # `app.copilot`; firmar y emitir sigue sin estar a su alcance.
+        copilot=Copilot(
+            analyze=analyze_with_ai,
+            tools=CopilotTools(
+                read_wallet=read_wallet,
+                compare_prices=compare_prices,
+                compare_bridges=compare_bridges,
+                token_lookup=token_lookup,
+                tokens=token_store,
+                clock=effective_clock,
+            ),
+        ),
+        chats=ChatStore(config_module.config_dir() / "chats"),
         alert_center=alert_center,
         scheduler=scheduler,
         watch_scan=watch_scan,
         rpc=rpc_registry,
-        token_lookup=TokenLookup(rpc=rpc_registry),
+        token_lookup=token_lookup,
         # La misma casa que `executions.jsonl`, y por el mismo motivo: el
         # directorio de configuración es el único sitio que existe cuando la
         # aplicación se lanza desde el menú de inicio y el directorio de trabajo

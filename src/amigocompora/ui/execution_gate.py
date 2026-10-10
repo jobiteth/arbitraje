@@ -30,11 +30,12 @@ de ahí para que no puedan separarse de lo que dirá el caso de uso.
 from __future__ import annotations
 
 from amigocompora.app.container import Container
+from amigocompora.app.usecases.execute_bridge import bridge_notional
 from amigocompora.app.usecases.execute_swap import reference_notional
 from amigocompora.domain.addresses import is_evm_address, is_solana_address
 from amigocompora.domain.chains import AddressFormat, chain
-from amigocompora.domain.errors import ExecutionLimitExceededError
-from amigocompora.domain.models import Quote, TradingPair
+from amigocompora.domain.errors import ExecutionLimitExceededError, NoActiveEngineError
+from amigocompora.domain.models import BridgeQuote, BridgeRequest, Quote, TradingPair
 from amigocompora.domain.modes import Capability
 from amigocompora.infra.wallets import WalletSource
 
@@ -203,6 +204,114 @@ def cap_blockers(container: Container, quote: Quote) -> tuple[str, ...]:
     except ExecutionLimitExceededError as error:
         return (str(error),)
     return ()
+
+
+def bridge_blockers(
+    container: Container,
+    *,
+    request: BridgeRequest | None,
+    quote: BridgeQuote | None = None,
+) -> tuple[str, ...]:
+    """Todo lo que falta para poder firmar un cruce. Vacío significa que sí.
+
+    Es la hermana de `execution_blockers` para el otro camino por el que sale
+    dinero, y existe por la misma razón que ella: la lista tiene que decir **lo
+    mismo** que dirá `ExecuteBridge` al firmar. Vivía dentro de la pestaña de
+    puentes, donde sólo podía leerla esa pantalla; ahora que el copiloto también
+    puede ofrecer un cruce desde el chat, la comprobación tiene que ser una sola
+    —dos listas que dicen cosas distintas son una de ellas mintiendo, y la que
+    miente es siempre la que no se ejecuta—.
+
+    La red de **destino** se mira además de la de origen, y eso es lo que
+    distingue un cruce de un swap: el dinero no se queda donde sale, así que una
+    lista blanca que sólo cubriera el origen dejaría cruzar hacia una red que el
+    usuario no autorizó.
+
+    El importe sólo se comprueba si la pata que se entrega ya está en la moneda
+    de los topes; cuando no lo está, valorarlo es una petición de red que un
+    repintado no puede permitirse y lo hará `ExecuteBridge` con la cotización
+    delante. Ese caso **no** bloquea —bloquearlo haría imposible cruzar medio
+    catálogo—: se avisa aparte, sin apagar el botón.
+    """
+    motivos: list[str] = []
+    if not container.guard.mode.grants(Capability.BROADCAST_TX):
+        motivos.append(
+            f"el modo {container.guard.mode.label} no permite emitir "
+            "(cambia a EJECUCIÓN)"
+        )
+    if not container.policy.limits.enabled:
+        motivos.append(
+            "la ejecución está apagada (`enabled = true` bajo `[execution]` "
+            "en config.toml)"
+        )
+    peticion = quote.request if quote is not None else request
+    if peticion is not None:
+        motivos.extend(_bridge_limit_blockers(container, peticion))
+    chain_key = peticion.origin.chain if peticion is not None else None
+    if not container.prepare_bridge.is_available(chain_key):
+        motivos.append(bridge_planner_reason(container, chain_key))
+    if not container.keys.available():
+        motivos.append("no hay cartera configurada, así que no hay con qué firmar")
+    return tuple(motivos)
+
+
+def bridge_planner_reason(container: Container, chain_key: str | None) -> str:
+    """Por qué no hay quien construya este puente, y qué se puede hacer.
+
+    Se distinguen dos casos que antes se decían igual: que **no haya ningún**
+    motor de puentes activo, y que los que hay no lleguen a esa red. El texto de
+    antes ofrecía siempre lo mismo —«activa `lifi` o `relay`»— y con `lifi` ya
+    activo eso manda al usuario a un panel donde no hay nada que activar: el
+    motor está, lo que no cubre es esa red. La salida es otra —cambiar el
+    origen—, así que el mensaje tiene que ser otro.
+    """
+    try:
+        activos = container.registry.bridge_planners()
+    except NoActiveEngineError:
+        # La ranura entera está vacía: aquí sí hay algo que activar.
+        activos = ()
+    if not activos:
+        return (
+            "no hay ningún motor de puentes activo "
+            "(activa `lifi` o `relay` en el panel de motores)"
+        )
+    nombre = ", ".join(sorted(engine.manifest.engine_id for engine in activos))
+    donde = f" desde «{chain_key}»" if chain_key else ""
+    return (
+        f"los motores de puentes activos ({nombre}) no cruzan{donde}: "
+        "elige otra red de origen o activa uno que la cubra"
+    )
+
+
+def _bridge_limit_blockers(
+    container: Container, request: BridgeRequest
+) -> tuple[str, ...]:
+    """Lo que los topes dirían de este cruce, con sus **dos** redes y su importe."""
+    limits = container.policy.limits
+    motivos: list[str] = []
+    try:
+        limits.check_token(
+            tuple(dict.fromkeys((request.origin.symbol, request.destination.symbol)))
+        )
+    except ExecutionLimitExceededError as error:
+        motivos.append(str(error))
+    for chain_key in request.chains:
+        try:
+            limits.check_chain(chain_key)
+        except ExecutionLimitExceededError as error:
+            motivos.append(str(error))
+
+    notional = bridge_notional(request)
+    if notional is None:
+        return tuple(motivos)
+    try:
+        limits.check_amount(
+            notional.as_decimal(),
+            spent_today=container.policy.spent_in_window(notional.symbol),
+        )
+    except ExecutionLimitExceededError as error:
+        motivos.append(str(error))
+    return tuple(motivos)
 
 
 def recipient_candidates(container: Container, chain_key: str) -> list[str]:

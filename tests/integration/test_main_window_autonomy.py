@@ -100,7 +100,11 @@ async def test_arming_turns_the_alarm_on_without_anyone_refreshing_it() -> None:
         # No basta con estar encendido: tiene que decir qué significa estar
         # armado, que es que emite sin preguntar.
         assert "sin preguntar" in texto
-        assert "desarm" in window._autonomy_label.toolTip().lower()
+        # Y dónde se apaga. Antes mandaba a `AutonomyPolicy.disarm()`, que es una
+        # llamada de Python y no un sitio de la aplicación: desde que el copiloto
+        # tiene su tira de autonomía, el aviso tiene que llevar allí.
+        assert "desármala" in window._autonomy_label.toolTip()
+        assert "Copiloto IA" in window._autonomy_label.toolTip()
 
 
 async def test_disarming_turns_the_alarm_off_again() -> None:

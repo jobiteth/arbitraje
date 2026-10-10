@@ -5,6 +5,112 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Arreglado — El copiloto llega al modelo con el TLS de la app, y un fallo se dice en vez de disfrazarse
+
+- **Los proveedores de IA abren su cliente con `infra.http`, como todos los demás
+  motores.** Construían un `httpx.AsyncClient` a secas, que verifica sólo contra
+  `certifi`: en una máquina cuyo antivirus intercepta el TLS, la llamada a
+  DeepSeek moría con `CERTIFICATE_VERIFY_FAILED` mientras el resto de motores
+  contestaba 200, porque ellos sí cargan el contexto de la app —almacén del
+  sistema **y** `certifi`—. Reportado por el usuario: «cuanto tengo en bankr» y el
+  copiloto sin contestar. Ahora hablan por el mismo cliente que los demás, con el
+  `allowed_hosts` del manifiesto aplicado de verdad (un proveedor de IA no puede
+  hablar con un host que no declaró). Medido tras el arreglo:
+  `POST https://api.deepseek.com/chat/completions` responde **HTTP 401** —sin
+  clave— en vez de fallar el certificado.
+- **Un modelo que no contesta ya no se lee como si hubiera contestado.** El
+  respaldo offline copiaba el principio de la pregunta como si fuera un análisis,
+  y con el protocolo del copiloto delante de la pregunta lo que aparecía en el
+  chat era el protocolo en JSON bajo la etiqueta «Copiloto». Ahora la respuesta
+  nombra el modelo y el motivo real —el error de TLS, el HTTP, la respuesta vacía—
+  y no lleva la advertencia de «análisis generado por IA», porque no hay análisis.
+  El protocolo pasa al contexto (`instrucciones_de_respuesta`) y la pregunta se
+  queda con las palabras del usuario. El análisis offline sigue existiendo donde
+  promete funcionar: el asistente offline. Ver `engines/llm/providers.py`,
+  `app/copilot.py` e `infra/http.py`.
+
+### Cambiado — El copiloto es un chat: consulta por su cuenta, guarda el historial y propone operaciones
+
+- **La pestaña del copiloto deja de ser un formulario y pasa a ser una
+  conversación, con el modelo y con las herramientas.** Pedido por el usuario:
+  «mejorar diseño que sea un chat con llm conectado que se conecte a las
+  herramientas incluso si le paso una dirección y le pregunto si tiene saldo
+  averigua, que vaya dejando el historial con chats archivados, modular
+  refactorizado con sus componentes, opciones de elegir el modelo y de hacer
+  operaciones en automático». Antes había que pegar a mano las cifras de las
+  otras pantallas, así que «¿tiene saldo esta dirección?» no se podía preguntar
+  de ninguna manera; ahora las trae la aplicación —saldos de una dirección,
+  cotizaciones, token por dirección y puentes— por los mismos casos de uso que
+  las demás pestañas, y mientras el turno ocurre se narra qué se está
+  consultando. Cada burbuja del copiloto guarda, plegada, la prueba de dónde
+  salió cada cifra: los hallazgos y lo consultado, con la salida en crudo.
+- **El historial: un chat por conversación, con sus archivados.** La lista va a
+  la izquierda, los de ahora arriba y los archivados en una sección plegada y
+  aparte; archivar no pregunta —se deshace de un clic— y borrar sí, con un aviso
+  que dice que no hay vuelta atrás. El mensaje del usuario se guarda **antes** de
+  preguntarle al modelo: si el motor se cae, lo escrito no se pierde y al
+  reabrir el chat se ve qué se preguntó y que no hubo respuesta. Al reabrir un
+  chat **no** se vuelve a ofrecer la propuesta de entonces: sería una cotización
+  vieja con un botón de firmar al lado.
+- **Cuando el copiloto propone una operación, el chat la ofrece por el camino de
+  siempre** (decisión del usuario). La tarjeta dice lo que se propone, avisa de
+  que todavía no se ha firmado nada y, si el camino no está abierto, enumera
+  **qué falta** con las mismas funciones que consultan las otras pantallas
+  (`ui/execution_gate.py`): modo, interruptor, lista blanca, planificador,
+  cartera y topes. El botón entra por `execute_swap`/`execute_bridge`, con su
+  confirmación por transacción —o con la autonomía ya armada, dentro de sus
+  límites—, y una propuesta ya ejecutada **no** vuelve a encenderse aunque el
+  estado cambie: la cifra que llevaba ya se gastó.
+- **Elegir el modelo, con uno encendido a la vez.** El desplegable se rellena con
+  todos los asesores instalados —elegir uno apagado es la forma normal de
+  encenderlo— y al elegir se enciende el nuevo **antes** de apagar los demás: en
+  el peor caso quedan dos encendidos, que es lo que ya había, y nunca ninguno.
+  La ranura se escribe en `config.toml` y, si no se pudo, se dice: vale para esta
+  sesión. Un modelo que no arranca —«claude» sin su clave— deja su motivo en la
+  pantalla y no se lleva por delante al que estaba contestando.
+- **La autonomía se arma desde aquí, y desarmarla no pide nada.** La tira enseña
+  si está armada, cuánto se ha gastado en 24 h **por unidad** —un número sin
+  unidad no dice si son cien dólares o cien mil, y es la cifra que se mira para
+  dejar que la aplicación firme sola— y hasta dónde llegan los topes. Armar pide
+  la frase (texto oculto, contra la guardada) y desarmar es el freno: no
+  pregunta, no pide frase y no falla. El aviso de la barra de estado ahora manda
+  a esta tira en vez de a un método de Python. Ver `ui/pages/ai.py`,
+  `ui/copilot_chat.py`, `ui/copilot_history.py` y `ui/copilot_controls.py`.
+
+### Cambiado — Configuración se divide en tres subpestañas, y el nodo se agrega y se edita en su ventana
+
+- **La pestaña Configuración pasa a ser tres subpestañas —Nodos RPC, APIs de
+  motores, Credenciales— y cada credencial vive en un solo sitio.** Pedido por
+  el usuario: «que las celdas se adapten al contenido en lo ancho y que al final
+  esté un botón de agregar nodo que al pulsarse se abra la ventana para añadirlo
+  […] y en una segunda subpestaña poner las API que puedan agregarse/editarse, no
+  de manera duplicada». El formulario fijo del final de la tarjeta desaparece:
+  «Agregar nodo…» abre una ventana (`ui/node_dialog.py`) que sirve para el alta y
+  —con el lápiz de la fila— para editar, con la ✕ para eliminar. Un nodo **nuevo**
+  sólo se guarda si la prueba (`eth_chainId`) responde con la red elegida; al
+  editar sólo se exige si cambió la URL o se escribió una clave nueva, porque
+  etiqueta y prioridad no son nada que la prueba mida. La clave del nodo viaja
+  dentro de su URL como `${NOMBRE}` y se escribe en esa misma ventana, junto al
+  nodo que la usa; dejarla en blanco al editar **no** borra la guardada.
+- **Las claves de los motores y su modelo dejan de enseñarse en dos sitios.**
+  La tabla de sólo lectura de Configuración y la casilla por opción de la tarjeta
+  de credenciales eran dos vistas del mismo dato, y se separan en cuanto una
+  cambia: ahora es una sola (`ui/pages/apis.py`), con el lápiz de la fila para
+  editar. Se guardan como `<motor>:<opción>` en el llavero; el **modelo** —que no
+  es un secreto— se lee en claro y en blanco es «el de fábrica»; un campo en
+  blanco no borra lo guardado («Borrar las guardadas» es su botón); y guardar una
+  clave aquí **no** enciende el motor, cosa que se dice porque una clave guardada
+  que nadie usa parece estar funcionando. La tarjeta de Credenciales queda con lo
+  que es de la aplicación entera: la clave que firma, la frase de la ejecución
+  desatendida, Polymarket y la fila «Otra credencial».
+- **Las tablas de la pestaña reparten el ancho por contenido**, como la de
+  motores: cada columna mide lo suyo y la larga —la URL de un nodo, la
+  configuración de un motor— se lleva el ancho que sobra, en vez de recortarse
+  todas por igual. La columna «Clave» de la tabla de nodos dice el estado de cada
+  marcador (`INFURA_API_KEY: configurada`) sin enseñar nunca el valor, y su ayuda
+  nombra el llavero, la variable de entorno y cómo escribirla (la ventana del
+  nodo). Ver `ui/pages/settings.py`, `ui/pages/apis.py` y `ui/node_dialog.py`.
+
 ### Cambiado — La pestaña de motores enciende y apaga por fila, y el nombre se edita
 
 - **El desplegable y el botón «Activar» de la pestaña de motores se sustituyen

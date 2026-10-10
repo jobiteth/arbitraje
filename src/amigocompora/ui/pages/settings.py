@@ -1,59 +1,109 @@
 """Pestaña: Configuración — nodos RPC, APIs de motores y credenciales.
 
-Aquí se decide **con qué nodos** habla cada red y **con qué claves** se llama a
-cada API. Motores se queda sólo con la activación: antes las tres cosas estaban
-en la misma pantalla y no se sabía dónde tocar para cambiar un nodo.
+La pestaña son tres subpestañas, y cada credencial vive en **un solo sitio**:
 
-Un nodo nuevo sólo se guarda si la prueba (`eth_chainId`) responde con la red
-elegida. La clave nunca se escribe en `config.toml`: se guarda en el llavero y la
-URL la nombra como `${NOMBRE}`, igual que los nodos que ya estaban declarados.
+- **Nodos RPC** — los endpoints declarados de cada red y sus respaldos públicos.
+  Un nodo se agrega o se edita en su ventana (`ui/node_dialog.py`), que prueba
+  antes de guardar; la clave de un nodo —la que viaja dentro de su URL como
+  `${NOMBRE}`— se escribe ahí mismo, junto al nodo que la usa.
+- **APIs de motores** — las claves y el modelo de cada motor (`ui/pages/apis.py`).
+  Antes esto estaba en dos sitios a la vez: una tabla de sólo lectura aquí y una
+  casilla por opción en la tarjeta de credenciales. Dos vistas del mismo dato se
+  separan en cuanto una cambia, así que ahora hay una.
+- **Credenciales** — lo de la aplicación: la clave que firma, la frase de la
+  ejecución desatendida y las de Polymarket (`ui/pages/credentials.py`).
+
+Las tablas reparten el ancho como la de motores: cada columna mide su contenido
+y el texto largo —la URL— se lleva lo que sobra, en vez de recortarse todas por
+igual.
 """
 
 from __future__ import annotations
 
-import hashlib
-
-from pydantic import ValidationError
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QComboBox,
-    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
-    QLineEdit,
     QPushButton,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
     QWidget,
 )
 
 from amigocompora.app.container import Container
 from amigocompora.domain.chains import CHAINS
-from amigocompora.domain.errors import AmigocomporaError
 from amigocompora.infra.config import RpcEndpointSettings, config_file
 from amigocompora.infra.config_writer import set_chain_endpoints
 from amigocompora.infra.logging import safe_url
-from amigocompora.infra.rpc.probe import probe_node
 from amigocompora.infra.secrets import (
     SecretStoreError,
+    app_env_var_name,
     app_secret_key,
-    resolve_placeholders,
-    secret_key,
+    placeholder_names,
 )
 from amigocompora.ui import icons
-from amigocompora.ui.pages.credentials import NOMBRE_VALIDO, CredentialsCard
+from amigocompora.ui.node_dialog import NodeDialog
+from amigocompora.ui.pages.apis import ApiKeysPanel
+from amigocompora.ui.pages.credentials import CredentialsCard, rpc_secret_usage
 from amigocompora.ui.theme import COLOR_MUTED
-from amigocompora.ui.widgets import Card, ScrollArea, spawn
+from amigocompora.ui.widgets import Card, ScrollArea
 
 _ORIGEN_CONFIG = "config.toml"
 _ORIGEN_PUBLICO = "respaldo público"
 
+#: Las redes EVM por nombre, en un solo sitio: el desplegable de la ventana y la
+#: red preseleccionada del alta tienen que ofrecer el mismo orden.
+_EVM_CHAINS = tuple(sorted((s for s in CHAINS.values() if s.is_evm), key=lambda s: s.name))
+
+#: Las columnas de la tabla de nodos, por nombre. Las URL son largas y las demás
+#: cortas, así que una sola de ellas se estira.
+_COL_CHAIN = 0
+_COL_LABEL = 1
+_COL_URL = 2
+_COL_PRIORITY = 3
+_COL_ORIGIN = 4
+_COL_KEY = 5
+_COL_ACTIONS = 6
+
 
 class ConfiguracionPage(QWidget):
     #: Se reenvían las señales de las credenciales: quien firma escucha aquí, y
-    #: no necesita saber que las credenciales viven en una tarjeta de esta pestaña.
+    #: no necesita saber que las credenciales viven en una subpestaña.
     credentials_changed = Signal()
+
+    def __init__(self, container: Container, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._container = container
+
+        tabs = QTabWidget()
+        self._nodes = NodesPanel(container, self)
+        tabs.addTab(self._nodes, "Nodos RPC")
+        self._apis = ApiKeysPanel(container, self)
+        tabs.addTab(self._apis, "APIs de motores")
+        self._credentials = CredentialsCard(container, self)
+        self._credentials.credentials_changed.connect(self._on_credentials_changed)
+        tabs.addTab(self._credentials, "Credenciales")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(tabs)
+
+    def _on_credentials_changed(self) -> None:
+        """Repinta lo que enseña estados de claves y avisa a quien firma.
+
+        Guardar «otra credencial» en la tarjeta puede ser la clave que un nodo
+        está esperando: su estado tiene que cambiar sin salir de la pestaña.
+        """
+        self._apis.refresh()
+        self._nodes.refresh_keys()
+        self.credentials_changed.emit()
+
+
+class NodesPanel(QWidget):
+    """La tabla de nodos y su ventana: agregar, editar y eliminar."""
 
     def __init__(self, container: Container, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -72,333 +122,227 @@ class ConfiguracionPage(QWidget):
             )
             for chain in container.settings.chains
         }
-        #: Firma de los campos del formulario cuya prueba respondió bien. Guardar
-        #: sólo se habilita si lo que hay escrito coincide con esa firma.
-        self._verified: str | None = None
-        #: Qué fila de la tabla es cada nodo: (red, índice en `_declared` o None si
-        #: es un respaldo público). Sólo los declarados se pueden eliminar.
-        self._rows: list[tuple[str, int | None]] = []
 
         lay = ScrollArea.fill(self, spacing=12).body()
-        lay.addWidget(self._build_nodes())
-        lay.addWidget(self._build_apis())
-        self._credentials = CredentialsCard(container)
-        self._credentials.credentials_changed.connect(self._on_credentials_changed)
-        lay.addWidget(self._credentials)
 
-        self._fill_nodes_table()
-        self._refresh_apis()
-
-    # ----------------------------------------------------------------- nodos #
-    def _build_nodes(self) -> Card:
         card = Card(
             "Nodos RPC",
             subtitle="los nodos se aplican al arrancar: tras guardar, reinicia la aplicación",
         )
 
-        self._nodes_table = QTableWidget(0, 5)
-        self._nodes_table.setHorizontalHeaderLabels(["Red", "Etiqueta", "URL", "Prioridad", "Origen"])
-        self._nodes_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._nodes_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._nodes_table.setMinimumHeight(180)
-        self._nodes_table.itemSelectionChanged.connect(self._refresh_delete)
-        card.body().addWidget(self._nodes_table, stretch=1)
-
-        self._delete_btn = QPushButton("Eliminar nodo seleccionado")
-        self._delete_btn.setObjectName("secondary")
-        self._delete_btn.setEnabled(False)
-        self._delete_btn.clicked.connect(self._on_delete_node)
-        card.body().addWidget(self._delete_btn)
-
-        form = QGridLayout()
-        form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(6)
-
-        self._chain = QComboBox()
-        for spec in sorted((s for s in CHAINS.values() if s.is_evm), key=lambda s: s.name):
-            self._chain.addItem(icons.network_icon(spec.key), spec.name, spec.key)
-
-        self._label = QLineEdit()
-        self._label.setPlaceholderText("opcional, p. ej. «mi nodo»")
-        self._url = QLineEdit()
-        self._url.setPlaceholderText("https://…  la clave va como ${NOMBRE}")
-        self._key_name = QLineEdit()
-        self._key_name.setPlaceholderText("NOMBRE_DE_LA_CLAVE, opcional")
-        self._key_value = QLineEdit()
-        self._key_value.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_value.setPlaceholderText("valor de la clave, opcional")
-        self._priority = QSpinBox()
-        self._priority.setRange(1, 999)
-        self._priority.setValue(10)
-
-        campos = (
-            ("Red:", self._chain),
-            ("Etiqueta:", self._label),
-            ("URL:", self._url),
-            ("Nombre de la clave:", self._key_name),
-            ("Valor de la clave:", self._key_value),
-            ("Prioridad:", self._priority),
+        self._table = QTableWidget(0, 7)
+        self._table.setHorizontalHeaderLabels(
+            ["Red", "Etiqueta", "URL", "Prioridad", "Origen", "Clave", ""]
         )
-        for fila, (texto, widget) in enumerate(campos):
-            form.addWidget(QLabel(texto), fila, 0)
-            form.addWidget(widget, fila, 1)
-        card.body().addLayout(form)
-
-        for widget in (self._label, self._url, self._key_name, self._key_value):
-            widget.textChanged.connect(self._invalidate)
-        self._chain.currentIndexChanged.connect(self._invalidate)
-        self._priority.valueChanged.connect(self._invalidate)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setMinimumHeight(220)
+        header = self._table.horizontalHeader()
+        header.setStretchLastSection(False)
+        # Cada columna mide su contenido; la URL se lleva el ancho que sobra.
+        # Repartidas a partes iguales, la URL se recortaba y «Origen» se quedaba
+        # con un palmo de hueco: el ancho de la ventana se reparte donde hay
+        # texto que crece, no donde no lo hay.
+        for columna in (
+            _COL_CHAIN,
+            _COL_LABEL,
+            _COL_PRIORITY,
+            _COL_ORIGIN,
+            _COL_KEY,
+            _COL_ACTIONS,
+        ):
+            header.setSectionResizeMode(columna, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(_COL_URL, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(32)
+        card.body().addWidget(self._table, stretch=1)
 
         botones = QHBoxLayout()
-        self._probe_btn = QPushButton("Probar")
-        self._probe_btn.setObjectName("secondary")
-        self._probe_btn.clicked.connect(self._on_probe)
-        self._save_btn = QPushButton("Guardar nodo")
-        self._save_btn.setEnabled(False)
-        self._save_btn.clicked.connect(self._on_save)
-        botones.addWidget(self._probe_btn)
-        botones.addWidget(self._save_btn)
+        agregar = QPushButton("Agregar nodo…")
+        agregar.setToolTip(
+            "Abre la ventana de un nodo nuevo. Sólo se guarda si la prueba "
+            "(eth_chainId) responde con la red elegida."
+        )
+        agregar.clicked.connect(self._on_add_node)
+        botones.addWidget(agregar)
         botones.addStretch(1)
         card.body().addLayout(botones)
 
-        self._probe_label = QLabel("")
-        self._probe_label.setWordWrap(True)
-        card.body().addWidget(self._probe_label)
-        self._node_status = QLabel("")
-        self._node_status.setWordWrap(True)
-        self._node_status.setStyleSheet(f"color: {COLOR_MUTED};")
-        card.body().addWidget(self._node_status)
-        return card
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(f"color: {COLOR_MUTED};")
+        card.body().addWidget(self._status)
 
-    def _fill_nodes_table(self) -> None:
-        self._nodes_table.setRowCount(0)
-        self._rows = []
+        lay.addWidget(card)
+        self._fill_table()
+
+    # -------------------------------------------------------------- pintado #
+    def _fill_table(self) -> None:
+        self._table.setRowCount(0)
         for chain_key in sorted(set(self._declared) | set(self._public)):
             nombre = CHAINS[chain_key].name if chain_key in CHAINS else chain_key
             for indice, endpoint in enumerate(self._declared.get(chain_key, [])):
-                self._add_row(nombre, endpoint, _ORIGEN_CONFIG, (chain_key, indice))
+                self._add_row(nombre, chain_key, endpoint, _ORIGEN_CONFIG, indice)
             for endpoint in self._public.get(chain_key, ()):
-                self._add_row(nombre, endpoint, _ORIGEN_PUBLICO, (chain_key, None))
-        self._refresh_delete()
+                self._add_row(nombre, chain_key, endpoint, _ORIGEN_PUBLICO, None)
 
     def _add_row(
         self,
         nombre: str,
+        chain_key: str,
         endpoint: RpcEndpointSettings,
         origen: str,
-        ref: tuple[str, int | None],
+        indice: int | None,
     ) -> None:
-        fila = self._nodes_table.rowCount()
-        self._nodes_table.insertRow(fila)
+        fila = self._table.rowCount()
+        self._table.insertRow(fila)
         celdas = (
             nombre,
             endpoint.label or "—",
             safe_url(endpoint.url),
             str(endpoint.priority),
             origen,
+            self._key_state_text(endpoint),
         )
         for columna, texto in enumerate(celdas):
-            self._nodes_table.setItem(fila, columna, QTableWidgetItem(texto))
+            self._table.setItem(fila, columna, QTableWidgetItem(texto))
         # El icono de la red en la primera celda. El texto no se toca: la columna
         # dice la red y hay filas cuya clave no está en el catálogo (se enseña la
         # clave cruda), así que el icono es un extra que puede faltar.
-        red = self._nodes_table.item(fila, 0)
+        red = self._table.item(fila, _COL_CHAIN)
         if red is not None:
-            red.setIcon(icons.network_icon(ref[0]))
-        self._rows.append(ref)
-
-    def _refresh_delete(self) -> None:
-        fila = self._nodes_table.currentRow()
-        declarado = 0 <= fila < len(self._rows) and self._rows[fila][1] is not None
-        self._delete_btn.setEnabled(declarado)
-
-    def _on_delete_node(self) -> None:
-        fila = self._nodes_table.currentRow()
-        if not (0 <= fila < len(self._rows)):
-            return
-        chain_key, indice = self._rows[fila]
-        if indice is None:
-            return
-        restantes = [ep for i, ep in enumerate(self._declared[chain_key]) if i != indice]
-        try:
-            set_chain_endpoints(config_file(), chain_key, restantes)
-        except (OSError, ValueError) as error:
-            self._node_status.setText(f"No se pudo escribir config.toml: {error}")
-            return
-        self._declared[chain_key] = restantes
-        self._fill_nodes_table()
-        self._node_status.setText(
-            "Nodo eliminado de config.toml. Su clave, si la tenía, sigue en el llavero."
-        )
-
-    def _signature(self) -> str:
-        """Lo que se ha escrito en el formulario, con la clave en forma de huella.
-
-        La clave no se guarda en ningún atributo: sólo su SHA-256, para saber si
-        lo escrito ahora es lo mismo que se probó.
-        """
-        huella = hashlib.sha256(self._key_value.text().strip().encode()).hexdigest()
-        return "|".join(
-            (
-                str(self._chain.currentData()),
-                self._label.text().strip(),
-                self._url.text().strip(),
-                self._key_name.text().strip(),
-                str(self._priority.value()),
-                huella,
+            red.setIcon(icons.network_icon(chain_key))
+        clave = self._table.item(fila, _COL_KEY)
+        if clave is not None:
+            clave.setToolTip(self._key_state_tooltip(chain_key, endpoint))
+        if indice is not None:
+            self._table.setCellWidget(
+                fila, _COL_ACTIONS, self._actions_cell(chain_key, endpoint, indice)
             )
+
+    def _actions_cell(
+        self, chain_key: str, endpoint: RpcEndpointSettings, indice: int
+    ) -> QWidget:
+        """Los botones de la fila: editar y eliminar. Sólo en los nodos propios."""
+        celda = QWidget()
+        caja = QHBoxLayout(celda)
+        caja.setContentsMargins(4, 0, 4, 0)
+        caja.setSpacing(4)
+
+        editar = QPushButton("✎")
+        editar.setObjectName("rowAction")
+        editar.setFixedWidth(26)
+        editar.setToolTip("Editar este nodo. Si cambias la URL o la clave, habrá que probarlo.")
+        editar.clicked.connect(lambda _=False, c=chain_key, i=indice: self._on_edit_node(c, i))
+        caja.addWidget(editar)
+
+        eliminar = QPushButton("✕")
+        eliminar.setObjectName("rowAction")
+        eliminar.setFixedWidth(26)
+        eliminar.setToolTip(
+            "Eliminar este nodo de config.toml. Su clave, si la tenía, sigue en el "
+            "llavero: se borra desde la tarjeta de credenciales."
         )
+        eliminar.clicked.connect(lambda _=False, c=chain_key, i=indice: self._on_delete_node(c, i))
+        caja.addWidget(eliminar)
+        return celda
 
-    def _invalidate(self, *_: object) -> None:
-        self._verified = None
-        self._save_btn.setEnabled(False)
-        self._probe_label.setText("Pendiente de prueba: pulsa Probar antes de guardar.")
+    def _key_state_text(self, endpoint: RpcEndpointSettings) -> str:
+        nombres = placeholder_names(endpoint.url)
+        if not nombres:
+            return "—"
+        return "; ".join(f"{nombre}: {self._estado_clave(nombre)}" for nombre in nombres)
 
-    def _on_probe(self) -> None:
-        chain_key = str(self._chain.currentData())
-        url = self._url.text().strip()
-        nombre = self._key_name.text().strip()
-        valor = self._key_value.text().strip()
-        if not url:
-            self._probe_label.setText("Escribe la URL del nodo.")
-            return
-        if nombre and not NOMBRE_VALIDO.match(nombre):
-            self._probe_label.setText(
-                f"«{nombre}» no vale como nombre: empieza por una letra y sigue con "
-                f"letras, números o «_»."
+    def _key_state_tooltip(self, chain_key: str, endpoint: RpcEndpointSettings) -> str:
+        nombres = placeholder_names(endpoint.url)
+        if not nombres:
+            return "Este nodo no lleva clave: su URL no referencia ninguna credencial."
+        uso = rpc_secret_usage(self._container.settings)
+        partes = []
+        for nombre in nombres:
+            donde = ", ".join(uso.get(nombre, ())) or "ningún nodo de config.toml"
+            partes.append(
+                f"«{nombre}» va dentro de la URL de {donde}; se guarda como "
+                f"«{app_secret_key(nombre)}» y su variable de entorno equivalente "
+                f"{app_env_var_name(nombre)} se lee siempre al resolver los nodos. "
+                f"Se escribe abriendo la ventana de este nodo (✎)."
             )
-            return
-        if nombre and f"${{{nombre}}}" not in url:
-            self._probe_label.setText(f"La URL tiene que contener ${{{nombre}}} donde va la clave.")
-            return
-        if valor and not nombre:
-            self._probe_label.setText("Para guardar la clave, escribe también su nombre.")
-            return
+        return "\n\n".join(partes)
+
+    def _estado_clave(self, nombre: str) -> str:
         try:
-            endpoint = RpcEndpointSettings(
-                url=url,
-                label=self._label.text().strip(),
-                priority=self._priority.value(),
-            )
-        except ValidationError as error:
-            self._probe_label.setText(f"URL no válida: {error.errors()[0]['msg']}")
-            return
-
-        try:
-            if nombre and valor:
-                probe_url = url.replace(f"${{{nombre}}}", valor)
-            else:
-                probe_url = resolve_placeholders(
-                    endpoint.url, self._container.secrets, place=f"el nodo de {chain_key}"
-                )
-        except AmigocomporaError as error:
-            self._probe_label.setText(f"No se puede resolver la clave: {error}")
-            return
-
-        esperada = CHAINS[chain_key].eip155_id
-        firma = self._signature()
-        self._probe_btn.setEnabled(False)
-        self._probe_label.setText("Probando el nodo…")
-        spawn(self._do_probe(firma, probe_url, esperada))
-
-    async def _do_probe(self, firma: str, url: str, esperada: int | None) -> None:
-        try:
-            resultado = await probe_node(url, esperada)
-        finally:
-            self._probe_btn.setEnabled(True)
-        if firma != self._signature():
-            return
-        if resultado.ok:
-            self._verified = firma
-            self._probe_label.setText(f"✓ {resultado.detail} ({resultado.latency_ms} ms)")
-        else:
-            self._verified = None
-            self._probe_label.setText(f"✗ {resultado.detail}")
-        self._save_btn.setEnabled(self._verified == self._signature())
-
-    def _on_save(self) -> None:
-        if self._verified != self._signature():
-            return
-        chain_key = str(self._chain.currentData())
-        url = self._url.text().strip()
-        nombre = self._key_name.text().strip()
-        valor = self._key_value.text().strip()
-        endpoint = RpcEndpointSettings(
-            url=url,
-            label=self._label.text().strip(),
-            priority=self._priority.value(),
-        )
-        existentes = self._declared.get(chain_key, [])
-        if any(ep.url == url for ep in existentes):
-            self._probe_label.setText("Ya hay un nodo con esa URL en esa red.")
-            return
-
-        if nombre and valor:
-            try:
-                self._container.secrets.set(app_secret_key(nombre), valor)
-            except SecretStoreError as error:
-                self._probe_label.setText(f"No se pudo guardar la clave en el llavero: {error}")
-                return
-
-        restantes = [*existentes, endpoint]
-        try:
-            set_chain_endpoints(config_file(), chain_key, restantes)
-        except (OSError, ValueError) as error:
-            self._probe_label.setText(f"No se pudo escribir config.toml: {error}")
-            return
-
-        self._declared[chain_key] = restantes
-        self._key_value.clear()
-        self._verified = None
-        self._save_btn.setEnabled(False)
-        self._probe_label.setText("")
-        self._fill_nodes_table()
-        self._node_status.setText(
-            "Nodo guardado en config.toml. Reinicia la aplicación para que se use."
-        )
-        self._refresh_apis()
-
-    # ------------------------------------------------------------------ APIs #
-    def _build_apis(self) -> Card:
-        card = Card(
-            "APIs de motores",
-            subtitle="hosts a los que puede llamar cada motor y estado de sus claves",
-        )
-        self._apis_table = QTableWidget(0, 3)
-        self._apis_table.setHorizontalHeaderLabels(["Motor", "Hosts permitidos", "Claves"])
-        self._apis_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._apis_table.setMinimumHeight(180)
-        card.body().addWidget(self._apis_table, stretch=1)
-        return card
-
-    def _refresh_apis(self) -> None:
-        self._apis_table.setRowCount(0)
-        for entry in self._container.registry.available():
-            manifest = entry.manifest
-            fila = self._apis_table.rowCount()
-            self._apis_table.insertRow(fila)
-            hosts = ", ".join(manifest.allowed_hosts) or "ninguno"
-            claves = "; ".join(
-                f"{opcion}: {self._estado_clave(secret_key(manifest.engine_id, opcion))}"
-                for opcion in manifest.config_options
-            )
-            celdas = (
-                self._container.engine_names.resolve(manifest.engine_id, manifest.name),
-                hosts,
-                claves or "—",
-            )
-            for columna, texto in enumerate(celdas):
-                celda = QTableWidgetItem(texto)
-                if columna == 0:
-                    celda.setIcon(icons.brand_icon(manifest.engine_id))
-                self._apis_table.setItem(fila, columna, celda)
-
-    def _estado_clave(self, key: str) -> str:
-        try:
-            return "configurada" if self._container.secrets.get(key) else "sin configurar"
+            presente = bool(self._container.secrets.get(app_secret_key(nombre)))
         except SecretStoreError:
             return "llavero no responde"
+        return "configurada" if presente else "sin configurar"
 
-    def _on_credentials_changed(self) -> None:
-        self._refresh_apis()
-        self.credentials_changed.emit()
+    def refresh_keys(self) -> None:
+        """Repinta sólo los estados de clave: se guardó (o borró) una credencial."""
+        for fila in range(self._table.rowCount()):
+            referencia = self._declared_ref(fila)
+            if referencia is None:
+                continue
+            chain_key, indice = referencia
+            endpoint = self._declared[chain_key][indice]
+            clave = self._table.item(fila, _COL_KEY)
+            if clave is not None:
+                clave.setText(self._key_state_text(endpoint))
+
+    def _declared_ref(self, fila: int) -> tuple[str, int] | None:
+        """El nodo declarado de esa fila, o `None` si la fila es de un respaldo.
+
+        Se recorre el mismo orden con el que `_fill_table` reparte las filas
+        —cada red, primero sus declarados y después sus públicos— porque la tabla
+        no guarda a qué nodo corresponde cada una: lo sabe su posición.
+        """
+        posicion = 0
+        for chain_key in sorted(set(self._declared) | set(self._public)):
+            declarados = self._declared.get(chain_key, [])
+            if fila < posicion + len(declarados):
+                return chain_key, fila - posicion
+            posicion += len(declarados) + len(self._public.get(chain_key, ()))
+        return None
+
+    # ------------------------------------------------------------ acciones #
+    def _on_add_node(self) -> None:
+        self._open_dialog(self._default_chain(), None)
+
+    def _on_edit_node(self, chain_key: str, indice: int) -> None:
+        self._open_dialog(chain_key, indice)
+
+    def _default_chain(self) -> str:
+        """La red preseleccionada al agregar: la primera del desplegable."""
+        return _EVM_CHAINS[0].key
+
+    def _open_dialog(self, chain_key: str, indice: int | None) -> None:
+        dialog = NodeDialog(
+            self._container,
+            self,
+            chain_key=chain_key,
+            endpoints=self._declared.get(chain_key, []),
+            index=indice,
+        )
+        if dialog.exec() != NodeDialog.DialogCode.Accepted or dialog.endpoints is None:
+            return
+        self._declared[chain_key] = list(dialog.endpoints)
+        self._fill_table()
+        verbo = "guardado" if indice is None else "actualizado"
+        aviso = " La clave quedó en el llavero." if dialog.key_saved else ""
+        self._status.setText(
+            f"Nodo {verbo} en config.toml. Reinicia la aplicación para que se use.{aviso}"
+        )
+
+    def _on_delete_node(self, chain_key: str, indice: int) -> None:
+        declarados = self._declared.get(chain_key, [])
+        if not 0 <= indice < len(declarados):
+            return
+        restantes = [ep for i, ep in enumerate(declarados) if i != indice]
+        try:
+            set_chain_endpoints(config_file(), chain_key, restantes)
+        except (OSError, ValueError) as error:
+            self._status.setText(f"No se pudo escribir config.toml: {error}")
+            return
+        self._declared[chain_key] = restantes
+        self._fill_table()
+        self._status.setText(
+            "Nodo eliminado de config.toml. Su clave, si la tenía, sigue en el llavero."
+        )

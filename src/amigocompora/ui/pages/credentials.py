@@ -1,7 +1,12 @@
-"""Credenciales de la aplicación, de motores y de nodos RPC.
+"""Credenciales de la aplicación: lo que firma y lo que identifica ante Polymarket.
 
-Vive en la pestaña Configuración. Antes estaba en Motores, junto a la activación,
-y las claves de nodo se mezclaban con las de motor sin que se viera cuál era cuál.
+Vive en la pestaña Configuración, en su propia subpestaña. Antes estaban aquí
+también las claves de los motores y las de los nodos RPC, y eso eran dos vistas
+del mismo dato: las de motor se editan en «APIs de motores» y la de un nodo se
+escribe en la ventana del nodo que la usa (`ui/node_dialog.py`). Aquí queda lo
+que pertenece a la aplicación entera —la clave que firma, la frase de la ejecución
+desatendida y las credenciales de Polymarket— más la fila para guardar una
+credencial por su nombre, que es la salida cuando todavía no la referencia nada.
 
 """
 
@@ -34,9 +39,7 @@ from amigocompora.infra.secrets import (
     SecretStoreError,
     app_env_var_name,
     app_secret_key,
-    env_var_name,
     placeholder_names,
-    secret_key,
 )
 from amigocompora.ui.theme import COLOR_DANGER, COLOR_MUTED, COLOR_WARNING
 from amigocompora.ui.widgets import Card
@@ -154,11 +157,10 @@ class CredentialsCard(QWidget):
     def _build_custom_secret(self) -> QHBoxLayout:
         """La fila para guardar una credencial que todavía no tiene casilla.
 
-        Las casillas de arriba salen de lo que ya está declarado —el manifiesto de
-        un motor, un `${NOMBRE}` escrito en `config.toml`—, y eso deja un hueco con
-        forma de huevo y gallina: la clave de un nodo nuevo no tiene dónde ponerse
-        hasta que el fichero la menciona, y el fichero no se puede probar hasta que
-        la clave está guardada. Aquí se guarda por su nombre, en cualquier orden.
+        La clave propia de un nodo se escribe en su ventana (`ui/node_dialog.py`),
+        junto a la URL que la usa. Esta fila queda para lo que no es de ningún
+        nodo todavía: se guarda por su nombre, en cualquier orden, y el día que
+        una URL la nombre ya está puesta.
 
         El valor va enmascarado y el nombre no: el nombre es lo que luego hay que
         escribir en `config.toml`, así que tiene que poder leerse y copiarse.
@@ -219,8 +221,9 @@ class CredentialsCard(QWidget):
                     f"Va dentro de la URL de {', '.join(usage[name])}."
                     if name in usage
                     else f"Guardada, pero ningún nodo de config.toml la usa todavía: "
-                    f"escribe ${{{name}}} dentro de la URL de un endpoint para "
-                    f"que se resuelva al arrancar."
+                    f"escribe ${{{name}}} dentro de la URL de un endpoint —o abre ese "
+                    f"nodo con ✎ en la subpestaña Nodos RPC— para que se resuelva al "
+                    f"arrancar."
                 ),
                 required=False,
             )
@@ -304,48 +307,6 @@ class CredentialsCard(QWidget):
         for position, (key, label, note, required) in enumerate(rows):
             self._add_secret_row(self._secrets_grid, position, key, label, note, required=required)
 
-        position = len(rows)
-
-        # Las claves de los nodos RPC. No hay ninguna lista de proveedores escrita
-        # aquí: se leen los `${NOMBRE}` que la propia configuración usa en sus
-        # endpoints, igual que las de motor se leen del manifiesto. Escribir
-        # «Infura» en la interfaz habría dejado fuera a Alchemy, a QuickNode y a
-        # cualquier nodo propio, que usan exactamente el mismo mecanismo.
-        for name, places in rpc_secret_usage(self._container.settings).items():
-            self._add_secret_row(
-                self._secrets_grid,
-                position,
-                app_secret_key(name),
-                f"Clave de nodo — {name}",
-                f"Va dentro de la URL de {', '.join(places)}. Sin ella ese nodo se "
-                f"descarta al arrancar y la red usa los respaldos públicos.",
-                required=False,
-            )
-            position += 1
-
-        # Una credencial por opción declarada en el manifiesto de un motor
-        # registrado. Se leen del manifiesto y no de una lista escrita aquí: un
-        # motor nuevo publica sus claves y aparecen solas, que es lo que hace que
-        # añadir un motor no toque la interfaz.
-        for entry in self._container.registry.available():
-            manifest = entry.manifest
-            for option in manifest.config_options:
-                required = option in manifest.required_config
-                self._add_secret_row(
-                    self._secrets_grid,
-                    position,
-                    secret_key(manifest.engine_id, option),
-                    f"{self._container.engine_names.resolve(manifest.engine_id, manifest.name)}"
-                    f" — {option}",
-                    (
-                        "Obligatoria: sin ella este motor no arranca."
-                        if required
-                        else "Opcional: el motor funciona sin ella."
-                    ),
-                    required=required,
-                )
-                position += 1
-
     def _add_secret_row(
         self,
         grid: QGridLayout,
@@ -397,26 +358,22 @@ class CredentialsCard(QWidget):
         dos credenciales de la aplicación no basta con ponerla: el proveedor que
         las lee sólo mira el entorno si `[execution] allow_env_key` está encendido.
         """
-        if key.startswith("app:"):
-            env = app_env_var_name(key.removeprefix("app:"))
-            # La clave privada y la frase las lee un proveedor —el que firma, el
-            # que arma la autonomía— que **sólo** mira la variable si la
-            # configuración lo autoriza; las de motor las resuelve el registro, y
-            # las de los nodos RPC las resuelve el contenedor al arrancar, que
-            # miran el entorno siempre. Nombrar la variable sin decir la condición
-            # mandaría a un servidor sin llavero a poner una variable que nadie va
-            # a leer, que es justo lo que el `require()` de al lado se cuida de no
-            # hacer; decir la condición donde no la hay sería el error simétrico.
-            condicionada = key in self._secret_sources
-            via = (
-                f"variable equivalente {env}, que sólo se lee si se enciende "
-                f"[execution] allow_env_key"
-                if condicionada and not self._container.settings.execution.allow_env_key
-                else f"variable equivalente {env}"
-            )
-        else:
-            engine_id, _, option = key.partition(":")
-            via = f"variable equivalente {env_var_name(engine_id, option)}"
+        env = app_env_var_name(key.removeprefix("app:"))
+        # La clave privada y la frase las lee un proveedor —el que firma, el que
+        # arma la autonomía— que **sólo** mira la variable si la configuración lo
+        # autoriza; las de Polymarket y las que se guardan por su nombre las
+        # resuelve quien las usa, que mira el entorno siempre. Nombrar la variable
+        # sin decir la condición mandaría a un servidor sin llavero a poner una
+        # variable que nadie va a leer, que es justo lo que el `require()` de al
+        # lado se cuida de no hacer; decir la condición donde no la hay sería el
+        # error simétrico.
+        condicionada = key in self._secret_sources
+        via = (
+            f"variable equivalente {env}, que sólo se lee si se enciende "
+            f"[execution] allow_env_key"
+            if condicionada and not self._container.settings.execution.allow_env_key
+            else f"variable equivalente {env}"
+        )
         kind = "obligatoria" if required else "opcional"
         return f"{note} Es {kind}. Credencial «{key}»; {via}."
 

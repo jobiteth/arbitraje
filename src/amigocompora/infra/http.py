@@ -72,6 +72,15 @@ class AllowlistTransport(httpx.AsyncBaseTransport):
         self._inner = inner
         self._allowed = allowed_hosts
 
+    @property
+    def allowed_hosts(self) -> frozenset[str]:
+        """Los hosts que deja pasar. Sólo lo miran las pruebas.
+
+        Es la forma de afirmar que un motor abrió con **este** transporte —y por
+        tanto con el contexto TLS de la app— sin abrir una conexión.
+        """
+        return self._allowed
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
         if not host_allowed(host, self._allowed):

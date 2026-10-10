@@ -312,7 +312,8 @@ no desviarse.
   —fallo de DNS, 401 sin explicación— no se parecen a la causa.
 - **Nodo RPC.** Endpoint JSON-RPC declarado para una red, con su prioridad y su
   etiqueta. Se guarda en `config.toml` y se gestiona desde la pestaña
-  Configuración.
+  Configuración —alta y edición en su ventana (`ui/node_dialog.py`), con la
+  prueba antes de guardar y las acciones en cada fila propia—.
 - **Respaldo público.** Endpoint público de una red que se añade al final de los
   declarados (`include_public_fallbacks`). Su prioridad es mayor que la de
   cualquier nodo propio (1000 frente a 1–999, y en `RpcPool` un número menor se
@@ -513,3 +514,91 @@ no desviarse.
   aplicación** ejecutó, y sólo eso: una transferencia que llegue de fuera no
   pasa por el registro y no aparece, así que la lista vacía lo dice con esas
   palabras en vez de dejar creer que no pasó nada.
+- **Subpestañas de Configuración.** La pestaña son tres —**Nodos RPC**, **APIs de
+  motores** y **Credenciales**— y cada credencial vive en **un solo sitio**: la
+  clave de un nodo en la ventana de ese nodo, las de motor y su modelo en APIs,
+  y lo que es de la aplicación entera —la clave que firma, la frase de la
+  autonomía, Polymarket— en Credenciales. Antes el mismo dato estaba en dos
+  vistas a la vez —una tabla de sólo lectura y una casilla por opción—, que es
+  lo que se separa en cuanto una cambia. Las tablas reparten el ancho por
+  contenido: cada columna mide lo suyo y la larga —la URL— se lleva lo que
+  sobra. Ver `ui/pages/settings.py`.
+- **Ventana de nodo RPC.** La ventana —una sola para agregar y editar— que abren
+  «Agregar nodo…» y el lápiz de cada fila propia de la tabla de nodos; la ✕ de
+  la fila elimina el nodo de `config.toml` (su clave, si la tenía, sigue en el
+  llavero). Un nodo **nuevo** sólo se guarda si la prueba (`eth_chainId`)
+  respondió con la red elegida; al editar sólo se exige si cambió la URL o se
+  escribió una clave nueva —etiqueta y prioridad no son nada que la prueba
+  mida—, y la red no se cambia: mudar un nodo de red sería borrarlo y crearlo en
+  otra, gesto que ya existe y donde la prueba vuelve a exigirse. La clave va al
+  llavero (`app:NOMBRE`) y al fichero sólo el `${NOMBRE}` de la URL; dejarla en
+  blanco al editar **no** borra la guardada, y escribir una nueva la reemplaza.
+  Ver `ui/node_dialog.py`.
+- **APIs de motores (subpestaña).** Una fila por motor registrado, con el estado
+  de cada opción de su manifiesto —«api_key: configurada», «model: …»—, y el
+  lápiz abre la ventana donde se escriben. Se guardan en el llavero como
+  `<motor>:<opción>`; el **modelo** —que no es un secreto: viaja en cada
+  petición— se lee en claro, y en blanco es el de fábrica del motor. Guardar una
+  clave aquí **no** enciende el motor —eso se decide en la pestaña Motores— y se
+  dice, porque una clave guardada que nadie usa parece estar funcionando. Un
+  campo en blanco no borra lo guardado: para eso está «Borrar las guardadas».
+  Ver `ui/pages/apis.py`.
+
+## Copiloto
+
+- **Turno del copiloto.** Una pregunta y todo lo que la aplicación hace para
+  contestarla: pedir herramientas a la red, devolverle los resultados al modelo y
+  quedarse con su respuesta. Se resuelve en `app/copilot.py` —un bucle con
+  presupuesto de pasos (MAX_STEPS)— y se narra mientras ocurre: `TOOL` abre una
+  fila en la burbuja, `TOOL_RESULT` la cierra, `ERROR` añade la suya en rojo y
+  `ANSWER`/`PROPOSAL` se leen en el texto. Un turno puede acabar en **respuesta**
+  o en **propuesta**, nunca en una firma: el copiloto no tiene `sign` ni
+  `broadcast` en su contrato y su dataclass es inmutable por construcción.
+- **Instrucciones de respuesta (el protocolo del copiloto).** El texto que le
+  cuenta al modelo, en cada vuelta, las tres formas de contestar —pedir una
+  herramienta, responder o proponer— viaja en el **contexto**, bajo
+  `instrucciones_de_respuesta`, y no dentro de la pregunta: para los proveedores
+  las dos cosas acaban en el mismo mensaje del usuario, así que el modelo lo lee
+  igual, pero la pregunta se queda con las palabras de la persona, que son lo que
+  la aplicación enseña cuando el modelo no contesta. Y **un fallo del modelo se
+  dice con su motivo**: `_sin_respuesta` nombra el modelo y la causa —el error de
+  TLS, el HTTP, la respuesta vacía— en vez de devolver un texto que nadie
+  escribió. `_offline_result` queda para el asistente offline, que es el que
+  promete contestar sin red.
+- **Lo que se consultó.** La letra pequeña plegada de cada respuesta: los
+  hallazgos y la salida en crudo de cada herramienta, con la fecha del turno. Es
+  la prueba de dónde salió cada cifra, y por eso se guarda con el mensaje
+  (`ChatMessage.detail`). Se abre para comprobar una cifra, no cada vez: por eso
+  nace plegada y con lo consultado recortado a `MAX_ACTIVITY_CHARS` (el texto
+  entero vive en el tooltip).
+- **Historial de chats.** Un fichero JSON por conversación bajo
+  `chats/` del directorio de configuración (`app/chat_store.py`), y no un
+  documento con todos: escribir un chat no toca a los demás y un JSON a medio
+  escribir se lleva por delante **ese** chat, no el historial. El título se
+  deduce del primer mensaje del usuario, el mensaje se guarda antes de
+  preguntar, y un fichero ilegible se salta con un aviso —el historial es
+  memoria, no un estado del que dependa arrancar—. **Archivado no es borrado**:
+  el chat apartado sigue explicando por qué se hizo lo que se hizo, así que su
+  sección es una lista plegada aparte, y sólo borrar pregunta.
+- **Tarjeta de propuesta.** Lo que el copiloto propone —un swap o un puente— con
+  su cotización observada, un aviso de que **todavía no se ha firmado nada** y el
+  botón «Revisar y ejecutar». No ejecuta por su cuenta: la lista de lo que falta
+  se la pasa la página desde `ui/execution_gate.py` —las mismas funciones que
+  consultan las otras pantallas— y el botón entra por `execute_swap` /
+  `execute_bridge`. Una propuesta ya ejecutada no vuelve a encenderse aunque el
+  estado cambie (`mark_spent`): la cifra que llevaba ya se gastó. Y una
+  propuesta **reabierta** de un chat guardado no se reofrece: la cotización ya es
+  vieja, así que para ejecutar se vuelve a preguntar.
+- **Desplegable de modelo.** El mando con el que se elige con qué asesor de IA
+  conversa el copiloto. El copiloto pregunta a **uno** —el preferido de la
+  ranura—, así que al elegir se enciende el nuevo **antes** de apagar los demás:
+  en el peor caso quedan dos encendidos, que es lo que ya había, y nunca ninguno.
+  Lo que se apagó se nombra, y volver a encenderlo es cosa de la pestaña de
+  Motores: un mando que además tocara otras ranuras haría dos cosas.
+- **Tira de autonomía.** La franja de la pestaña del copiloto donde se lee el
+  estado de la ejecución desatendida —armada o no, con el color de peligro
+  cuando lo está—, el gasto de las últimas 24 h **desglosado por unidad** y los
+  topes. Un total sin unidad no dice si son cien dólares o cien mil, y es la
+  cifra que se mira para dejar que la aplicación firme sola. Armar pide la frase
+  de autonomía con el texto oculto; desarmar no pregunta, no pide frase y no
+  falla nunca, porque un freno que puede negarse a frenar no sirve.

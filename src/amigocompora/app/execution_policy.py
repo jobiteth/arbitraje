@@ -504,15 +504,35 @@ class ExecutionLedger:
         que se cotiza el par, así que dos entradas de la misma red están en la
         misma unidad. Si alguna vez no lo estuvieran sería un fallo de
         `ExecutionIntent`, que ya lo comprueba al construirse.
+
+        Es la suma de `spent_by_symbol_since` y no un recorrido propio: la ventana
+        y la regla de qué asiento cuenta tienen que ser las mismas para el número
+        total y para su desglose, o el desglose no explicaría el total.
         """
-        total = Decimal(0)
+        return sum((total for _, total in self.spent_by_symbol_since(moment)), Decimal(0))
+
+    def spent_by_symbol_since(self, moment: datetime) -> tuple[tuple[str, Decimal], ...]:
+        """Lo mismo, **por unidad**, de menor a mayor símbolo.
+
+        Existe porque hay una pantalla que tiene que enseñar el gasto frente al
+        tope, y ahí un número sin unidad es peor que ningún número: quien va a
+        armar la ejecución desatendida necesita saber si lo gastado son cien
+        dólares o cien mil. `spent_today` sigue devolviendo el total —sumar
+        unidades distintas es correcto por la razón que explica su docstring—, y
+        esto es el desglose que lo hace legible.
+        """
+        totals: dict[str, Decimal] = {}
         for entry in self._read():
             if entry.counts_towards_limits and entry.occurred_at >= moment:
-                total += entry.notional_value
-        return total
+                symbol = entry.notional_symbol
+                totals[symbol] = totals.get(symbol, Decimal(0)) + entry.notional_value
+        return tuple(sorted(totals.items()))
 
     def spent_today(self) -> Decimal:
         return self.spent_since(self._clock.now() - WINDOW)
+
+    def spent_today_by_symbol(self) -> tuple[tuple[str, Decimal], ...]:
+        return self.spent_by_symbol_since(self._clock.now() - WINDOW)
 
     def _read(self) -> Iterator[LedgerEntry]:
         if not self._path.is_file():
