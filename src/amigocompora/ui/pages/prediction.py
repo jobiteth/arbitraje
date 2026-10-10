@@ -109,7 +109,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -162,6 +161,7 @@ from amigocompora.ui.theme import (
     COLOR_SUCCESS,
 )
 from amigocompora.ui.widgets import (
+    AmountSpinBox,
     Card,
     Chip,
     Field,
@@ -1321,7 +1321,7 @@ class PredictionPage(QWidget):
         # El precio límite va fuera de las caras: es de la **orden**, no del
         # lado —comprar y vender a un precio es la misma decisión— y duplicarlo
         # serían dos campos para el mismo dato.
-        self._price = QDoubleSpinBox()
+        self._price = AmountSpinBox()
         self._price.setDecimals(2)
         self._price.setRange(0.01, 0.99)
         self._price.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
@@ -1349,7 +1349,7 @@ class PredictionPage(QWidget):
         caja_compra.setContentsMargins(0, 0, 0, 0)
         caja_compra.setSpacing(8)
 
-        self._amount = QDoubleSpinBox()
+        self._amount = AmountSpinBox()
         self._amount.setDecimals(2)
         self._amount.setRange(0.01, 1_000_000.0)
         self._amount.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
@@ -1396,7 +1396,7 @@ class PredictionPage(QWidget):
         caja_venta.setContentsMargins(0, 0, 0, 0)
         caja_venta.setSpacing(8)
 
-        self._shares = QDoubleSpinBox()
+        self._shares = AmountSpinBox()
         self._shares.setDecimals(2)
         self._shares.setRange(0.01, 1_000_000.0)
         self._shares.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)

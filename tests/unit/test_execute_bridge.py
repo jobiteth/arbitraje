@@ -24,6 +24,7 @@ Hardhat —publicada, sin fondos, conocida— para que la firma sea de verdad.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -36,7 +37,11 @@ import pytest
 from eth_utils.crypto import keccak
 from structlog.testing import capture_logs
 
-from amigocompora.app.confirmation import ConfirmationGateway, RecordingPrompt
+from amigocompora.app.confirmation import (
+    ConfirmationGateway,
+    PendingAction,
+    RecordingPrompt,
+)
 from amigocompora.app.execution_policy import (
     AutonomyPolicy,
     ExecutionLedger,
@@ -60,6 +65,7 @@ from amigocompora.domain.execution import ExecutionLimits, TriggerKind
 from amigocompora.domain.models import (
     BridgeQuote,
     BridgeRequest,
+    BroadcastReceipt,
     BroadcastStatus,
     Measurement,
     Token,
@@ -141,7 +147,7 @@ class _Planner:
         to_address: str = CONTRATO,
         calldata: str = CALLDATA,
         value: int = 0,
-        declares: str | None = CONTRATO,
+        declares: str | frozenset[str] | None = CONTRATO,
         approval: TokenApproval | None = None,
         chains: frozenset[str] = frozenset({"base"}),
     ) -> None:
@@ -199,7 +205,11 @@ class _Planner:
             approval=self._approval,
         )
 
-    def expected_destination(self, chain_key: str) -> str | None:
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
+        if self._declara is None:
+            return None
+        if isinstance(self._declara, str):
+            return frozenset({self._declara})
         return self._declara
 
 
@@ -536,7 +546,35 @@ async def test_un_destino_que_el_motor_no_declara_no_se_firma(tmp_path: Path) ->
     planner = _Planner(to_address=OTRO)
     execute, node, _ledger, _prompt, _keys, _ = await _armed(tmp_path, planner=planner)
 
-    with pytest.raises(ExecutionError, match="no es el que el motor dice usar"):
+    with pytest.raises(ExecutionError, match="ninguno de los que el motor dice usar"):
+        await execute(_quote(), recipient=RECEPTOR)
+
+    assert node.sent_raw() == []
+
+
+async def test_un_destino_entre_los_varios_que_el_motor_declara_se_firma(tmp_path: Path) -> None:
+    """Un motor puede declarar **varios** contratos de origen, y el payload usa uno.
+
+    Es el caso de Relay: según la ruta deposita en el depósito, en el router de la
+    v3 o en su proxy, y los tres están publicados para la misma red. La
+    comprobación es de pertenencia —el payload tiene que dirigirse a alguno de los
+    declarados— y no de igualdad con uno solo: exigir «el» contrato único es lo
+    que paró una ruta legítima.
+    """
+    planner = _Planner(to_address=OTRO, declares=frozenset({CONTRATO, OTRO}))
+    execute, node, _ledger, _prompt, _keys, _ = await _armed(tmp_path, planner=planner)
+
+    await execute(_quote(), recipient=RECEPTOR)
+
+    assert len(node.sent_raw()) == 1
+
+
+async def test_un_destino_fuera_de_los_declarados_no_se_firma(tmp_path: Path) -> None:
+    """El otro lado de la pertenencia: mismo payload, tabla sin él."""
+    planner = _Planner(to_address=OTRO, declares=frozenset({CONTRATO}))
+    execute, node, _ledger, _prompt, _keys, _ = await _armed(tmp_path, planner=planner)
+
+    with pytest.raises(ExecutionError, match="ninguno de los que el motor dice usar"):
         await execute(_quote(), recipient=RECEPTOR)
 
     assert node.sent_raw() == []
@@ -817,3 +855,90 @@ async def test_el_permiso_se_muestra_antes_de_firmar(tmp_path: Path) -> None:
     assert f"Fondos a tu cartera: {shorten(RECEPTOR)}" in texto
     assert f"Firma la cartera: {DIRECCION}" in texto
     assert CLAVE not in texto
+
+
+# --------------------------------------------------------------------------- #
+# 7. Una ejecución a la vez
+# --------------------------------------------------------------------------- #
+class _PromptLento:
+    """Pregunta que no contesta hasta que la prueba la suelta.
+
+    Es lo que permite tener una ejecución **en vuelo** de verdad —parada dentro
+    del «sí»— contra la que lanzar la segunda. Con el prompt normal la primera
+    termina antes de que la segunda empiece, y no habría concurrencia que probar.
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[PendingAction] = []
+        self._liberar = asyncio.Event()
+
+    async def ask(self, action: PendingAction) -> bool:
+        self.asked.append(action)
+        await self._liberar.wait()
+        return True
+
+    def liberar(self) -> None:
+        self._liberar.set()
+
+
+async def _hasta_la_pregunta(
+    prompt: _PromptLento, tarea: asyncio.Task[BroadcastReceipt]
+) -> None:
+    """Deja avanzar la primera ejecución hasta que está pidiendo el permiso.
+
+    Si la primera termina antes de llegar —por un fallo suyo— se relanza su
+    excepción en vez de esperar para siempre: una prueba que se cuelga no dice
+    nada.
+    """
+    while not prompt.asked:
+        if tarea.done():
+            await tarea
+            pytest.fail("la primera ejecución terminó sin llegar a pedir el permiso")
+        await asyncio.sleep(0)
+
+
+async def test_un_segundo_puente_simultaneo_se_rechaza_sin_firmar(tmp_path: Path) -> None:
+    """Dos ejecuciones a la vez comparten nonce: la segunda se rechaza.
+
+    Medido en vivo el 2026-10-10: un segundo disparo a mitad de un puente firmó
+    otra vez con el mismo nonce —dos firmas, sólo una podía minar—. Aquí la
+    primera se para dentro del «sí» y la segunda tiene que caer sin emitir
+    **nada**: se mira lo que salió hacia el nodo, no sólo el error.
+    """
+    execute, node, _ledger, _prompt, _keys, _ = await _armed(tmp_path)
+    lento = _PromptLento()
+    execute.gateway.set_prompt(lento)
+
+    primera = asyncio.create_task(execute(_quote(), recipient=RECEPTOR))
+    await _hasta_la_pregunta(lento, primera)
+
+    with pytest.raises(ExecutionError, match="Ya hay un puente en curso"):
+        await execute(_quote(), recipient=RECEPTOR)
+
+    assert node.sent_raw() == []
+
+    lento.liberar()
+    receipt = await primera
+    assert receipt.status is BroadcastStatus.SUCCESS
+    assert len(node.sent_raw()) == 1
+
+
+async def test_tras_un_rechazo_el_siguiente_intento_entra(tmp_path: Path) -> None:
+    """El candado se suelta al terminar, también cuando termina en rechazo.
+
+    Un candado que se quedara tomado tras un «no» dejaría la aplicación sin
+    poder firmar hasta reiniciarla, y el rechazo es una acción normal del
+    usuario: sería un fallo peor que el que se está arreglando.
+    """
+    execute, node, _ledger, _prompt, _keys, _ = await _armed(tmp_path, answer=False)
+
+    with pytest.raises(ConfirmationDeniedError):
+        await execute(_quote(), recipient=RECEPTOR)
+
+    # El segundo intento no se rechaza por el candado: llega a preguntar otra
+    # vez y, con el «sí», firma y emite.
+    execute.gateway.set_prompt(RecordingPrompt(answer=True))
+    receipt = await execute(_quote(), recipient=RECEPTOR)
+
+    assert receipt.status is BroadcastStatus.SUCCESS
+    assert len(node.sent_raw()) == 1

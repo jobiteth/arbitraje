@@ -47,6 +47,7 @@ import structlog
 
 from amigocompora.app.confirmation import ConfirmationGateway
 from amigocompora.app.execution_policy import AutonomyPolicy, PrivateKeySource
+from amigocompora.app.single_flight import SingleFlight
 from amigocompora.app.usecases.prepare_bridge import PrepareBridge, recipient_for
 from amigocompora.app.usecases.value_in_reference import ReferenceValuation
 from amigocompora.domain.addresses import shorten
@@ -188,8 +189,22 @@ class ExecuteBridge:
     #: moneda de referencia. Puede faltar: sin ella, los puentes que salen en la
     #: stablecoin de su red —el caso normal— funcionan igual.
     valuation: ReferenceValuation | None = None
+    #: Un candado compartido con los demás caminos que firman: mientras una
+    #: ejecución está en curso, la siguiente se rechaza en vez de encolarse. La
+    #: misma instancia que usa `ExecuteSwap` — el recurso escaso, el nonce de la
+    #: cartera, es el mismo. Ver `SingleFlight`.
+    single_flight: SingleFlight = field(default_factory=SingleFlight)
 
     async def __call__(
+        self, quote: BridgeQuote, *, recipient: str
+    ) -> BroadcastReceipt:
+        # Una ejecución a la vez, y la segunda se rechaza —no se encola—: ver
+        # `SingleFlight`. La puerta está aquí, en el caso de uso, y no en la
+        # vista: una pestaña puede olvidarse de repintar su botón.
+        async with self.single_flight.exclusive(what="un puente"):
+            return await self._run(quote, recipient=recipient)
+
+    async def _run(
         self, quote: BridgeQuote, *, recipient: str
     ) -> BroadcastReceipt:
         origin = quote.request.origin.chain
@@ -325,28 +340,43 @@ class ExecuteBridge:
     ) -> tuple[UnsignedTransaction, str]:
         """Construye el payload y comprueba que va donde el motor dice que va.
 
-        Devuelve también el contrato declarado, y no sólo el payload: ese valor es
-        el que hay que contrastar al emitir, y recalcularlo fuera con otra llamada
-        al motor daría una segunda respuesta que podría no ser la misma que se
-        acaba de comprobar.
+        El motor declara el **conjunto** de contratos admitidos para la red de
+        origen —un puente puede tener más de uno legítimo: Relay manda el depósito
+        directo a su depósito y las rutas con swap en origen a su router—, y el
+        `to` del payload tiene que caer dentro. Cuál de ellos le toca a esta ruta
+        lo decide el motor al construir, que es quien tiene la cotización delante.
+
+        Devuelve también el contrato declarado con el que casó, y no sólo el
+        payload: ese valor es el que hay que contrastar al emitir, y recalcularlo
+        fuera con otra llamada al motor daría una segunda respuesta que podría no
+        ser la misma que se acaba de comprobar.
         """
         transaction = await self.prepare.build(quote, recipient=recipient)
 
         origin = quote.request.origin.chain
-        contract = self.prepare.planner_for(quote).expected_destination(origin)
-        if contract is None:
+        admitted = self.prepare.planner_for(quote).expected_destination(origin)
+        if not admitted:
             raise ExecutionError(
-                f"el motor «{quote.engine_id}» no declara a qué contrato dirige los "
+                f"el motor «{quote.engine_id}» no declara a qué contratos dirige los "
                 f"puentes desde «{origin}», así que no hay contra qué comprobar el "
                 f"destino del payload y no se puede firmar. En un puente esto no es "
                 f"una formalidad: un destino equivocado no pierde dinero en una "
                 f"operación de mercado, lo manda a otra parte y no vuelve."
             )
-        if contract.lower() != transaction.to_address.lower():
+        contract = next(
+            (
+                declarado
+                for declarado in admitted
+                if declarado.lower() == transaction.to_address.lower()
+            ),
+            None,
+        )
+        if contract is None:
             raise ExecutionError(
                 f"el payload dirige el puente a {transaction.to_address}, y el motor "
-                f"«{quote.engine_id}» declara {contract} para «{origin}». No se firma: "
-                f"el destino no es el que el motor dice usar."
+                f"«{quote.engine_id}» declara para «{origin}» "
+                f"{', '.join(sorted(admitted))}. No se firma: el destino no es "
+                f"ninguno de los que el motor dice usar."
             )
 
         return transaction, contract

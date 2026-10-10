@@ -166,8 +166,8 @@ class _Planner:
             description=f"puente de prueba hacia {recipient}",
         )
 
-    def expected_destination(self, chain_key: str) -> str | None:
-        return self._declara
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
+        return None if self._declara is None else frozenset({self._declara})
 
 
 class _Provider:

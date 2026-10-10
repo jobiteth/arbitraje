@@ -28,6 +28,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox
 
 from amigocompora.app.container import Container, build_container
@@ -191,6 +192,32 @@ async def test_la_peticion_la_arma_la_pantalla_con_lo_que_dice_la_pantalla() -> 
         referencia = quote_token(ORIGEN)
         assert referencia is not None
         assert request.amount_in == referencia.amount("0.5")
+
+
+async def test_el_importe_tecleado_con_punto_es_el_que_viaja() -> None:
+    """El caso medido el 2026-10-10: «0.000243» se convertía en «24» al teclear.
+
+    Se teclea de verdad —tecla a tecla, como el usuario— y lo que se comprueba
+    es la petición que la pantalla armaría: el importe que viaja es el que se
+    escribió, no el que la configuración regional del sistema entendiera. El
+    punto es el separador que la aplicación enseña en todas partes, así que es
+    el que se teclea.
+    """
+    async with _seccion() as (_, seccion):
+        _elegir(seccion._origin_token, ORIGEN, "USDC")
+        _elegir(seccion._destination_token, DESTINO, "USDC")
+        seccion._amount.clear()
+        editor = seccion._amount.lineEdit()
+        assert editor is not None
+        QTest.keyClicks(editor, "0.000243")
+
+        request, motivo = seccion._request()
+
+        assert motivo == ""
+        assert request is not None
+        referencia = quote_token(ORIGEN)
+        assert referencia is not None
+        assert request.amount_in == referencia.amount("0.000243")
 
 
 async def test_las_dos_patas_en_la_misma_red_se_rechazan_como_lo_que_son() -> None:
@@ -482,3 +509,35 @@ async def test_sin_ningun_motor_activo_si_se_dice_cual_activar() -> None:
 
         assert any("ningún motor de puentes activo" in motivo for motivo in motivos)
         assert any("activa `lifi` o `relay`" in motivo for motivo in motivos)
+
+
+async def test_el_boton_no_se_reenciende_a_mitad_de_la_ejecucion() -> None:
+    """La parte visible de la regresión del cuelgue del 2026-10-10.
+
+    `_on_route_selected` es el repintado del botón y se llama muchas veces
+    durante una ejecución (cada refresco de estado). Sin la bandera `_executing`,
+    cada repintado volvía a encender «Ejecutar» con la operación en vuelo, y el
+    segundo clic disparaba otra firma con el mismo nonce. La puerta de verdad
+    está en `ExecuteBridge` —`SingleFlight`—; esto fija que la vista además no
+    lo ofrezca.
+    """
+    async with _seccion() as (_, seccion):
+        _elegir(seccion._origin_token, ORIGEN, "USDC")
+        _elegir(seccion._destination_token, DESTINO, "USDC")
+        seccion._amount.setValue(0.5)
+        request, _ = seccion._request()
+        assert request is not None
+        seccion._comparison = _comparacion(request)
+        seccion._fill_table(seccion._comparison)
+        seccion._table.selectRow(0)
+        assert seccion._exec_btn.isEnabled() is True
+
+        # Con la ejecución en vuelo, el repintado no lo vuelve a encender…
+        seccion._executing = True
+        seccion._on_route_selected()
+        assert seccion._exec_btn.isEnabled() is False
+
+        # …y al terminar —el `finally` de `_do_execute`— vuelve a ofrecerse.
+        seccion._executing = False
+        seccion._on_route_selected()
+        assert seccion._exec_btn.isEnabled() is True

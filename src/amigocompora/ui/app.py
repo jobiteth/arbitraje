@@ -10,7 +10,9 @@ Flujo:
 2. Se construye el `Container` (app, motores, scheduler) de forma asíncrona.
 3. Se construye `MainWindow` y se le inyecta el prompt de confirmación Qt.
 4. Se arranca el scheduler con la tarea de barrido de pares vigilados.
-5. `run_forever()` corre hasta que el usuario cierra la ventana.
+5. `run_until_complete` corre hasta que la última ventana termina de cerrarse; el
+   cierre asíncrono (`container.aclose()`) lo orquesta `MainWindow.closeEvent`,
+   que no acepta el cierre hasta terminarlo.
 """
 
 from __future__ import annotations
@@ -81,15 +83,22 @@ def main() -> int:
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    shutdown = asyncio.Event()
-    app.aboutToQuit.connect(shutdown.set)
+    # El cierre tiene un solo camino: `MainWindow.closeEvent` espera a que el
+    # contenedor cierre (`aclose`) antes de aceptarse, y aquí sólo se espera a
+    # que la última ventana termine de cerrarse. Antes se esperaba
+    # `aboutToQuit`, pero esa señal llega justo cuando el bucle de Qt ya va a
+    # salir: el `await` de este lado no llegaba a despertar y la app terminaba
+    # con «Event loop stopped before Future completed» y salida 1. Qt no debe
+    # salir por su cuenta al cerrarse la última ventana: el apagado lo termina
+    # el bucle de asyncio cuando `_serve` retorna.
+    app.setQuitOnLastWindowClosed(False)
+    closed = asyncio.Event()
+    app.lastWindowClosed.connect(closed.set)
 
     async def _serve() -> None:
-        container, _window = await _build_and_show()
+        _container, _window = await _build_and_show()
         _log.info("app.started", version=__version__)
-        await shutdown.wait()
-        await container.aclose()
-        loop.stop()
+        await closed.wait()
 
     with loop:
         loop.run_until_complete(_serve())

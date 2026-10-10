@@ -150,7 +150,7 @@ class _Planner:
     async def plan_bridge(self, quote: BridgeQuote, *, recipient: str) -> Any:
         raise NotImplementedError
 
-    def expected_destination(self, chain_key: str) -> str | None:
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
         return None
 
 

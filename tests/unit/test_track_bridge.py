@@ -64,6 +64,13 @@ class _MotorNombrado(_Motor):
         self.manifest = _Manifiesto(engine_id)
 
 
+class _MotorSinSeguimiento:
+    """Un motor activo que no implementa `BridgeTracker`: relay antes del arreglo."""
+
+    def __init__(self, engine_id: str) -> None:
+        self.manifest = _Manifiesto(engine_id)
+
+
 def _progreso(mensaje: str) -> BridgeProgress:
     return BridgeProgress(
         state=BridgeTrackState.PENDING, provider_status="", substatus="", message=mensaje
@@ -171,6 +178,65 @@ def test_sin_motor_de_seguimiento_no_se_inventa_un_estado(tmp_path: Path) -> Non
         assert actual is not None
         assert actual.track_state is BridgeTrackState.PENDING
         assert "no está activo" in actual.message
+
+    asyncio.run(escenario())
+
+
+def test_un_motor_activo_sin_seguimiento_lo_dice_sin_mentir_y_deja_de_sondear(
+    tmp_path: Path,
+) -> None:
+    """El caso medido el 2026-10-10: relay activo, cruce parado en el paso 1.
+
+    El registro decía «el motor no está activo» cada 15 s, y era falso. Ahora
+    dice lo que pasa —activo, pero sin seguimiento— y deja de sondear: un motor
+    que no sabe seguir no va a aprender mientras la app siga abierta, así que
+    insistir sólo reescribiría la misma frase. El registro queda sin estado
+    final y se vuelve a sondear al arrancar.
+    """
+    motor = _MotorSinSeguimiento("relay")
+
+    async def escenario() -> None:
+        tracking = BridgeTracking(tmp_path / "b.json", _registro_de(motor), poll_seconds=0)
+        vistos: list[TrackedBridge] = []
+        tracking.subscribe(vistos.append)
+        tracking.add(_registro(engine_id="relay"))
+        await asyncio.sleep(0.05)
+        cuantos = len(vistos)
+        await asyncio.sleep(0.05)
+        await tracking.aclose()
+        actual = tracking.record(HASH)
+        assert actual is not None
+        assert actual.track_state is BridgeTrackState.PENDING
+        assert "está activo" in actual.message
+        assert "no sabe seguir" in actual.message
+        # Con `poll_seconds=0`, un vigilante vivo avisaría cientos de veces en el
+        # segundo sueño; parado, ni una: el contador no puede haber crecido.
+        assert len(vistos) == cuantos
+
+    asyncio.run(escenario())
+
+
+def test_un_motor_inactivo_se_sigue_sondeando_por_si_se_activa(tmp_path: Path) -> None:
+    """El motor inactivo es el caso contrario: puede activarse en caliente.
+
+    Desde la página de motores se puede activar el motor que emitió el cruce, y
+    entonces el sondeo tiene que estar ahí para encontrarlo. Sólo se deja de
+    sondear cuando no hay nada que esperar.
+    """
+
+    async def escenario() -> None:
+        tracking = BridgeTracking(tmp_path / "b.json", _registro_de(), poll_seconds=0)
+        vistos: list[TrackedBridge] = []
+        tracking.subscribe(vistos.append)
+        tracking.add(_registro(engine_id="relay"))
+        await asyncio.sleep(0.05)
+        cuantos = len(vistos)
+        await asyncio.sleep(0.05)
+        await tracking.aclose()
+        actual = tracking.record(HASH)
+        assert actual is not None
+        assert "no está activo" in actual.message
+        assert len(vistos) > cuantos
 
     asyncio.run(escenario())
 

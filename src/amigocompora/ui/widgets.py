@@ -18,6 +18,7 @@ from typing import Any, Final
 from PySide6.QtCore import (
     Property,
     QEvent,
+    QLocale,
     QPointF,
     QPropertyAnimation,
     QRectF,
@@ -31,11 +32,13 @@ from PySide6.QtGui import (
     QPainter,
     QPaintEvent,
     QPen,
+    QValidator,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -297,6 +300,49 @@ def width_for_chars(control: QWidget, chars: int) -> int:
     control.ensurePolished()
     metrics = QFontMetrics(control.font())
     return metrics.horizontalAdvance("M" * chars) + 34  # margen + galón del combo
+
+
+class AmountSpinBox(QDoubleSpinBox):
+    """Un importe que se escribe con punto decimal y se lee sin ceros de relleno.
+
+    El campo guarda los decimales que se le configuren —seis en los importes de
+    token—, pero no los enseña todos: «5» y no «5.000000». El recorte es sólo de
+    la pantalla: lo que se firma sale de `value()`, con todos sus decimales, y
+    nunca de este texto.
+
+    El separador decimal es el punto **siempre**, no el del idioma del sistema,
+    y eso es una lección medida el 2026-10-10: el campo del puente mostraba con
+    punto pero dejaba interpretar con la configuración regional —en español el
+    punto es el separador de millares—, así que escribir «0.000243» concatenaba
+    los dígitos («0000243») y lo convertía en «24» a mitad del tecleo. El punto
+    es además el separador de todo lo que la aplicación enseña —los saldos, las
+    rutas, los exploradores—, de modo que lo escrito y lo leído usan el mismo.
+    La coma se acepta igual al teclear, porque en un teclado español la tecla
+    decimal del bloque numérico escribe una.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # La configuración regional se fija, en vez de heredar la del sistema:
+        # con la heredada, el idioma del equipo decide qué significa el punto
+        # que el usuario acaba de teclear, y aquí eso significó multiplicar un
+        # importe por diez sin decirlo.
+        self.setLocale(QLocale.c())
+
+    def validate(self, text: str, pos: int) -> tuple[QValidator.State, str, int]:
+        """Valida la coma como punto: ocupan lo mismo y la posición no se desvía."""
+        estado, _, _ = super().validate(text.replace(",", "."), pos)
+        return estado, text, pos
+
+    def valueFromText(self, text: str) -> float:
+        try:
+            return float(text.replace(",", ".").strip())
+        except ValueError:
+            return super().valueFromText(text)
+
+    def textFromValue(self, value: float) -> str:
+        texto = f"{value:.{self.decimals()}f}".rstrip("0").rstrip(".")
+        return texto or "0"
 
 
 class ScrollArea(QWidget):
@@ -747,16 +793,37 @@ class QtConfirmationPrompt:
     """Adaptador `ConfirmationPrompt` que abre `ConfirmationDialog` en el hilo de Qt.
 
     Se instala en `ConfirmationGateway` desde `MainWindow`.
+
+    Pregunta **sin abrir un bucle de eventos anidado**: `dialog.open()` muestra
+    el diálogo (modal para la ventana) y devuelve el control en el acto; el
+    «sí»/«no» llega por la señal `finished`, que resuelve una `Future`. Esperar
+    aquí es cederle el turno al bucle de `qasync`, que sigue atendiendo todo lo
+    demás mientras el diálogo está abierto.
+
+    No es un detalle de estilo. `QDialog.exec()` mete un bucle anidado dentro
+    del paso de esta corrutina, y medido en vivo el 2026-10-10 eso mató el
+    despertar de otra tarea en curso («Cannot enter into task … while another
+    task … is being executed»): la pestaña de puentes se quedó colgada a mitad
+    de una ejecución. Desde una corrutina, un diálogo se pide sólo por este
+    camino — `open()` + señal, nunca `exec()`.
     """
 
     def __init__(self, parent: QWidget) -> None:
         self._parent = parent
 
     async def ask(self, action: PendingAction) -> bool:
-        # qasync hace que este `await` ceda al event loop de Qt sin bloquear.
         dialog = ConfirmationDialog(action, self._parent)
-        result = dialog.exec()
-        return result == QDialog.Accepted
+        respuesta: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+        def _anotar(code: int) -> None:
+            # `finished` puede llegar más de una vez (p. ej. si algo cierra el
+            # diálogo después de un `accept()`); el futuro se resuelve una sola.
+            if not respuesta.done():
+                respuesta.set_result(code == QDialog.Accepted)
+
+        dialog.finished.connect(_anotar)
+        dialog.open()
+        return await respuesta
 
 
 class AlertBanner(QWidget):

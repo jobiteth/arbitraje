@@ -33,6 +33,7 @@ from amigocompora.app.execution_policy import (
 from amigocompora.app.mode_guard import ModeGuard
 from amigocompora.app.registry import EngineRegistry, sole_engine_for
 from amigocompora.app.scheduler import Scheduler
+from amigocompora.app.single_flight import SingleFlight
 from amigocompora.app.slippage import DefaultSlippage
 from amigocompora.app.usecases.analyze_prediction_market import AnalyzePredictionMarkets
 from amigocompora.app.usecases.analyze_with_ai import AnalyzeWithAi
@@ -647,6 +648,13 @@ def _build_execution(
     # de ninguna seguridad.
     gateway.set_bypass(PolicyBypass(policy))
 
+    # Un solo candado para **todos** los caminos que firman —swap, puente,
+    # recepción y retirada—: el recurso escaso es el nonce de la cartera, y es
+    # el mismo para todos. Con candados separados, dos caminos simultáneos
+    # volverían a firmar dos veces el mismo nonce, que es exactamente lo medido
+    # el 2026-10-10. Ver `SingleFlight`.
+    single_flight = SingleFlight()
+
     return _Execution(
         execute_swap=ExecuteSwap(
             prepare=prepare,
@@ -660,6 +668,7 @@ def _build_execution(
             # topes: se valora lo entregado con los mismos motores que cotizaron
             # el par. Sin esto habría que rechazarlo, que es lo que se hacía.
             valuation=ValueInReference(registry=registry),
+            single_flight=single_flight,
         ),
         execute_bridge=ExecuteBridge(
             prepare=prepare_bridge,
@@ -676,6 +685,7 @@ def _build_execution(
             # red —el caso normal— ya está en la unidad del tope y no necesita
             # valoración. Esto cubre el otro caso, salir en ETH o en un token.
             valuation=ValueInReference(registry=registry),
+            single_flight=single_flight,
         ),
         place_prediction_order=PlacePredictionOrder(
             registry=registry,
@@ -709,6 +719,7 @@ def _build_execution(
             keys=keys,
             policy=policy,
             broadcasters=broadcasters,
+            single_flight=single_flight,
         ),
         # La retirada no cotiza nada —se manda lo que se manda—, así que no tiene
         # `prepare` del que tirar: construye su propia transferencia. Lo que sí
@@ -722,6 +733,7 @@ def _build_execution(
             policy=policy,
             broadcasters=broadcasters,
             valuation=ValueInReference(registry=registry),
+            single_flight=single_flight,
         ),
         policy=policy,
         keys=keys,

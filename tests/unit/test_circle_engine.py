@@ -97,7 +97,7 @@ def test_red_fuera_de_la_tabla_cctp_no_se_cotiza() -> None:
 
 def test_destino_esperado_solo_en_redes_cctp() -> None:
     motor = _motor([])
-    assert motor.expected_destination("base") == TOKEN_MESSENGER
+    assert motor.expected_destination("base") == frozenset({TOKEN_MESSENGER})
     assert motor.expected_destination("bsc") is None
 
 

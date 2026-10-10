@@ -81,12 +81,25 @@ def test_un_titulo_larguisimo_se_recorta_para_la_lista(tmp_path: Path) -> None:
 
 
 def test_el_orden_es_por_la_ultima_conversacion(tmp_path: Path) -> None:
-    """El chat que acaba de hablar va primero, aunque se creara antes."""
+    """El chat que acaba de hablar va primero, aunque se creara antes.
+
+    La marca del mensaje se toma del chat recién creado y no de una hora fija:
+    `append` fecha con el momento del mensaje, así que con una hora fija la prueba
+    dependería de a qué hora se ejecuta —por la mañana el mensaje «llegaría» en el
+    futuro y por la tarde no— en vez de decir lo que quiere decir.
+    """
     store = _store(tmp_path)
     viejo = store.create()
     nuevo = store.create()
 
-    store.append(viejo.chat_id, _mensaje("sigo aquí", desfase=30))
+    store.append(
+        viejo.chat_id,
+        ChatMessage(
+            role=ChatRole.USER,
+            text="sigo aquí",
+            at=nuevo.updated_at + timedelta(seconds=1),
+        ),
+    )
 
     assert [chat.chat_id for chat in store.chats()] == [viejo.chat_id, nuevo.chat_id]
 

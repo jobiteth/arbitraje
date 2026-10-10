@@ -48,6 +48,7 @@ import structlog
 
 from amigocompora.app.confirmation import ConfirmationGateway
 from amigocompora.app.execution_policy import AutonomyPolicy, PrivateKeySource
+from amigocompora.app.single_flight import SingleFlight
 from amigocompora.app.usecases.value_in_reference import ReferenceValuation
 from amigocompora.domain.addresses import require_evm_address, shorten
 from amigocompora.domain.chains import chain
@@ -105,8 +106,21 @@ class WithdrawFunds:
     #: su red. Sin esto, retirar ETH o cualquier token contra un tope escrito en
     #: dólares se rechaza en vez de medirse mal.
     valuation: ReferenceValuation | None = None
+    #: Un candado compartido con los demás caminos que firman: mientras una
+    #: ejecución está en curso, la siguiente se rechaza en vez de encolarse. La
+    #: misma instancia que usan swaps, puentes y recepciones — el recurso
+    #: escaso, el nonce de la cartera, es el mismo. Ver `SingleFlight`.
+    single_flight: SingleFlight = field(default_factory=SingleFlight)
 
     async def __call__(
+        self, token: Token, amount: TokenAmount, *, recipient: str
+    ) -> BroadcastReceipt:
+        # Una ejecución a la vez, y la segunda se rechaza —no se encola—: ver
+        # `SingleFlight`.
+        async with self.single_flight.exclusive(what="una retirada"):
+            return await self._run(token, amount, recipient=recipient)
+
+    async def _run(
         self, token: Token, amount: TokenAmount, *, recipient: str
     ) -> BroadcastReceipt:
         # 1. El modo primero: antes de gastar red, y antes de pedir la clave.

@@ -53,6 +53,23 @@ no desviarse.
   los de `zeroex`, no, y por eso su camino directo no se toca. El gastador de la
   primera aprobación es Permit2 —no el router— y el relato de los diálogos lo
   distingue («Es la primera de dos aprobaciones…»).
+- **Una ejecución a la vez (`SingleFlight`).** La puerta que deja **una sola**
+  operación de firma en vuelo, compartida por los cuatro caminos que emiten
+  —swap, puente, recepción de un puente y retirada— porque el recurso escaso es
+  uno: el nonce de la cartera. La segunda ejecución concurrente se **rechaza**
+  con `ExecutionError`; no se encola —encolarla sería firmar «cuando le toque»,
+  ya sin el usuario mirando—. Se midió el 2026-10-10: un segundo disparo a mitad
+  de un puente volvió a firmar con el mismo nonce, y de dos transacciones con el
+  mismo nonce sólo una puede minar. La puerta vive en el caso de uso y no en la
+  vista: una pestaña puede olvidarse de apagar su botón; la firma, no. Ver
+  `app/single_flight.py`.
+- **Diálogo de confirmación sin bucle anidado.** `QDialog.exec()` dentro de una
+  corrutina abre un bucle de eventos anidado **dentro** del paso de la tarea y,
+  bajo `qasync`, mata el despertar de cualquier otra tarea en vuelo (medido el
+  2026-10-10: `RuntimeError: Cannot enter into task …`). Desde una corrutina un
+  diálogo se pide con `open()` —modal para la ventana— y se espera el «sí» por
+  la señal `finished`; `exec()` queda para los manejadores síncronos. Ver
+  `ui/widgets.py` (`QtConfirmationPrompt`).
 
 ## Carteras
 
@@ -169,13 +186,36 @@ no desviarse.
 
 - **Seguimiento de puente (`BridgeTracker`).** Protocolo opcional de un motor de
   puente que dice en qué va un cruce ya emitido (`track_bridge`). Sólo lee; un
-  motor sin él se muestra «sin seguimiento», nunca con pasos inventados.
+  motor que no lo implementa no inventa pasos: si está activo se dice así
+  —«está activo, pero no sabe seguir cruces todavía»— y se deja de sondear (el
+  registro queda sin estado final y se vuelve a sondear al arrancar); si no está
+  activo se sigue sondeando, porque puede activarse desde la página de motores.
+  `lifi` lo implementa, y `relay` desde el 2026-10-10.
+- **Seguimiento de relay (`/requests/v3`).** La consulta con la que relay sigue
+  un cruce ya emitido: `GET /requests/v3?depositTxHash=<hash de origen>` —la v2
+  se retira el 2026-11-24—, con la clave en la cabecera. De la respuesta se leen
+  el estado, la transacción de entrega (`outTxs`) y el importe **recibido de
+  verdad**: el cambio de saldo positivo a favor de la cartera en
+  `stateChanges`, no lo cotizado. Un hash que no conoce contesta la lista vacía,
+  y la respuesta se comprueba otra vez contra sus `inTxs` para que el cruce de
+  otro nunca se muestre como propio.
 - **`BridgeTrackState`.** Estado de un cruce según el proveedor: `PENDING`,
   `REFUNDING`, `REFUNDED`, `DONE`, `FAILED`, `UNKNOWN`. Sólo `DONE`, `REFUNDED` y
   `FAILED` son finales.
 - **Reembolso (`REFUNDING`).** El proveedor devuelve el importe a la dirección de
   origen porque no llegó al destino. No es un fallo del emisor, pero tampoco es un
   éxito: se muestra en ámbar.
+- **Contratos de origen (del puente).** Los contratos **de la red de salida** a
+  los que un motor de puente puede mandar el dinero. No es uno por red: Relay
+  usa tres —el depósito directo, el router de su v3 para las rutas con swap en
+  origen y su proxy de aprobación para las de un ERC-20—, los publica en
+  `GET /chains` y se midieron en vivo (el depósito el 2026-10-07; la familia
+  entera el 2026-10-10). `expected_destination` los declara y el payload tiene
+  que dirigirse **a alguno de ellos**: es la comprobación que separa un puente de
+  un swap, porque aquí un destino equivocado no pierde dinero en una operación de
+  mercado — lo manda a otra parte y no vuelve. En todas las rutas observadas el
+  gastador de la aprobación es el mismo contrato que recibe el depósito, y que no
+  coincidan se rechaza antes de construir.
 
 ## Datos de mercado
 
@@ -385,6 +425,18 @@ no desviarse.
   En pantalla es un recuadro (`QFrame#legBox`) con su red, su importe, la píldora
   de su token y su saldo. Las dos patas se ven a la vez y del mismo tamaño, porque
   lo que se describe es un intercambio entre ellas.
+- **Importe (convención de escritura).** Los importes se escriben y se leen con
+  **punto** decimal en toda la aplicación —campos, tablas, recibos, exploradores—:
+  es la cifra que viaja a la cadena. El campo de importe (`AmountSpinBox`,
+  `ui/widgets.py`) fija esa convención en vez de heredarla de la configuración
+  regional del sistema, y además acepta la **coma** al teclear —la tecla decimal
+  del bloque numérico español—, normalizándola al punto al confirmar. La trampa
+  medida el 2026-10-10: en el puente, un campo que *mostraba* con punto pero
+  *interpretaba* con el sistema (donde el punto es separador de millares)
+  convertía «0.000243» en «24» a mitad del tecleo; en la dirección contraria,
+  teclear «0.5» daba «5» —diez veces el importe—. Por eso ninguna pantalla usa
+  `QDoubleSpinBox` a secas: puentes, intercambio y predicción van por
+  `AmountSpinBox`.
 - **Tarjeta de ruta.** Una cotización de la lista de rutas, en dos líneas: arriba
   el icono del motor, el venue, lo que se recibe —en verde si es la mejor de la
   comparación— y la marca ámbar de las que sólo cotizan; debajo el desglose

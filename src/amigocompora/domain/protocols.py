@@ -463,8 +463,15 @@ class CrossChainPlanner(Engine, Protocol):
         """
         ...
 
-    def expected_destination(self, chain_key: str) -> str | None:
-        """El contrato al que este motor manda los fondos **desde** esa red.
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
+        """Los contratos a los que este motor puede mandar los fondos **desde** esa red.
+
+        Un puente no siempre deposita en un único contrato por red: Relay, por
+        ejemplo, manda el depósito directo a su contrato de depósito y las rutas
+        con swap en origen al router o al proxy que su API publica para esa red.
+        Por eso se declara el **conjunto** de los admitidos y no una sola
+        dirección: el `to` del payload tiene que caer en uno de ellos, y el motor
+        es quien sabe, al construir, cuál de ellos le corresponde a la ruta.
 
         `None` significa «no declaro destino para esa red», y el camino de
         ejecución lo trata como motivo para no firmar. Indexado por la red de

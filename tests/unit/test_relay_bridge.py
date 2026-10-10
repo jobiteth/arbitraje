@@ -8,13 +8,13 @@ el punto de partida es la forma que publica la documentación —`POST /quote/v2
 sería el error que este repositorio evita en todas partes; y la clave de Relay no
 se escribe en un fichero del repositorio ni aunque se tenga.
 
-Lo que sí se midió es la tabla que decide a dónde va el dinero: **`DEPOSITORIES`
-se rellenó el 2026-10-07 midiendo la API en vivo** —tres usuarios, tres importes y
-dos destinos sobre cinco redes de origen, y siempre el mismo contrato—, y hay una
-prueba que lo fija para que nadie edite la dirección a ojo. Esa tabla es el
-contrato al que Relay manda los fondos desde cada red, y es lo que se contrasta
-antes de firmar: aquí un destino equivocado no pierde dinero en una operación de
-mercado — lo manda a otra parte y no vuelve.
+Lo que sí se midió es la tabla que decide a dónde va el dinero: **los contratos
+de origen** —el depósito directo medido el 2026-10-07, y el router y el proxy de
+la v3 el 2026-10-10, publicados por la propia API de Relay en `/chains`—, y hay
+una prueba que la fija para que nadie edite una dirección a ojo. Esa tabla es a
+qué contratos de Relay se manda el dinero desde cada red, y es lo que se
+contrasta antes de firmar: aquí un destino equivocado no pierde dinero en una
+operación de mercado — lo manda a otra parte y no vuelve.
 
 Lo que se prueba entero es la **maquinaria** —con la tabla medida para las rutas
 normales y con una tabla inyectada para las variantes—, y sobre todo los
@@ -55,18 +55,30 @@ from amigocompora.domain.errors import (
     SourceResponseError,
     UnsupportedOperationError,
 )
-from amigocompora.domain.models import BridgeQuote, BridgeRequest, Measurement, Token
+from amigocompora.domain.models import (
+    BridgeProgress,
+    BridgeQuote,
+    BridgeRequest,
+    BridgeTrackState,
+    Measurement,
+    Token,
+)
 from amigocompora.domain.modes import Capability
 from amigocompora.domain.money import TokenAmount
-from amigocompora.domain.protocols import EngineKind
+from amigocompora.domain.protocols import BridgeTracker, EngineKind
 from amigocompora.engines.relay import engine as modulo
 from amigocompora.engines.relay.engine import (
     BRIDGE_CHAINS,
-    DEPOSITORIES,
     MANIFEST,
     NATIVE_CURRENCY,
+    ORIGIN_CONTRACTS,
     PROVIDER,
     QUOTE_URL,
+    RELAY_DEPOSITORY,
+    RELAY_ORIGIN_CONTRACTS,
+    RELAY_V3_APPROVAL_PROXY,
+    RELAY_V3_ROUTER,
+    REQUESTS_URL,
     RelayEngine,
 )
 
@@ -92,6 +104,20 @@ DEPOSITO_BASE_EN_MAYUSCULAS = "0x" + DEPOSITO_BASE[2:].upper()
 #: `0xf70d…dbef` no es el contrato al que Relay manda los fondos. Escribirlo
 #: aquí, y no sólo en el motor, es lo que hace que editarlo a ojo rompa la suite.
 DEPOSITO_MEDIDO = "0x4cD00E387622C35bDDB9b4c962C136462338BC31"
+
+#: La familia entera de contratos de origen, escrita otra vez a propósito.
+#:
+#: Los dos últimos —el router ERC-20 v3 y el proxy de aprobación v3— los publica
+#: Relay en `GET https://api.relay.link/chains` (`erc20Router`, `approvalProxy`)
+#: y se midieron en vivo el 2026-10-10: una ruta POL→base con swap en origen
+#: depositó en el router, y una ruta de un ERC-20 en el proxy, con la aprobación
+#: concedida a ese mismo contrato. Cambiar una dirección en el motor sin
+#: cambiarla aquí rompe la prueba, que es exactamente para lo que está.
+FAMILIA_MEDIDA = {
+    DEPOSITO_MEDIDO,
+    "0xb92fe925DC43a0ECdE6c8b1a2709c170Ec4fFf4f",
+    "0xCcC88a9d1B4ED6b0EABA998850414b24f1c315bE",
+}
 
 #: Las cifras del documento de prueba: sale menos de lo que entra porque el
 #: puente cobra, y el mínimo garantizado es el suelo por debajo del estimado.
@@ -272,7 +298,7 @@ def deposito_medido(monkeypatch: pytest.MonkeyPatch) -> str:
     tabla distinta. `quote_bridge` y `plan_bridge` leen el global en cada llamada,
     así que basta con esto.
     """
-    monkeypatch.setattr(modulo, "DEPOSITORIES", {"base": DEPOSITO_BASE})
+    monkeypatch.setattr(modulo, "ORIGIN_CONTRACTS", {"base": frozenset({DEPOSITO_BASE})})
     monkeypatch.setattr(modulo, "BRIDGE_CHAINS", frozenset({"base"}))
     return DEPOSITO_BASE
 
@@ -362,16 +388,22 @@ def test_la_tabla_de_destinos_lleva_lo_medido_y_no_lo_supuesto() -> None:
     la tabla no se había medido: el único valor del que se tenía noticia venía de
     un **ejemplo** de la documentación, y un ejemplo no es una medición.
 
-    Ya se midió —el 2026-10-07, contra la API en vivo: tres usuarios, tres
-    importes y dos destinos por red, y siempre el mismo contrato—, así que lo que
-    hay que proteger es lo contrario: que nadie edite la tabla a ojo. Cambiar la
-    dirección en el motor sin cambiarla aquí rompe esta prueba, que es
-    exactamente para lo que está.
+    Ya se midió —el 2026-10-07 el depósito directo; el 2026-10-10 la familia
+    entera, cuando una ruta de Polygon apuntó al router de la v3 y el motor paró
+    la operación—, así que lo que hay que proteger es lo contrario: que nadie
+    edite la tabla a ojo. Cambiar una dirección en el motor sin cambiarla aquí
+    rompe esta prueba, que es exactamente para lo que está.
     """
-    assert DEPOSITORIES, "la tabla ya medida no puede volver a estar vacía"
-    assert set(DEPOSITORIES.values()) == {DEPOSITO_MEDIDO}
-    assert frozenset(DEPOSITORIES) == BRIDGE_CHAINS
+    assert ORIGIN_CONTRACTS, "la tabla ya medida no puede volver a estar vacía"
+    assert set(ORIGIN_CONTRACTS.values()) == {frozenset(FAMILIA_MEDIDA)}
+    assert frozenset(ORIGIN_CONTRACTS) == BRIDGE_CHAINS
     assert MANIFEST.bridge_chains == BRIDGE_CHAINS
+    assert frozenset(RELAY_ORIGIN_CONTRACTS) == frozenset(FAMILIA_MEDIDA)
+    assert {
+        RELAY_DEPOSITORY,
+        RELAY_V3_ROUTER,
+        RELAY_V3_APPROVAL_PROXY,
+    } == FAMILIA_MEDIDA
 
 
 # --------------------------------------------------------------------------- #
@@ -709,7 +741,8 @@ async def test_un_destino_distinto_al_medido_no_se_firma(deposito_medido: str) -
     Un `to` equivocado no pierde dinero en una operación de mercado: lo manda a
     otra parte y no vuelve. Por eso se contrasta **antes** de leer nada más — la
     prueba manda además un calldata inválido, y si el orden fuera el otro el
-    error sería el del calldata.
+    error sería el del calldata. El rechazo nombra lo que llegó y los contratos
+    publicados para la red, para que se pueda comprobar sin adivinar.
     """
     ruta(
         cuerpo=respuesta(
@@ -720,8 +753,11 @@ async def test_un_destino_distinto_al_medido_no_se_firma(deposito_medido: str) -
         )
     )
     async with motor() as engine:
-        with pytest.raises(SourceResponseError, match="contrato medido para esa red"):
+        with pytest.raises(SourceResponseError, match="contratos que Relay publica") as fallo:
             await engine.plan_bridge(_cotizar(), recipient=_RECEPTOR)
+
+    assert _OTRO in str(fallo.value)
+    assert DEPOSITO_BASE in str(fallo.value)
 
 
 async def test_el_contraste_admite_las_mayusculas_de_la_fuente(deposito_medido: str) -> None:
@@ -796,11 +832,11 @@ async def test_construye_el_payload_del_origen(deposito_medido: str) -> None:
 
 
 async def test_la_aprobacion_va_al_gastador_del_propio_calldata(deposito_medido: str) -> None:
-    """No se supone que sea el depósito: se lee de la dirección que autoriza.
+    """El gastador se lee de la dirección que autoriza, y tiene que ser el depósito.
 
-    Es el mismo contrato en el ejemplo de la documentación, y aun así se lee: el
-    día que no coincidan, la diferencia tiene que salir de los datos y no de una
-    suposición sobre cómo los pone la fuente.
+    Se lee en vez de suponerlo —el día que la fuente lo ponga de otra forma, la
+    diferencia tiene que salir de los datos— y además el motor exige que coincida
+    con el contrato que recibe el depósito: es el que va a mover el token.
     """
     cuerpo = respuesta_documentada()
     cuerpo["steps"].insert(0, _paso_aprobacion(gastador=DEPOSITO_BASE))
@@ -811,6 +847,58 @@ async def test_la_aprobacion_va_al_gastador_del_propio_calldata(deposito_medido:
     assert tx.approval is not None
     assert tx.approval.spender == DEPOSITO_BASE
     assert not tx.approval.is_chained
+
+
+async def test_el_router_de_la_v3_se_acepta_como_destino() -> None:
+    """La ruta con swap en origen deposita en el router v3, y eso es legítimo.
+
+    Es el caso que paró una ruta de verdad el 2026-10-10: una ruta POL→base con
+    swap en Polygon depositaba en el router y el motor, con una sola dirección
+    medida, se negaba. Está en la tabla porque Relay lo publica en `/chains`, y
+    esta prueba usa la tabla de verdad —sin inyectar nada— para que el camino
+    real quede fijado.
+    """
+    ruta(cuerpo=respuesta(**{"steps.0.items.0.data.to": RELAY_V3_ROUTER}))
+    async with motor() as engine:
+        tx = await engine.plan_bridge(_cotizar(), recipient=_RECEPTOR)
+
+    assert tx.to_address == RELAY_V3_ROUTER
+
+
+async def test_el_proxy_de_aprobacion_se_acepta_con_su_propio_gastador() -> None:
+    """Un ERC-20 con swap en origen deposita en el proxy, y el permiso va a él.
+
+    Medido el 2026-10-10: el paso de aprobación autoriza al mismo contrato que
+    recibe el depósito.
+    """
+    cuerpo = respuesta_documentada()
+    cuerpo["steps"] = [
+        _paso_aprobacion(gastador=RELAY_V3_APPROVAL_PROXY),
+        _paso_deposito(destino=RELAY_V3_APPROVAL_PROXY),
+    ]
+    ruta(cuerpo=cuerpo)
+    async with motor() as engine:
+        tx = await engine.plan_bridge(_cotizar(), recipient=_RECEPTOR)
+
+    assert tx.to_address == RELAY_V3_APPROVAL_PROXY
+    assert tx.approval is not None
+    # El gastador sale del calldata, que es bytes: se compara por identidad y no
+    # por presentación, porque ahí no hay checksum que conservar.
+    assert tx.approval.spender == RELAY_V3_APPROVAL_PROXY.lower()
+
+
+async def test_un_gastador_que_no_es_el_deposito_no_se_firma(deposito_medido: str) -> None:
+    """El permiso va al contrato que recibe el dinero, y si no coinciden, se para.
+
+    Autorizar a otro contrato deja al autorizado sobre el token del usuario sin
+    cobrarlo: el permiso existe, se puede gastar, y el puente no lo necesita.
+    """
+    cuerpo = respuesta_documentada()
+    cuerpo["steps"].insert(0, _paso_aprobacion(gastador=_OTRO))
+    ruta(cuerpo=cuerpo)
+    async with motor() as engine:
+        with pytest.raises(SourceResponseError, match="permiso tiene que ir al contrato"):
+            await engine.plan_bridge(_cotizar(), recipient=_RECEPTOR)
 
 
 async def test_el_valor_se_lee_tambien_en_hexadecimal(deposito_medido: str) -> None:
@@ -832,8 +920,250 @@ async def test_la_descripcion_nombra_el_destino_medido(deposito_medido: str) -> 
     assert str(TokenAmount(MIN_RAW, 6, "USDC")) in tx.description
 
 
-def test_el_destino_esperado_sale_de_la_tabla(deposito_medido: str) -> None:
-    """Lo que contesta por red de **origen**: una red sin medir no tiene destino."""
+def test_el_destino_esperado_sale_de_la_tabla() -> None:
+    """Lo que contesta por red de **origen**: una red sin medir no tiene destino.
+
+    El motor no tiene tabla inyectada aquí —la inyección es del fixture de la
+    construcción—, así que lo que se comprueba es la tabla de verdad: las cinco
+    redes medidas declaran la familia publicada, y una red fuera de ellas no
+    declara nada.
+    """
     engine = RelayEngine(api_key="de-prueba")
-    assert engine.expected_destination("base") == DEPOSITO_BASE
-    assert engine.expected_destination("polygon") is None
+    assert engine.expected_destination("base") == frozenset(RELAY_ORIGIN_CONTRACTS)
+    assert engine.expected_destination("bsc") is None
+
+
+# --------------------------------------------------------------------------- #
+# Seguir: el cruce emitido, tal como lo devuelve la API
+# --------------------------------------------------------------------------- #
+#: El cruce medido el 2026-10-10: un puente de 4 POL de Polygon a Base emitido
+#: desde la propia app, cuyo rastro se siguió hasta la entrega.
+HASH_ORIGEN = "0x60e0e21361ec12251d4eb0d06a0bf779323384b75ca47b87e7b54dbe451acd10"
+HASH_ENTREGA = "0x9df356403820581a0293a08529a162ee7ddaf384ffe497f026de108dd901b829"
+
+#: Lo que llegó de verdad, en wei de la unidad de destino: el `balanceDiff`
+#: positivo que la transacción de entrega marca a favor de la cartera. Es la
+#: misma cifra que la app midió por diferencia de saldo (0,00015229895039858
+#: ETH), y por eso el seguimiento la muestra en vez de la cotizada.
+RECIBIDO_RAW = 152_298_950_398_580
+
+#: La contraparte del abono: si el cambio positivo fuera suyo, no sería lo que
+#: le llegó al usuario.
+_RELAYER = "0x" + "ba" * 20
+
+
+def respuesta_seguimiento(
+    status: str = "success",
+    *,
+    in_tx: str = HASH_ORIGEN,
+    entrega: str | None = HASH_ENTREGA,
+    recibido: int | None = RECIBIDO_RAW,
+    abono_a: str = _RECEPTOR,
+    fail_reason: str = "N/A",
+) -> dict[str, Any]:
+    """La forma del cruce que devuelve `GET /requests/v3`, medida en vivo.
+
+    Se parte del cruce real del 2026-10-10 —`status: success`, la transacción de
+    entrega en Base y, en sus `stateChanges`, el abono a la cartera— y cada
+    prueba cambia un dato: el estado, el hash de entrada (para simular el cruce
+    de otro), la entrega (que aún no existe mientras va en vuelo) o el abono.
+    """
+    out_txs: list[dict[str, Any]] = []
+    if entrega is not None:
+        cambios: list[dict[str, Any]] = []
+        if recibido is not None:
+            cambios = [
+                {
+                    "address": abono_a,
+                    "change": {"kind": "transfer", "balanceDiff": str(recibido)},
+                },
+                {
+                    "address": _RELAYER,
+                    "change": {"kind": "transfer", "balanceDiff": str(-recibido)},
+                },
+            ]
+        out_txs.append(
+            {"txHash": entrega, "chainId": 8453, "status": "success", "stateChanges": cambios}
+        )
+    return {
+        "requests": [
+            {
+                "id": "0x" + "17" * 32,
+                "status": status,
+                "sender": _RECEPTOR,
+                "recipient": _RECEPTOR,
+                "refundTo": _RECEPTOR,
+                "data": {
+                    "inTxs": [{"txHash": in_tx, "chainId": 137}],
+                    "outTxs": out_txs,
+                    "failReason": fail_reason,
+                },
+            }
+        ]
+    }
+
+
+def ruta_seguimiento(
+    *, cuerpo: dict[str, Any] | None = None, status: int = 200
+) -> respx.Route:
+    return respx.get(REQUESTS_URL).mock(
+        return_value=httpx.Response(
+            status, json=cuerpo if cuerpo is not None else respuesta_seguimiento()
+        )
+    )
+
+
+def test_el_motor_ya_sabe_seguir_cruces() -> None:
+    """La pata que le faltaba al registro de cruces.
+
+    El registro busca un motor activo que implemente `BridgeTracker`; mientras
+    relay no lo implementaba, un cruce emitido por él se quedaba en el primer
+    paso con un mensaje que decía «no está activo» — y era falso: estaba activo,
+    sólo que no sabía seguir.
+    """
+    assert isinstance(RelayEngine(api_key="de-prueba"), BridgeTracker)
+
+
+async def test_el_cruce_se_busca_por_el_hash_de_origen_y_se_lee_la_entrega() -> None:
+    route = ruta_seguimiento()
+    async with motor() as engine:
+        progreso: BridgeProgress = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert route.calls[-1].request.url.params["depositTxHash"] == HASH_ORIGEN
+    assert route.calls[-1].request.headers["x-api-key"] == "clave-de-prueba"
+    assert progreso.state is BridgeTrackState.DONE
+    assert progreso.provider_status == "success"
+    assert progreso.receiving_tx_hash == HASH_ENTREGA
+    assert progreso.received_raw == RECIBIDO_RAW
+    assert progreso.received_chain == "8453"
+
+
+async def test_un_hash_que_relay_no_conoce_no_se_inventa_estado() -> None:
+    """La lista vacía es la respuesta medida para un hash que no está indexado."""
+    ruta_seguimiento(cuerpo={"requests": []})
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.UNKNOWN
+    assert "aún no conoce" in progreso.message
+
+
+async def test_un_404_tambien_es_no_conocerlo_todavia_no_un_fallo() -> None:
+    ruta_seguimiento(status=404, cuerpo={"message": "not found"})
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.UNKNOWN
+
+
+async def test_una_respuesta_de_otro_cruce_no_se_da_por_propia() -> None:
+    """El filtro se comprueba en el cuerpo, no se confía en la consulta.
+
+    La petición ya pidió el cruce por ese hash; si algún día el filtro dejara de
+    filtrar, el primer resultado sería el de otro, y enseñarlo como propio es la
+    clase de error que aquí no se firma.
+    """
+    ruta_seguimiento(cuerpo=respuesta_seguimiento(in_tx=_OTRO))
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.UNKNOWN
+    assert progreso.receiving_tx_hash is None
+
+
+@pytest.mark.parametrize(
+    ("status", "fragmento"),
+    [
+        ("waiting", "confirmación del depósito"),
+        ("depositing", "rellenando el cruce"),
+        ("pending", "pendiente de la entrega"),
+        ("submitted", "Entrega emitida"),
+        ("delayed", "retraso"),
+    ],
+)
+async def test_los_estados_en_vuelo_no_se_adelantan_a_final(status: str, fragmento: str) -> None:
+    """Los cinco que documenta la API se dicen sin prometer que ya llegó."""
+    ruta_seguimiento(cuerpo=respuesta_seguimiento(status, entrega=None, recibido=None))
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.PENDING
+    assert progreso.provider_status == status
+    assert fragmento in progreso.message
+
+
+async def test_un_fallo_dice_el_motivo_que_relay_dio() -> None:
+    ruta_seguimiento(
+        cuerpo=respuesta_seguimiento(
+            "failure", entrega=None, recibido=None, fail_reason="SLIPPAGE"
+        )
+    )
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.FAILED
+    assert "SLIPPAGE" in progreso.message
+
+
+async def test_una_devolucion_queda_devuelta_y_no_entregada() -> None:
+    ruta_seguimiento(cuerpo=respuesta_seguimiento("refund", entrega=None, recibido=None))
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.REFUNDED
+    assert "devolvió los fondos" in progreso.message
+
+
+async def test_un_estado_desconocido_se_nombra_tal_cual() -> None:
+    """Nombrar el estado crudo es lo que permite investigarlo; esconderlo, no."""
+    ruta_seguimiento(cuerpo=respuesta_seguimiento("teleported", entrega=None, recibido=None))
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.state is BridgeTrackState.UNKNOWN
+    assert progreso.provider_status == "teleported"
+    assert "teleported" in progreso.message
+
+
+@pytest.mark.parametrize("recibido", [None, -RECIBIDO_RAW])
+async def test_sin_abono_no_se_rellena_la_cifra_con_la_promesa(recibido: int | None) -> None:
+    """Sin cambio positivo a favor de la cartera no hay cifra recibida.
+
+    El `None` cubre la respuesta sin `stateChanges`; el negativo, el cargo que no
+    es un abono. Poner ahí el importe cotizado sería enseñar como recibido lo que
+    sólo se prometió, que es el número equivocado en el sitio que más se mira.
+    """
+    ruta_seguimiento(cuerpo=respuesta_seguimiento(recibido=recibido))
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.received_raw is None
+    assert progreso.receiving_tx_hash == HASH_ENTREGA
+
+
+async def test_el_abono_a_otra_direccion_no_cuenta_como_recibido() -> None:
+    ruta_seguimiento(cuerpo=respuesta_seguimiento(abono_a=_OTRO))
+    async with motor() as engine:
+        progreso = await engine.track_bridge(
+            HASH_ORIGEN, origin_chain="polygon", destination_chain="base"
+        )
+
+    assert progreso.received_raw is None

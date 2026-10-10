@@ -5,6 +5,131 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### Arreglado — El importe se escribe como se lee: «0.000243» ya no se convierte en «24»
+
+- **«Si escribo 0.000243 me lo convierte en 24.»** Medido el 2026-10-10. El campo
+  del puente **mostraba** con punto —como toda la aplicación: tablas, recibos,
+  exploradores— pero dejaba que Qt **interpretara** con la configuración regional
+  del sistema: en español el punto es el separador de millares, así que los
+  dígitos se concatenaban («0000243» → 243, y a mitad del tecleo, 24). En los
+  campos del intercambio la trampa era la misma al revés: con la coma como
+  separador decimal del sistema, teclear «0.5» daba «5» —diez veces el importe,
+  sin decirlo—.
+- **Un solo campo de importe para toda la aplicación.** `AmountSpinBox`
+  (`ui/widgets.py`) fija la convención que ya usa el resto de la aplicación
+  —punto decimal, sin ceros de relleno— de forma que mostrar e interpretar no
+  puedan discrepar, y además acepta la coma al teclear, que es la tecla decimal
+  del bloque numérico en un teclado español. Puentes, intercambio y predicción
+  usan ya el mismo campo, en vez de tres variantes con trampas distintas.
+- Regresión cubierta con tecleo real, tecla a tecla
+  (`tests/unit/test_amount_spinbox.py` y el caso del puente en
+  `tests/integration/test_bridges_page.py`): lo que viaja en la petición es lo
+  que se escribió.
+
+### Arreglado — El seguimiento de los cruces de Relay ya sigue: el puente deja de quedarse en el primer paso
+
+- **«Hice un swap entre redes y se quedó en la primera posición.»** El paso 1 era
+  verdad —el origen se emitió y su transacción tuvo éxito—, pero no podía
+  avanzar: el motor `relay` no implementaba `BridgeTracker` (sólo `lifi` lo
+  hacía), así que el registro de cruces guardaba cada 15 s «El motor «relay» no
+  está activo: no se puede seguir este cruce» —falso: estaba activo; lo que no
+  sabía era seguir—. El cruce **sí se había completado**: medido el 2026-10-10
+  contra la API en vivo, Relay lo da por `success`, con la entrega en Base
+  (`0x9df356…b829`) y un abono de +0,00015229895039858 ETH a la cartera, la
+  misma cifra medida por diferencia de saldo.
+- **Relay ahora sabe seguir sus cruces.** `track_bridge` consulta
+  `GET /requests/v3?depositTxHash=<hash de origen>` —medido en vivo; la v2 se
+  retira el 2026-11-24— y traduce el estado sin inventar pasos: `success` →
+  entregado, `failure` → fallo con el motivo que Relay dé (`failReason`),
+  `refund` → devuelto, `waiting`/`depositing`/`pending`/`submitted`/`delayed` →
+  en vuelo con su frase, cualquier otro → «desconocido» nombrando el estado
+  crudo. El importe recibido sale del cambio de saldo **positivo a favor de la
+  cartera** en la transacción de entrega —lo que llegó, no lo cotizado— y la
+  respuesta se comprueba otra vez contra sus `inTxs` para que el cruce de otro
+  nunca se muestre como propio.
+- **Y el registro ya no miente cuando no hay seguimiento.** Motor activo que no
+  sabe seguir → «está activo, pero no sabe seguir cruces todavía» y deja de
+  sondear (el registro queda sin estado final y se vuelve a sondear al arrancar,
+  tras actualizar el motor); motor inactivo → se sigue sondeando, porque puede
+  activarse desde la página de motores. Verificado en vivo: el registro atascado
+  pasó a `done` con la entrega y `0.00015229895039858 ETH` recibidos. Ver
+  `engines/relay/engine.py` (`track_bridge`, `REQUESTS_URL`,
+  `progress_from_request`) y `app/usecases/track_bridge.py`.
+
+### Arreglado — Cerrar la aplicación ya no termina en error
+
+- Cerrar la ventana salía con traza y código 1: `MainWindow.closeEvent` ya
+  orquestaba el cierre asíncrono (`container.aclose()`), pero `ui/app.py::main`
+  esperaba además la señal `aboutToQuit`, que llega **justo cuando el bucle de
+  Qt ya va a salir** —el `await` de este lado no llegaba a despertar y el bucle
+  se apagaba con la tarea a medias («Event loop stopped before Future
+  completed»; reproducido también sin pantalla)—. Ahora el cierre tiene un solo
+  camino: Qt no sale por su cuenta al cerrarse la última ventana
+  (`setQuitOnLastWindowClosed(False)`) y el bucle de asyncio se apaga cuando
+  `_serve` retorna, después de que la ventana terminó de cerrarse. Verificado
+  con la aplicación real: salida limpia, código 0.
+
+### Arreglado — La pestaña de puentes ya no se cuelga: el diálogo de confirmación no abre un bucle anidado, y sólo se firma una operación a la vez
+
+- **«Intenté pasar 3 POL de Polygon a ETH en Base y se quedó colgado».** La
+  causa, medida en vivo el 2026-10-10: `QtConfirmationPrompt.ask` llamaba a
+  `QDialog.exec()` **dentro de la corrutina**, y ese `exec()` abre un bucle de
+  eventos anidado dentro del paso de la tarea. Bajo `qasync` eso mata el
+  despertar de cualquier otra tarea en vuelo (`RuntimeError: Cannot enter into
+  task … while another task … is being executed`): la pestaña quedó muda a
+  mitad de la operación. No hubo pérdidas — se comprobó en la cadena: ninguna
+  de las dos firmas existía para el nodo, el nonce no se consumió y el saldo
+  quedó intacto. Ahora `ask` muestra el diálogo con `open()` —modal para la
+  ventana, sin bucle— y espera el «sí» por la señal `finished`, que resuelve
+  una `Future`: esperar es cederle el turno al bucle de `qasync`, que sigue
+  atendiendo todo lo demás. Ver `ui/widgets.py` (`QtConfirmationPrompt`).
+- **Una ejecución a la vez, y la segunda se rechaza.** Factor contribuyente del
+  mismo cuelgue: el repintado de la pestaña volvía a encender «Ejecutar» con
+  una operación en vuelo, y un segundo clic firmó otra vez **con el mismo
+  nonce** (medido: dos firmas a 30 s de diferencia, al router de Relay, por el
+  importe entero). Ahora los cuatro caminos que firman —swap, puente, recepción
+  y retirada— comparten un solo `SingleFlight` (`app/single_flight.py`, montado
+  en el contenedor): la segunda ejecución concurrente se **rechaza** con
+  `ExecutionError` en vez de encolarse —una operación que se firma sola «cuando
+  le toque el turno» es una firma que el usuario ya no está mirando—. La puerta
+  vive en el caso de uso y no en la vista: una pestaña puede olvidarse de
+  repintar su botón —y se olvidó—; ahora además la pestaña de puentes tiene su
+  bandera `_executing` y el botón no se reenciende a mitad de vuelo. Ver
+  `app/usecases/execute_bridge.py`, `execute_swap.py`, `claim_bridge.py`,
+  `withdraw.py` y `ui/pages/bridges.py`.
+
+### Arreglado — El puente ya no se niega por su propia tabla: los contratos de origen de Relay son una familia medida
+
+- **«El puente no funciona: dice que apunta a otra wallet».** Lo que decía, con
+  sus palabras, era que el payload dirigía el depósito a un contrato que no era
+  el único que la tabla tenía apuntado — y por eso se negaba a construir. La
+  tabla era demasiado estrecha, no la respuesta: **Relay no deposita en un solo
+  contrato por red, sino en tres**. Estaba medido el depósito directo
+  (`0x4cD00E…BC31`, 2026-10-07); el 2026-10-10 se midió en vivo lo que faltaba:
+  una ruta de POL con swap en origen deposita en el **router ERC-20 de la v3**
+  (`0xb92fe925…Ff4f`) y una de un ERC-20 con swap en origen en su **proxy de
+  aprobación** (`0xCcC88a9d…15bE`) —los dos publicados por la propia API de
+  Relay en `GET /chains` (`erc20Router`, `approvalProxy`), con bytecode en las
+  cinco redes—, y en todas las rutas observadas **el gastador de la aprobación
+  es el mismo contrato que recibe el depósito**. El motor ahora declara la
+  familia entera por red y tanto él como el ejecutor comprueban **pertenencia**
+  (el payload tiene que ir a alguno de los declarados) en vez de igualdad con
+  uno solo; una aprobación cuyo gastador no sea el destinatario del depósito se
+  rechaza antes de construir nada, porque autorizar a otro deja al autorizado
+  sobre el token sin cobrarlo. Verificado en vivo: POL→base, POL→bankr,
+  bankr→POL (×2) y ETH→POL construyen, cada uno hacia un contrato de la
+  familia, y el destinatario aparece en el calldata. Ver
+  `engines/relay/engine.py` (`RELAY_ORIGIN_CONTRACTS`, `ORIGIN_CONTRACTS`),
+  `domain/protocols.py` (`BridgePlanner.expected_destination`) y
+  `app/usecases/execute_bridge.py` (`_build_checked`).
+- **Una clave de API rechazada ahora se distingue de una API que cambió.** La
+  prueba real dejó ver que la clave de LI.FI guardada ya no vale —su API
+  contesta `401 Invalid API key`— y el mensaje del motor decía sólo «respuesta
+  no válida»: ahora, si la petición llevaba credencial del motor y el rechazo es
+  401/403, lo dice y señala dónde se cambia (Motores → Credenciales), porque
+  puede estar caducada, revocada o ser de otra cuenta. Ver
+  `engines/http_source.py` (`_rejection_hint`).
+
 ### Arreglado — El copiloto llega al modelo con el TLS de la app, y un fallo se dice en vez de disfrazarse
 
 - **Los proveedores de IA abren su cliente con `infra.http`, como todos los demás

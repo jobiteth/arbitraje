@@ -342,9 +342,14 @@ class CircleEngine:
             ),
         )
 
-    def expected_destination(self, chain_key: str) -> str | None:
-        """El `TokenMessengerV2` desde esa red de origen, o `None` si no es CCTP."""
-        return TOKEN_MESSENGER if chain_key in CCTP_DOMAINS else None
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
+        """El `TokenMessengerV2` desde esa red de origen, o `None` si no es CCTP.
+
+        Un solo contrato, declarado como conjunto por la misma razón que en los
+        demás motores de puente: es la forma que tiene el contraste del camino de
+        ejecución.
+        """
+        return frozenset({TOKEN_MESSENGER}) if chain_key in CCTP_DOMAINS else None
 
     # ------------------------------------------------------------ interno #
     async def _standard_fee_bps(self, request: BridgeRequest) -> Decimal | None:

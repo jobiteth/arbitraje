@@ -37,7 +37,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QComboBox,
-    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -82,6 +81,7 @@ from amigocompora.ui.execution_gate import bridge_blockers
 from amigocompora.ui.theme import COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARNING
 from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import (
+    AmountSpinBox,
     Card,
     divider,
     format_amount,
@@ -115,14 +115,6 @@ _MAX_AYUDA: Final = (
     "que de un token de dieciocho deja fuera lo que no cabe —siempre por debajo "
     "del saldo, nunca por encima."
 )
-
-
-class _AmountSpinBox(QDoubleSpinBox):
-    """Importe sin ceros sobrantes: «2» en vez de «2,000000». El valor no cambia."""
-
-    def textFromValue(self, value: float) -> str:
-        texto = f"{value:.{self.decimals()}f}".rstrip("0").rstrip(".")
-        return texto or "0"
 
 
 class _LegBox(QFrame):
@@ -191,6 +183,12 @@ class BridgesSection(QWidget):
         super().__init__(parent)
         self._container = container
         self._comparison: BridgeComparison | None = None
+        #: Si hay una ejecución en vuelo. Apaga el botón de ejecutar mientras
+        #: dure: sin esto, `_on_route_selected` volvía a encenderlo al repintar
+        #: y un segundo clic firmaba otra vez con el mismo nonce (medido el
+        #: 2026-10-10). La puerta de verdad está en `ExecuteBridge` —ver
+        #: `SingleFlight`—; esto es la parte que se ve.
+        self._executing = False
         self._tracking = container.bridge_tracking
         self._tracking_resumed = False
         self._tx_hashes: list[str] = []
@@ -253,7 +251,7 @@ class BridgesSection(QWidget):
         self._origin_chain.setObjectName("chainPill")
         self._origin_token = QComboBox()
         self._origin_token.setObjectName("tokenPill")
-        self._amount = _AmountSpinBox()
+        self._amount = AmountSpinBox()
         self._amount.setRange(0.000001, 1_000_000)
         self._amount.setDecimals(6)
         self._amount.setValue(1.0)
@@ -261,7 +259,7 @@ class BridgesSection(QWidget):
         # y sin caja: el recuadro de la pata ya dice dónde se escribe, y una caja
         # dentro de otra es lo que hacía que esto pareciera un formulario.
         self._amount.setObjectName("amountInput")
-        self._amount.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self._amount.setButtonSymbols(AmountSpinBox.ButtonSymbols.NoButtons)
         self._amount.setFrame(False)
         # El ancho de este campo se ajusta al mostrarlo, no aquí: medirlo en
         # construcción da un número que no vale. Ver `showEvent`.
@@ -844,7 +842,7 @@ class BridgesSection(QWidget):
         # Los avisos no apagan el botón: informan de lo que decidirá la firma (hoy,
         # que el importe se valorará al firmar). Ver `_notes`.
         notas = self._notes(quote)
-        self._exec_btn.setEnabled(quote is not None and not motivos)
+        self._exec_btn.setEnabled(quote is not None and not motivos and not self._executing)
 
         if quote is None:
             self._chosen.setText(
@@ -1110,6 +1108,10 @@ class BridgesSection(QWidget):
         set_empty(self._tx, self._tx_empty, "Aún no has emitido ningún puente.")
 
     def _on_execute(self) -> None:
+        if self._executing:
+            # Doble disparo (p. ej. doble clic antes de que Qt repinte): se
+            # ignora sin más. No se encola nada.
+            return
         quote = self._selected_quote()
         if quote is None:
             self._status.setText("Selecciona primero una ruta de la tabla.")
@@ -1124,6 +1126,7 @@ class BridgesSection(QWidget):
         recipient = self._ask_recipient(quote.request.destination.chain)
         if recipient is None:
             return
+        self._executing = True
         self._exec_btn.setEnabled(False)
         self._status.setText("Firmando y emitiendo el cruce…")
         spawn(self._do_execute(quote, recipient))
@@ -1145,6 +1148,7 @@ class BridgesSection(QWidget):
             self._status.setText(f"Error: {error}")
             self._refresh_balances(forced=True)
         finally:
+            self._executing = False
             self._on_route_selected()
 
 

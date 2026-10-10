@@ -31,6 +31,7 @@ from amigocompora.app.execution_policy import (
     PrivateKeySource,
 )
 from amigocompora.app.registry import EngineRegistry
+from amigocompora.app.single_flight import SingleFlight
 from amigocompora.app.usecases.track_bridge import TrackedBridge
 from amigocompora.domain.addresses import shorten
 from amigocompora.domain.chains import chain
@@ -81,8 +82,19 @@ class ClaimBridge:
     keys: PrivateKeySource
     policy: AutonomyPolicy
     broadcasters: Mapping[str, EvmBroadcaster] = field(default_factory=dict)
+    #: Un candado compartido con los demás caminos que firman: mientras una
+    #: ejecución está en curso, la siguiente se rechaza en vez de encolarse. La
+    #: misma instancia que usan swaps, puentes y retiradas — el recurso escaso,
+    #: el nonce de la cartera, es el mismo. Ver `SingleFlight`.
+    single_flight: SingleFlight = field(default_factory=SingleFlight)
 
     async def __call__(self, record: TrackedBridge) -> BroadcastReceipt:
+        # Una ejecución a la vez, y la segunda se rechaza —no se encola—: ver
+        # `SingleFlight`.
+        async with self.single_flight.exclusive(what="una recepción"):
+            return await self._run(record)
+
+    async def _run(self, record: TrackedBridge) -> BroadcastReceipt:
         origin = record.origin_chain
         destination = record.destination_chain
 

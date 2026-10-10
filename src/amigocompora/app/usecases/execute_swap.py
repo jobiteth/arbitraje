@@ -61,6 +61,7 @@ import structlog
 
 from amigocompora.app.confirmation import ConfirmationGateway
 from amigocompora.app.execution_policy import AutonomyPolicy, PrivateKeySource
+from amigocompora.app.single_flight import SingleFlight
 from amigocompora.app.usecases.estimate_cost import NetworkCost
 from amigocompora.app.usecases.prepare_swap import PrepareSwap, destination_for
 from amigocompora.app.usecases.value_in_reference import ReferenceValuation
@@ -207,8 +208,26 @@ class ExecuteSwap:
     #: anterior— y por eso puede faltar: es una capacidad, no un requisito para
     #: operar los pares que sí la tocan.
     valuation: ReferenceValuation | None = None
+    #: Un candado compartido con los demás caminos que firman: mientras una
+    #: ejecución está en curso, la siguiente se rechaza en vez de encolarse. La
+    #: misma instancia que usa `ExecuteBridge` — el recurso escaso, el nonce de
+    #: la cartera, es el mismo. Ver `SingleFlight`.
+    single_flight: SingleFlight = field(default_factory=SingleFlight)
 
     async def __call__(
+        self,
+        quote: Quote,
+        *,
+        recipient: str,
+        on_step: Callable[[StepUpdate], None] | None = None,
+    ) -> BroadcastReceipt:
+        # Una ejecución a la vez, y la segunda se rechaza —no se encola—: ver
+        # `SingleFlight`. La puerta está aquí, en el caso de uso, y no en la
+        # vista: una pestaña puede olvidarse de repintar su botón.
+        async with self.single_flight.exclusive(what="un swap"):
+            return await self._run(quote, recipient=recipient, on_step=on_step)
+
+    async def _run(
         self,
         quote: Quote,
         *,

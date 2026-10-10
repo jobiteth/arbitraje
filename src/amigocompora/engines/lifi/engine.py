@@ -263,9 +263,16 @@ class LifIEngine:
             )
         return self._to_unsigned(quote, payload, recipient=recipient)
 
-    def expected_destination(self, chain_key: str) -> str | None:
-        """El diamante medido para esa red de origen, o `None` si no se midió."""
-        return DIAMONDS.get(chain_key)
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
+        """El diamante medido para esa red de origen, o `None` si no se midió.
+
+        Un solo contrato —medido estable en todas las rutas de la misma red—,
+        pero se declara como conjunto porque el contrato del camino de ejecución
+        es un conjunto: los motores cuyo destino depende de la ruta caben en el
+        mismo tipo sin cambiar de forma.
+        """
+        diamond = DIAMONDS.get(chain_key)
+        return None if diamond is None else frozenset({diamond})
 
     # ---------------------------------------------------------- seguir #
     async def track_bridge(

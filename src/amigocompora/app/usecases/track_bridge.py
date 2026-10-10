@@ -193,6 +193,13 @@ class BridgeTracking:
                 await self._poll_once(tx_hash)
                 if self._records[tx_hash].track_state.is_final:
                     break
+                # Un motor activo que no sabe seguir cruces no va a aprender a
+                # hacerlo mientras la app siga abierta: insistir cada 15 s sólo
+                # reescribiría la misma frase. El registro queda sin estado final
+                # y `resume()` volverá a sondearlo en el próximo arranque (p. ej.,
+                # tras actualizar el motor).
+                if not self._worth_polling(tx_hash):
+                    break
                 await asyncio.sleep(self._poll_seconds)
         finally:
             self._watchers.pop(tx_hash, None)
@@ -201,13 +208,7 @@ class BridgeTracking:
         record = self._records[tx_hash]
         tracker = self._tracker(record.engine_id)
         if tracker is None:
-            self._store(
-                tx_hash,
-                message=(
-                    f"El motor «{record.engine_id}» no está activo: "
-                    "no se puede seguir este cruce."
-                ),
-            )
+            self._store(tx_hash, message=self._no_tracker_message(record.engine_id))
             return
         try:
             progress = await tracker.track_bridge(
@@ -317,6 +318,38 @@ class BridgeTracking:
             ):
                 return engine
         return None
+
+    def _is_engine_active(self, engine_id: str) -> bool:
+        """Si el motor que emitió el cruce está en la pila activa, sepa seguir o no."""
+        if not engine_id:
+            return False
+        return any(
+            engine.manifest.engine_id == engine_id
+            for engine in self._registry.active_stack(EngineKind.CROSS_CHAIN)
+        )
+
+    def _worth_polling(self, tx_hash: str) -> bool:
+        """Si seguir sondeando puede cambiar algo con lo que hay ahora mismo.
+
+        Sin seguidor hay dos casos: si el motor ni está activo, se sigue
+        sondeando —puede activarse desde la página de motores—; si está activo
+        pero no sabe seguir cruces, no hay nada que esperar y se deja de
+        sondear.
+        """
+        engine_id = self._records[tx_hash].engine_id
+        if self._tracker(engine_id) is not None:
+            return True
+        return not self._is_engine_active(engine_id)
+
+    def _no_tracker_message(self, engine_id: str) -> str:
+        """Lo que se dice cuando no hay quien siga el cruce, sin mentir sobre el porqué."""
+        if self._is_engine_active(engine_id):
+            return (
+                f"El motor «{engine_id}» está activo, pero no sabe seguir cruces "
+                "todavía: no hay seguimiento automático. "
+                "Mira el hash en el explorador."
+            )
+        return f"El motor «{engine_id}» no está activo: no se puede seguir este cruce."
 
     def _ensure_loaded(self) -> None:
         if self._loaded:

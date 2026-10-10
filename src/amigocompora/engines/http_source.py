@@ -455,7 +455,7 @@ class JsonSource:
         if response.status_code >= 400:
             raise SourceResponseError(
                 f"«{self._name}» respondió {response.status_code} a una petición "
-                f"que debería ser válida; puede que su API haya cambiado."
+                f"que debería ser válida{self._rejection_hint(response.status_code)}."
                 f"{_body_hint(response)}"
             )
 
@@ -467,6 +467,38 @@ class JsonSource:
     @property
     def cache_hit_rate(self) -> float:
         return self._cache.stats.hit_rate
+
+    def _rejection_hint(self, status: int) -> str:
+        """La coletilla del rechazo, sin afirmar lo que no consta.
+
+        Un 401 o un 403 cuando la petición llevaba credencial es casi siempre la
+        credencial —rechazada, caducada o de otra cuenta—, y el mensaje de
+        siempre («puede que su API haya cambiado») manda a buscar donde no está.
+        Medido el 2026-10-10 con LI.FI: con una clave guardada inválida responde
+        `401 Invalid API key`, y el motivo estaba en la credencial, no en la API.
+        Sin credencial configurada no se puede afirmar nada de ninguna, así que se
+        deja el mensaje de siempre.
+        """
+        if status in (401, 403) and self._credentials_configured:
+            return (
+                ", y llevaba la credencial del motor: comprueba que siga siendo "
+                "válida —puede estar caducada, revocada o ser de otra cuenta— en "
+                "Motores → Credenciales; puede que su API haya cambiado"
+            )
+        return "; puede que su API haya cambiado"
+
+    @property
+    def _credentials_configured(self) -> bool:
+        """Si alguna cabecera propia tiene forma de credencial.
+
+        Se mira el **nombre** y no el valor: el valor no se expone ni se registra
+        nunca, y una cabecera con nombre de clave es lo único que hace falta para
+        saber que un 401 puede ir por ahí.
+        """
+        return any(
+            "api-key" in name.lower() or name.lower() == "authorization"
+            for name in self._headers
+        )
 
 
 # --------------------------------------------------------------------------- #

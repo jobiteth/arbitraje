@@ -48,25 +48,44 @@ podido comprobar en vivo se dice en vez de suponerse.
   ejecutor la construye él mismo a partir del gastador—, y se rechaza cualquier
   otro reparto con los pasos nombrados, para que quien lo lea sepa qué llegó.
 
-### Lo que ya está medido: la tabla de depósitos
+### Lo que ya está medido: los contratos de origen
 
-`DEPOSITORIES` se rellenó el 2026-10-07 midiendo la API en vivo, que es lo que
-este docstring pedía a quien lo leyera. El valor es **el mismo contrato en todas
-las redes** —`0x4cD00E387622C35bDDB9b4c962C136462338BC31`, un despliegue CREATE2
-de dirección idéntica—, y no depende de la ruta: se cruzaron tres usuarios
-distintos, tres importes (0,01 · 1 · 1.000 USDC) y dos destinos sobre cinco redes
-de origen, y en todas las combinaciones que Relay aceptó salió la misma dirección.
-Lo que antes era un ejemplo de la documentación ahora es una medición.
+La tabla se empezó a medir el 2026-10-07 —tres usuarios, tres importes y dos
+destinos sobre cinco redes de origen— y entonces salió el mismo contrato en
+todas las combinaciones: el depósito `0x4cD0…BC31`. El 2026-10-10, probando una
+ruta de verdad, una cotización de Polygon apuntó a **otro** contrato y el motor
+detuvo la operación, que es lo que tenía que hacer.
 
-Que sea la misma en todas partes no es un motivo para escribir una constante
-suelta: la tabla se sigue consultando **por red de origen** y se sigue
-contrastando contra lo que devuelve cada cotización antes de firmar. Si Relay
-alguna vez devuelve otro destino, `_require_known_depository` para la operación
-en vez de mandar el dinero a donde no vuelve.
+Medido a fondo ese día, no era un error de nadie: Relay manda el depósito
+**directo** a su contrato de depósito `0x4cD0…BC31`, y las rutas que necesitan
+un swap en la red de origen (POL→USDC antes de cruzar, por ejemplo) al router
+ERC-20 v3 `0xb92f…Ff4f` —o al proxy de aprobación v3 `0xCcC8…15bE` cuando el
+token de origen es un ERC-20, que cobra el permiso y lo reenvía al router—. Los
+tres son contratos de Relay con la misma dirección en las cinco redes, y los
+tres están publicados por su propia API: `GET https://api.relay.link/chains` los
+sirve por red (`erc20Router`, `approvalProxy`, `relayReceiver`), y la página de
+direcciones de su documentación confirma la familia v3. En todas las rutas
+medidas el gastador de la aprobación fue **el mismo contrato que recibe el
+depósito**: el que cobra el token es el que recibe el dinero.
 
-Con la tabla llena, `expected_destination` devuelve la dirección y `plan_bridge`
-construye. Sigue rechazando lo que no cabe en una transacción —ver arriba—, así
-que lo que se enciende es construir, no tragarse cualquier cosa.
+Así que la tabla deja de ser «un contrato por red» y pasa a ser «los contratos
+publicados por Relay para esa red»: el depósito medido más los dos de la v3 que
+su API publica. El contraste sigue significando lo mismo —un `to` que no sea uno
+de ellos no se firma—; lo que cambia es que la lista es la familia entera y no
+sólo el primero que se midió. `expected_destination` devuelve ese conjunto, y
+`plan_bridge` exige además que el permiso del ERC-20, si lo hay, se conceda al
+mismo contrato que recibe el depósito.
+
+### Lo que ya está medido: el seguimiento
+
+`GET /requests/v3?depositTxHash=` devuelve el cruce por el hash de su
+transacción de origen —medido el 2026-10-10 con un cruce recién emitido:
+estado `success`, la transacción de entrega en destino y, en sus
+`stateChanges`, el abono exacto a la cartera—, y un hash que no conoce contesta
+la lista vacía. La v3 exige la clave en la cabecera, que este motor ya manda en
+cada petición. Es la consulta que sostiene `track_bridge`: no necesita la
+cartera del usuario —que el registro del seguimiento no guarda— porque el hash
+de origen es justo lo que sí guarda.
 """
 
 from __future__ import annotations
@@ -87,8 +106,10 @@ from amigocompora.domain.errors import (
     UnsupportedOperationError,
 )
 from amigocompora.domain.models import (
+    BridgeProgress,
     BridgeQuote,
     BridgeRequest,
+    BridgeTrackState,
     Measurement,
     Token,
     TokenApproval,
@@ -106,30 +127,63 @@ HOST: Final = "api.relay.link"
 QUOTE_URL: Final = f"https://{HOST}/quote/v2"
 STATUS_URL: Final = f"https://{HOST}/intents/status/v3"
 
+#: La consulta del seguimiento: el cruce por el hash de su transacción de
+#: origen. Medida el 2026-10-10 contra la API en vivo —encontró el cruce recién
+#: emitido y devolvió, con él, la transacción de entrega y el abono a la
+#: cartera—; un hash que no conoce contesta la lista vacía, y la clave viaja en
+#: la cabecera como en todo lo demás. Es además la ruta a la que la v2 señala al
+#: retirarse, así que no hay una segunda forma que mantener.
+REQUESTS_URL: Final = f"https://{HOST}/requests/v3"
+
 CONFIG_API_KEY: Final = "api_key"
 
 #: Cómo nombra esta API el token nativo de una red. Tomado de su ejemplo, no
 #: elegido: es el valor con el que la documentación cruza ETH.
 NATIVE_CURRENCY: Final = "0x0000000000000000000000000000000000000000"
 
-#: Contratos a los que Relay manda los fondos **desde** cada red de origen.
-#:
-#: Medido el 2026-10-07 contra la API en vivo, no copiado de la documentación:
-#: el mismo contrato en las cinco redes, estable ante el usuario, el importe y el
-#: destino. Ver el docstring del módulo para cómo se midió. `BRIDGE_CHAINS` sale
-#: de aquí para que no discrepen.
-DEPOSITORIES: Final[Mapping[str, str]] = {
-    "ethereum": "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
-    "base": "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
-    "arbitrum": "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
-    "optimism": "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
-    "polygon": "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
+#: El depósito directo de Relay: a donde van los fondos cuando el token de
+#: origen ya es el que cruza. Medido el 2026-10-07 en las cinco redes —tres
+#: usuarios, tres importes y dos destinos— y vuelto a medir el 2026-10-10.
+RELAY_DEPOSITORY: Final = "0x4cD00E387622C35bDDB9b4c962C136462338BC31"
+
+#: El router ERC-20 v3 de Relay: recibe el depósito de las rutas que necesitan
+#: un swap en la red de origen (p. ej. POL→USDC antes de cruzar). Publicado por
+#: `GET https://api.relay.link/chains` como `erc20Router` en las cinco redes, y
+#: medido en vivo el 2026-10-10: una ruta POL→base depositó aquí.
+RELAY_V3_ROUTER: Final = "0xb92fe925DC43a0ECdE6c8b1a2709c170Ec4fFf4f"
+
+#: El proxy de aprobación v3: recibe el depósito cuando el token de origen es un
+#: ERC-20 y la ruta lleva swap en origen —cobra el permiso y lo reenvía al
+#: router—. Publicado como `approvalProxy`; medido el 2026-10-10: el paso de
+#: aprobación de esa ruta autoriza a este mismo contrato.
+RELAY_V3_APPROVAL_PROXY: Final = "0xCcC88a9d1B4ED6b0EABA998850414b24f1c315bE"
+
+#: La familia publicada, escrita una sola vez: la usan la tabla de cada red y
+#: las pruebas, para que no haya dos listas que puedan discrepar.
+RELAY_ORIGIN_CONTRACTS: Final[tuple[str, str, str]] = (
+    RELAY_DEPOSITORY,
+    RELAY_V3_ROUTER,
+    RELAY_V3_APPROVAL_PROXY,
+)
+
+#: Contratos de Relay admitidos como destino del depósito **desde** cada red de
+#: origen. Las cinco redes publican la misma familia —los tres contratos están
+#: desplegados con la misma dirección en todas—, y se escribe por red y no como
+#: una constante suelta porque es lo que se sigue consultando al construir: una
+#: red cuya familia cambie se notará aquí. `BRIDGE_CHAINS` sale de aquí para que
+#: no discrepen.
+ORIGIN_CONTRACTS: Final[Mapping[str, frozenset[str]]] = {
+    "ethereum": frozenset(RELAY_ORIGIN_CONTRACTS),
+    "base": frozenset(RELAY_ORIGIN_CONTRACTS),
+    "arbitrum": frozenset(RELAY_ORIGIN_CONTRACTS),
+    "optimism": frozenset(RELAY_ORIGIN_CONTRACTS),
+    "polygon": frozenset(RELAY_ORIGIN_CONTRACTS),
 }
 
 #: Las redes **desde** las que este motor puede construir un cruce. Cotizar
 #: depende de la misma tabla a propósito: enseñar una ruta que no se puede firmar
 #: es peor que no enseñarla, porque el usuario la elige y se queda mirándola.
-BRIDGE_CHAINS: Final = frozenset(DEPOSITORIES)
+BRIDGE_CHAINS: Final = frozenset(ORIGIN_CONTRACTS)
 
 #: Selector de `approve(address,uint256)`, el único que se acepta en un paso de
 #: aprobación. Se comprueba en vez de suponerlo: un paso cuyo calldata no empiece
@@ -153,7 +207,7 @@ MANIFEST: Final = EngineManifest(
     kind=EngineKind.CROSS_CHAIN,
     summary=(
         "Cruza tokens entre redes por la red de resolución de Relay. Cotiza y "
-        "construye desde las cinco redes cuyo contrato de depósito se midió, y "
+        "construye desde las cinco redes cuyos contratos de origen se midieron, y "
         "compite con LI.FI por la misma operación."
     ),
     capabilities=frozenset(
@@ -278,9 +332,28 @@ class RelayEngine:
             quote, deposits[0], approve, recipient=recipient, fresh_raw=fresh
         )
 
-    def expected_destination(self, chain_key: str) -> str | None:
-        """El contrato de destino medido para esa red de origen, o `None`."""
-        return DEPOSITORIES.get(chain_key)
+    def expected_destination(self, chain_key: str) -> frozenset[str] | None:
+        """Los contratos de origen publicados para esa red, o `None` si no hay."""
+        return ORIGIN_CONTRACTS.get(chain_key)
+
+    # ---------------------------------------------------------- seguir #
+    async def track_bridge(
+        self, tx_hash: str, *, origin_chain: str, destination_chain: str
+    ) -> BridgeProgress:
+        """Lo que Relay dice de un cruce emitido. Sólo lee.
+
+        `origin_chain` y `destination_chain` los exige el contrato
+        `BridgeTracker`; esta consulta no los necesita —el cruce que Relay
+        devuelve ya trae sus redes— y por eso no se usan para nada.
+        """
+        raw = await self._source.get_json(
+            REQUESTS_URL,
+            params={"depositTxHash": tx_hash},
+            absent_statuses=frozenset({404}),
+        )
+        if raw is None:
+            return _unknown_progress(f"{SOURCE_NAME} aún no conoce esta transacción.")
+        return progress_from_request(as_mapping(raw, "estado", SOURCE_NAME), tx_hash)
 
     # ------------------------------------------------------------ interno #
     async def _quote_payload(
@@ -410,6 +483,19 @@ class RelayEngine:
             )
 
         approval = _approval(approve, request)
+        # El permiso va **al contrato que recibe el depósito**: es el que va a
+        # mover el token. Medido el 2026-10-10 en las dos formas que publica
+        # Relay —el depósito directo y el proxy de la v3— el gastador del
+        # `approve` fue el mismo contrato al que apunta el depósito. Autorizar a
+        # otro contrato dejaría el permiso en manos de quien no cobra, así que si
+        # alguna vez no coinciden, no se firma.
+        if approval is not None and approval.target.lower() != destination.lower():
+            raise SourceResponseError(
+                f"«{SOURCE_NAME}» pide autorizar {approval.target} y el depósito va "
+                f"a {destination} en «{chain_key}». No se construyó nada: el "
+                f"permiso tiene que ir al contrato que recibe el dinero, y "
+                f"autorizar a otro deja al autorizado sobre tu token sin cobrarlo."
+            )
         _log.info(
             "relay.bridge_planned",
             pair=request.symbol,
@@ -597,15 +683,27 @@ def _item_data(item: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _require_known_depository(chain_key: str, returned: Any) -> str:
-    expected = DEPOSITORIES[chain_key]
-    if not isinstance(returned, str) or returned.strip().lower() != expected.lower():
-        raise SourceResponseError(
-            f"«{SOURCE_NAME}» devolvió como destino del puente {returned!r} en "
-            f"«{chain_key}», y el contrato medido para esa red es {expected}. No se "
-            f"construyó nada: aquí un destino equivocado no pierde dinero en una "
-            f"operación de mercado, lo manda a otra parte y no vuelve."
-        )
-    return expected
+    """El destino del depósito, comprobado contra los contratos publicados.
+
+    Se lee de `ORIGIN_CONTRACTS` —y no de la constante de la familia— para que
+    una tabla inyectada en las pruebas gobierne también este contraste. Devuelve
+    la forma publicada del contrato y no la que trajo la respuesta, para que lo
+    que se compare después sea siempre la misma cadena: el payload, el permiso y
+    el contraste de la emisión.
+    """
+    admitted = ORIGIN_CONTRACTS[chain_key]
+    if isinstance(returned, str):
+        text = returned.strip().lower()
+        for contract in sorted(admitted):
+            if contract.lower() == text:
+                return contract
+    conocidos = ", ".join(sorted(admitted)) or "ninguno"
+    raise SourceResponseError(
+        f"«{SOURCE_NAME}» devolvió como destino del puente {returned!r} en "
+        f"«{chain_key}», y los contratos que Relay publica para esa red son "
+        f"{conocidos}. No se construyó nada: aquí un destino equivocado no pierde "
+        f"dinero en una operación de mercado, lo manda a otra parte y no vuelve."
+    )
 
 
 def _fresh_out(payload: Mapping[str, Any]) -> int:
@@ -794,6 +892,174 @@ def _is_address(value: str) -> bool:
     if not text.startswith("0x") or len(text) != 42:
         return False
     return all(c in "0123456789abcdefABCDEF" for c in text[2:])
+
+
+# --------------------------------------------------------------------------- #
+# El seguimiento: qué se lee de la respuesta que devuelve el cruce
+# --------------------------------------------------------------------------- #
+#: Los estados en vuelo y lo que cada uno significa, según la documentación de
+#: Relay para su estado por intención: `waiting` es que el depósito aún no se
+#: confirma y `delayed` que el relleno va con retraso pero sigue.
+IN_FLIGHT_MESSAGES: Final[Mapping[str, str]] = {
+    "waiting": "Esperando la confirmación del depósito en la red de origen.",
+    "depositing": "Depósito confirmado: Relay está rellenando el cruce.",
+    "pending": "Depósito confirmado; pendiente de la entrega en destino.",
+    "submitted": "Entrega emitida en destino; pendiente de su confirmación.",
+    "delayed": "La entrega en destino va con retraso; Relay sigue con el cruce.",
+}
+
+
+def _unknown_progress(message: str) -> BridgeProgress:
+    """Un progreso sin estado del proveedor: lo que aún no se sabe, dicho."""
+    return BridgeProgress(
+        state=BridgeTrackState.UNKNOWN,
+        provider_status="",
+        substatus="",
+        message=message,
+    )
+
+
+def progress_from_request(payload: Mapping[str, Any], tx_hash: str) -> BridgeProgress:
+    """Traduce el cruce que Relay devuelve para ese hash de origen.
+
+    El hash se comprueba **otra vez** contra las transacciones de entrada del
+    cruce aunque la consulta ya lo pidiera por él: si algún día el filtro
+    dejara de filtrar, el primer resultado sería el de otro cruce, y enseñarlo
+    como propio es la clase de error que aquí no se firma.
+    """
+    requests = payload.get("requests")
+    if not isinstance(requests, list):
+        return _unknown_progress(
+            f"«{SOURCE_NAME}» devolvió una respuesta sin `requests`: no se puede "
+            f"leer el estado del cruce."
+        )
+    request = _request_with_origin(requests, tx_hash)
+    if request is None:
+        return _unknown_progress(f"{SOURCE_NAME} aún no conoce esta transacción.")
+
+    status = str(request.get("status", ""))
+    out_txs = _out_txs(request)
+    if status == "success":
+        state = BridgeTrackState.DONE
+        message = "Relay entregó el cruce en destino: la transacción se confirmó en la red."
+    elif status == "failure":
+        state = BridgeTrackState.FAILED
+        message = "Relay no pudo completar el cruce."
+        motivo = _fail_reason(request)
+        if motivo:
+            message = f"{message} Motivo: {motivo}."
+    elif status == "refund":
+        state = BridgeTrackState.REFUNDED
+        message = "Relay devolvió los fondos a la dirección de origen."
+    elif status in IN_FLIGHT_MESSAGES:
+        state = BridgeTrackState.PENDING
+        message = IN_FLIGHT_MESSAGES[status]
+    else:
+        return BridgeProgress(
+            state=BridgeTrackState.UNKNOWN,
+            provider_status=status,
+            substatus="",
+            message=f"Relay informó un estado que este camino no conoce ({status!r}).",
+        )
+    return BridgeProgress(
+        state=state,
+        provider_status=status,
+        substatus="",
+        message=message,
+        receiving_tx_hash=_receiving_tx_hash(out_txs),
+        received_raw=_received_amount(out_txs, request.get("recipient")),
+        received_chain=_receiving_chain(out_txs),
+    )
+
+
+def _request_with_origin(requests: Sequence[Any], tx_hash: str) -> Mapping[str, Any] | None:
+    """El cruce cuya transacción de entrada es ese hash, o `None`."""
+    wanted = tx_hash.strip().lower()
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        data = request.get("data")
+        in_txs = data.get("inTxs") if isinstance(data, dict) else None
+        if not isinstance(in_txs, list):
+            continue
+        for tx in in_txs:
+            if not isinstance(tx, dict):
+                continue
+            # `txHash` es el nombre que publica la v3 —la v2 lo llamaba `hash`—
+            # y se lee el vigente: el viejo no se adivina.
+            hash_ = tx.get("txHash")
+            if isinstance(hash_, str) and hash_.strip().lower() == wanted:
+                return request
+    return None
+
+
+def _out_txs(request: Mapping[str, Any]) -> list[Any]:
+    """Las transacciones de entrega que el cruce publique, si hay."""
+    data = request.get("data")
+    raw = data.get("outTxs") if isinstance(data, dict) else None
+    return raw if isinstance(raw, list) else []
+
+
+def _receiving_tx_hash(out_txs: Sequence[Any]) -> str | None:
+    """El hash de la transacción que entrega en destino, si Relay ya la emitió."""
+    for tx in out_txs:
+        if not isinstance(tx, dict):
+            continue
+        hash_ = tx.get("txHash")
+        if isinstance(hash_, str) and hash_:
+            return hash_
+    return None
+
+
+def _receiving_chain(out_txs: Sequence[Any]) -> str | None:
+    """La red del destino tal cual la declara esa transacción, si la declara."""
+    for tx in out_txs:
+        if not isinstance(tx, dict):
+            continue
+        chain_id = _uint(tx.get("chainId"))
+        if chain_id is not None:
+            return str(chain_id)
+    return None
+
+
+def _received_amount(out_txs: Sequence[Any], recipient: Any) -> int | None:
+    """Lo que de verdad llegó: el abono a la dirección de destino.
+
+    Se lee del cambio de saldo de la transacción de entrega —medido el
+    2026-10-10: el abono de la cartera aparece con su dirección y un
+    `balanceDiff` positivo— y no del importe cotizado: lo cotizado es lo que se
+    prometió, y esto es lo que llegó. Sin abono no hay cifra: no se rellena con
+    la promesa.
+    """
+    if not isinstance(recipient, str) or not recipient.strip():
+        return None
+    wanted = recipient.strip().lower()
+    for tx in out_txs:
+        if not isinstance(tx, dict):
+            continue
+        state_changes = tx.get("stateChanges")
+        if not isinstance(state_changes, list):
+            continue
+        for change in state_changes:
+            if not isinstance(change, dict):
+                continue
+            address = change.get("address")
+            if not isinstance(address, str) or address.strip().lower() != wanted:
+                continue
+            data = change.get("change")
+            amount = _uint(data.get("balanceDiff")) if isinstance(data, dict) else None
+            if amount is not None and amount > 0:
+                return amount
+    return None
+
+
+def _fail_reason(request: Mapping[str, Any]) -> str:
+    """El motivo del fallo, si Relay dio uno que no sea el relleno `N/A`."""
+    data = request.get("data")
+    reason = data.get("failReason") if isinstance(data, dict) else None
+    if isinstance(reason, str) and reason and reason != "N/A":
+        return reason
+    return ""
 
 
 @dataclass(frozen=True, slots=True)

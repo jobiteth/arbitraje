@@ -68,6 +68,7 @@ from amigocompora.ui.theme import (
 )
 from amigocompora.ui.wallet_state import WalletBalances
 from amigocompora.ui.widgets import (
+    AmountSpinBox,
     Card,
     Chip,
     Field,
@@ -105,25 +106,6 @@ def position_of(combo: QComboBox, token: Token | None) -> int:
         if isinstance(candidato, Token) and candidato.is_same_asset(token):
             return index
     return -1
-
-
-class AmountSpinBox(QDoubleSpinBox):
-    """Un importe que se escribe y se lee **sin ceros de relleno**: «5», no «5,000000».
-
-    El campo guarda seis decimales porque es lo que admite la cantidad, pero
-    enseñarlos siempre llena la pantalla de ceros y hace difícil leer de un vistazo
-    qué se va a entregar. Aquí el texto se recorta sólo en la pantalla: el valor
-    que se firma sale de `value()`, con todos sus decimales, y no de este texto.
-    Se usa el separador decimal del idioma del sistema, para que lo que se escribe
-    y lo que se lee sean el mismo formato.
-    """
-
-    def textFromValue(self, value: float) -> str:
-        texto = self.locale().toString(float(value), "f", self.decimals())
-        separador = self.locale().decimalPoint()
-        if separador in texto:
-            texto = texto.rstrip("0").rstrip(separador)
-        return texto or "0"
 
 
 class TokenLeg(QFrame):
